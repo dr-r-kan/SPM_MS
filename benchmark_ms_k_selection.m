@@ -15,15 +15,15 @@ clear; clc; rng(1);
 if isempty(gcp('nocreate')), parpool('threads'); end
 
 %% ---------------- Config ----------------
-meta_file        = 'Metamaps MS Template/MetaMaps_2023_06.mat';  % must be on path / CWD
+meta_file        = 'Metamaps MS Template/MetaMaps_2023_06.mat';
 K_range_run      = [3 7];                % K per run chosen uniformly in this range
 noise_levels     = [0.01 0.02 0.05 0.10 0.15];
-replicates       = 5;                    % datasets per noise level
+replicates       = 20;                   % datasets per noise level
 T_target_range   = [4000 8000];          % target total samples per run (pre-noise)
 gfp_top_frac     = 0.15;                 % top 15% |weights|
 smooth_sigma     = 15;                   % smoothing (samples) for weights
 seg_len_range    = [80 250];             % sticky segments (samples)
-outlier_frac     = 0.00;                 % set >0 if you want uniform artefact blocks
+outlier_frac     = 0.02;                 % set >0 if you want uniform artefact blocks
 Kgrid_eval       = 1:12;
 Kgrid_kmeans     = 2:10;
 
@@ -101,6 +101,8 @@ for noise_sd = noise_levels
             X(:, 1:Nout) = (rand(Nch, Nout) - 0.5) * 2 * max(abs(X(:)));
             labels_true(1:Nout) = 0;
         end
+
+        fprintf("EEG Simulated")
 
         % ----- run both input modes -----
         for mode_i = 1:numel(input_modes)
@@ -215,35 +217,146 @@ disp('Done.');
 %% ====================== Helper functions =======================
 
 function [Maps, Channels] = load_metamaps(fname)
+%LOAD_METAMAPS  Load MetaMaps microstate templates robustly.
+% Returns:
+%   Maps     : Nch x Nms double, each column a unit-L2 map
+%   Channels : [] or a struct/cell with channel names if present
+
 S = load(fname);
-if isfield(S,'data')
-    D = S.data;    % 71x7 struct with fields (assumed) .map or .topo
-    % Try common field names
-    fns = fieldnames(D);
-    % Find a field that looks like a channel vector
-    candidate = '';
-    for i=1:numel(fns)
-        v = D(1,1).(fns{i});
-        if isnumeric(v)
-            candidate = fns{i}; break;
+vars = fieldnames(S);
+
+% ---- pick the dataset variable ----
+preferred = {'data','Data','Maps','maps','Templates','templates','MetaMaps','metaMaps'};
+vname = '';
+for k=1:numel(preferred)
+    if ismember(preferred{k}, vars), vname = preferred{k}; break; end
+end
+if isempty(vname)
+    % fallback: first non-Channel-like variable
+    for k=1:numel(vars)
+        if ~contains(lower(vars{k}), 'channel')
+            vname = vars{k}; break;
         end
     end
-    if isempty(candidate), error('Could not find numeric field in data struct.'); end
-    Nch = numel(D(:,1).(candidate));
-    Nms = numel(D(1,:));
-    Maps = zeros(Nch, Nms);
-    for j=1:Nms
-        v = D(:,j).(candidate);
-        Maps(:,j) = v(:);
+end
+if isempty(vname)
+    error('Could not find a maps/data variable in %s. Found only: %s', fname, strjoin(vars, ', '));
+end
+D = S.(vname);
+
+% ---- try to interpret D ----
+Maps = [];
+if isnumeric(D)
+    % Case C: numeric matrix Nch x Nms
+    Maps = double(D);
+elseif isstruct(D)
+    sz = size(D);
+    fns = fieldnames(D);
+
+    % Try to find a numeric field
+    cand = '';
+    scalar_field = false;
+    vec_field = false;
+    vec_len = [];
+
+    % look at a few elements to decide
+    probe_idx = sub2ind(sz, min(1,sz(1)), min(1,sz(2)));
+    for i=1:numel(fns)
+        try
+            v = D(probe_idx).(fns{i});
+        catch
+            continue
+        end
+        if isnumeric(v) && isscalar(v)
+            cand = fns{i}; scalar_field = true; break;
+        elseif isnumeric(v) && isvector(v)
+            cand = fns{i}; vec_field = true; vec_len = numel(v); break;
+        end
+    end
+    if isempty(cand)
+        error('No numeric field found in struct "%s" of %s. Fields: %s', vname, fname, strjoin(fns, ', '));
+    end
+
+    if numel(sz)==2 && all(sz>1) && scalar_field
+        % Case A: struct Nch x Nms with scalar entries per element
+        Nch = sz(1); Nms = sz(2);
+        tmp = arrayfun(@(s) double(s.(cand)), D);
+        Maps = reshape(tmp, Nch, Nms);
+    elseif isvector(D) && vec_field
+        % Case B: struct 1 x Nms (or Nms x 1) with vector field of length Nch
+        Nms = numel(D);
+        Nch = vec_len;
+        Maps = zeros(Nch, Nms);
+        for j=1:Nms
+            v = D(j).(cand);
+            if numel(v) ~= Nch
+                error('Field "%s" length varies across maps (expected %d, got %d at j=%d).', cand, Nch, numel(v), j);
+            end
+            Maps(:,j) = double(v(:));
+        end
+    else
+        % Last attempt: look for a field that itself is a numeric 2D array
+        pulled = false;
+        for i=1:numel(fns)
+            V = D(1).(fns{i});
+            if isnumeric(V) && ndims(V)==2
+                Maps = double(V);
+                pulled = true;
+                break;
+            end
+        end
+        if ~pulled
+            error('Unrecognised struct layout for "%s" in %s. Size=%s; fields=%s', ...
+                  vname, fname, mat2str(sz), strjoin(fns, ', '));
+        end
+    end
+elseif iscell(D)
+    % cell array: try to stack column-wise
+    try
+        Nms = numel(D);
+        Nch = numel(D{1});
+        Maps = zeros(Nch, Nms);
+        for j=1:Nms, Maps(:,j) = double(D{j}(:)); end
+    catch
+        error('Cell array "%s" has unexpected contents in %s.', vname, fname);
     end
 else
-    error('metaMaps_2023.mat must contain struct array "data".');
+    error('Unsupported type for "%s": %s', vname, class(D));
 end
+
+% ---- channels (best-effort) ----
 Channels = [];
-if isfield(S,'Channels'), Channels = S.Channels; end
-% Normalise maps to unit L2
-Maps = bsxfun(@rdivide, Maps, max(vecnorm(Maps,2,1), eps));
+candCh = {'Channels','channels','Chanlocs','chanlocs','Channel','EEG','eeg'};
+for k=1:numel(candCh)
+    if isfield(S, candCh{k})
+        Channels = S.(candCh{k});
+        break;
+    end
 end
+% If Channels is EEGLAB-like, try to expose labels
+if isstruct(Channels)
+    fnsC = fieldnames(Channels);
+    if ismember('labels', fnsC)
+        try
+            chnames = arrayfun(@(c) string(c.labels), Channels, 'UniformOutput', false);
+            Channels = chnames(:);
+        catch
+            % leave as-is
+        end
+    elseif ismember('Name', fnsC)
+        try
+            chnames = arrayfun(@(c) string(c.Name), Channels, 'UniformOutput', false);
+            Channels = chnames(:);
+        catch
+        end
+    end
+end
+
+% ---- normalise columns to unit L2 ----
+Maps = bsxfun(@rdivide, Maps, max(vecnorm(Maps,2,1), eps));
+
+end
+
 
 function [X, labels, w, seg_ids] = synth_ms_eeg(Maps, T_target, seg_len_range, smooth_sigma)
 % Sticky microstate sequence with smooth weights in [-1,1]
