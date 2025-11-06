@@ -3,9 +3,6 @@
 A comprehensive comparison of Variational Bayes and classical methods for EEG microstate clustering and automatic K selection.
 
 [![MATLAB](https://img.shields.io/badge/MATLAB-R2020a%2B-blue.svg)](https://www.mathworks.com/products/matlab.html)
-
-[![SPM](https://github.com/spm/spm)]
-
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## Overview
