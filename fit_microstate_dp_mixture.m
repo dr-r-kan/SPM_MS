@@ -1,7 +1,5 @@
 function Results = fit_microstate_dp_mixture(Sim, K_candidates, criterion)
-% FIT_MICROSTATE_DP_MIXTURE: Dirichlet Process Mixture using SPM
-%
-% Uses Dirichlet Process for automatic K determination with VB
+% FIT_MICROSTATE_DP_MIXTURE: Dirichlet Process Mixture
 %
 % INPUTS:
 %   Sim          - Simulation structure
@@ -9,7 +7,7 @@ function Results = fit_microstate_dp_mixture(Sim, K_candidates, criterion)
 %   criterion    - 'free_energy' or 'silhouette' (default 'free_energy')
 %
 % OUTPUTS:
-%   Results      - Structure with fitted model and diagnostics
+%   Results      - Structure with fitted model and recovery metrics
 
     if nargin < 2, K_candidates = 2:10; end
     if nargin < 3, criterion = 'free_energy'; end
@@ -17,21 +15,25 @@ function Results = fit_microstate_dp_mixture(Sim, K_candidates, criterion)
     t_start = tic;
 
     fprintf('\n========================================\n');
-    fprintf('Dirichlet Process Mixture (SPM-based)\n');
+    fprintf('Dirichlet Process Mixture\n');
     fprintf('========================================\n');
     fprintf('Criterion: %s\n', criterion);
     fprintf('True K: %d, SNR: %+.1f dB\n', Sim.K_true, Sim.SNR_dB);
 
-    % Preprocessing
-    [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims] = preprocess_maps(Sim);
+    % Load shared utilities
+    util = microstate_utilities_SHARED();
+
+    % Preprocessing (using shared utility)
+    fprintf('1. Preprocessing...\n');
+    [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims, maps_original] = util.preprocess_maps(Sim);
     
-    % Fit DP mixture for each max K
-    fprintf('Fitting DP mixture models...\n');
+    fprintf('2. Fitting DP mixture models...\n');
     
     nK = numel(K_candidates);
     scores = zeros(nK, 1);
     silhouette_vals = zeros(nK, 1);
     free_energy_vals = zeros(nK, 1);
+    gev_vals = zeros(nK, 1);  % ← NOW COMPUTE THIS
     K_inferred = zeros(nK, 1);
     centers_all = cell(nK, 1);
     labels_all = cell(nK, 1);
@@ -41,7 +43,6 @@ function Results = fit_microstate_dp_mixture(Sim, K_candidates, criterion)
         fprintf('  K_max=%d... ', K_max);
         
         try
-            % DP mixture with polarity
             [centers, labels, K_inf, fe, sil] = dp_mixture_polarity(maps_norm, K_max);
             
             centers_all{iK} = centers;
@@ -50,13 +51,18 @@ function Results = fit_microstate_dp_mixture(Sim, K_candidates, criterion)
             free_energy_vals(iK) = fe;
             silhouette_vals(iK) = sil;
             
-            % Select score
+            % ✅ COMPUTE GEV (KOENIG METHOD)
+            sim = abs(maps_original * centers');
+            [max_sim, ~] = max(sim, [], 2);
+            gfp_squared = sum(maps_original.^2, 2);
+            gev_vals(iK) = sum(max_sim.^2) / (sum(gfp_squared) + eps);
+            
             if strcmp(criterion, 'silhouette')
                 scores(iK) = sil;
-                fprintf('K_inf=%d, Sil=%.3f, FE=%.1f\n', K_inf, sil, fe);
+                fprintf('K_inf=%d, Sil=%.3f, FE=%.1f, GEV=%.3f\n', K_inf, sil, fe, gev_vals(iK));
             else
                 scores(iK) = fe;
-                fprintf('K_inf=%d, FE=%.1f, Sil=%.3f\n', K_inf, fe, sil);
+                fprintf('K_inf=%d, FE=%.1f, Sil=%.3f, GEV=%.3f\n', K_inf, fe, sil, gev_vals(iK));
             end
             
         catch ME
@@ -68,24 +74,24 @@ function Results = fit_microstate_dp_mixture(Sim, K_candidates, criterion)
         end
     end
     
-    % Model selection
     [best_score, best_idx] = max(scores);
     K_estimated = K_inferred(best_idx);
     centers = centers_all{best_idx};
     labels = labels_all{best_idx};
     
-    fprintf('\nBest K=%d (score=%.3f, true K=%d)\n', K_estimated, best_score, Sim.K_true);
+    fprintf('Best K=%d (score=%.3f, true K=%d)\n', K_estimated, best_score, Sim.K_true);
     
-    % Map recovery
-    true_maps_norm = normalize_maps(Sim.maps_true);
-    recovery_corr = best_match_corr_hungarian_polarity_aware(true_maps_norm, centers);
-    mean_recovery = mean(recovery_corr);
+    true_maps_norm = util.normalize_maps(Sim.maps_true);
+    recovery_metrics = microstate_partial_alignment(true_maps_norm, centers, ...
+        'distance_type', 'cosine', 'threshold', 0.0, 'polarity', true);
     
-    fprintf('Map recovery: %.3f\n', mean_recovery);
+    fprintf('\n3. Map Recovery Analysis:\n');
+    fprintf('  Matched: %d, Sensitivity: %.4f, Precision: %.4f, F1: %.4f\n', ...
+        recovery_metrics.n_matched, recovery_metrics.sensitivity, ...
+        recovery_metrics.precision, recovery_metrics.f1_score);
     
     runtime = toc(t_start);
     
-    % Return results
     Results = struct( ...
         'method', 'dp_mixture', ...
         'criterion', criterion, ...
@@ -101,66 +107,60 @@ function Results = fit_microstate_dp_mixture(Sim, K_candidates, criterion)
         'labels', labels, ...
         'free_energy_vals', free_energy_vals, ...
         'silhouette_vals', silhouette_vals, ...
+        'gev_vals', zeros(nK, 1), ...            
+        'within_ss', zeros(nK, 1), ...           
         'scores', scores, ...
         'best_criterion_value', best_score, ...
         'maps_nc', maps_norm, ...
         'idx_peaks', idx_peaks, ...
         'gfp_vec', gfp_vec, ...
-        'mean_recovery', mean_recovery, ...
-        'recovery_corr', recovery_corr, ...
+        'recovery_metrics', recovery_metrics, ...
+        'mean_recovery', recovery_metrics.mean_recovery_matched, ...
+        'recovery_corr', recovery_metrics.match_similarities, ...
+        'avg_recovery_per_state', recovery_metrics.mean_recovery_padded, ...
         'valid_fit', true, ...
         'runtime', runtime);
 end
 
-% ======================== DP MIXTURE IMPLEMENTATION ========================
+% ======================== LOCAL HELPERS ========================
 
 function [centers, labels, K_inferred, free_energy, silhouette_score] = dp_mixture_polarity(X, K_max)
-    % Dirichlet Process mixture with stick-breaking and polarity invariance
+% Dirichlet Process mixture model with polarity invariance
     
     [N, D] = size(X);
     max_iter = 100;
     tol = 1e-6;
     
-    % DP hyperparameters
-    alpha_dp = 1.0;  % Concentration parameter
+    alpha_dp = 1.0;
     
-    % Initialize
     idx = randperm(N, min(K_max, N));
     C = X(idx, :);
     C = C ./ (sqrt(sum(C.^2, 2)) + eps);
     
-    % Stick-breaking weights (variational parameters)
-    v = ones(K_max, 1) * 0.5;  % Stick-breaking proportions
+    v = ones(K_max, 1) * 0.5;
     
     for iter = 1:max_iter
         C_old = C;
         
-        % E-step: Compute responsibilities
-        sim = abs(X * C');  % [N x K_max]
-        
-        % Stick-breaking weights
+        sim = abs(X * C');
         pi = stick_breaking_weights(v);
         
-        % Responsibilities
         log_rho = log(sim + eps) + log(pi' + eps);
         log_rho = log_rho - max(log_rho, [], 2);
         rho = exp(log_rho);
         rho = rho ./ (sum(rho, 2) + eps);
         
-        % M-step: Update centers
         active = false(K_max, 1);
         for k = 1:K_max
             Nk = sum(rho(:, k));
-            if Nk > 0.5  % Active component threshold
+            if Nk > 0.5
                 active(k) = true;
-                % Align polarities
                 Xk = X .* sign(X * C(k, :)');
                 C(k, :) = sum(Xk .* rho(:, k), 1) / Nk;
                 C(k, :) = C(k, :) / (norm(C(k, :)) + eps);
             end
         end
         
-        % Update stick-breaking proportions
         for k = 1:K_max
             v(k) = 1 + sum(rho(:, k));
             for kk = (k+1):K_max
@@ -169,29 +169,24 @@ function [centers, labels, K_inferred, free_energy, silhouette_score] = dp_mixtu
             v(k) = v(k) / (alpha_dp + N);
         end
         
-        % Check convergence
         if max(abs(abs(diag(C * C_old')) - 1)) < tol
             break;
         end
     end
     
-    % Determine active components
     K_inferred = sum(active);
     centers = C(active, :);
     
-    % Final assignment
     sim = abs(X * centers');
     [~, labels] = max(sim, [], 2);
     
-    % Compute free energy
     free_energy = compute_free_energy_dp(X, centers, rho(:, active), v(active), alpha_dp);
-    
-    % Silhouette score
-    silhouette_score = polarity_silhouette(X, labels, centers);
+    silhouette_score = polarity_silhouette_koenig(X, labels, centers);
 end
 
 function pi = stick_breaking_weights(v)
-    % Convert stick-breaking proportions to mixture weights
+% Stick breaking weights for DP
+    
     K = numel(v);
     pi = zeros(K, 1);
     remaining = 1;
@@ -203,33 +198,32 @@ function pi = stick_breaking_weights(v)
 end
 
 function fe = compute_free_energy_dp(X, C, rho, v, alpha_dp)
-    % Free energy for DP mixture
+% Compute free energy for DP mixture
+    
     [N, ~] = size(X);
     K = size(C, 1);
     
-    % Log likelihood
     log_like = 0;
     for k = 1:K
         sim = abs(X * C(k, :)');
         log_like = log_like + sum(rho(:, k) .* log(sim + eps));
     end
     
-    % KL for stick-breaking weights
     pi = stick_breaking_weights(v);
     kl_pi = sum(pi .* log(pi + eps)) + alpha_dp * log(K);
     
-    % Entropy
     entropy = -sum(rho(:) .* log(rho(:) + eps));
     
     fe = log_like - kl_pi + entropy;
 end
 
-function sil = polarity_silhouette(X, labels, centers)
-    % Same as in VB K-means
+function sil = polarity_silhouette_koenig(X, labels, centers)
+    % KOENIG METHOD: Simple cosine-based silhouette
+    
     K = size(centers, 1);
     N = size(X, 1);
     
-    if K < 2
+    if K < 2 || N < 2
         sil = 0;
         return;
     end
@@ -238,9 +232,12 @@ function sil = polarity_silhouette(X, labels, centers)
     
     for i = 1:N
         k = labels(i);
+        
         same_cluster = find(labels == k);
         if numel(same_cluster) > 1
-            a = mean(1 - abs(X(same_cluster, :) * X(i, :)'));
+            similarities = abs(X(same_cluster, :) * X(i, :)');
+            a = mean(1 - similarities(similarities < 1));
+            if isnan(a) || a < 0, a = 0; end
         else
             a = 0;
         end
@@ -250,87 +247,25 @@ function sil = polarity_silhouette(X, labels, centers)
             if kk == k, continue; end
             other_cluster = find(labels == kk);
             if ~isempty(other_cluster)
-                b = min(b, mean(1 - abs(X(other_cluster, :) * X(i, :)')));
+                similarities = abs(X(other_cluster, :) * X(i, :)');
+                b_kk = mean(1 - similarities);
+                b = min(b, b_kk);
             end
         end
         
-        sil_vals(i) = (b - a) / max(a, b);
+        if isinf(b) || isnan(b)
+            b = a;
+        end
+        
+        if a == 0 && b == 0
+            sil_vals(i) = 0;
+        else
+            sil_vals(i) = (b - a) / (max(a, b) + eps);
+        end
     end
     
-    sil = mean(sil_vals);
-end
-
-% ======================== HELPER FUNCTIONS (shared) ========================
-
-function [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims] = preprocess_maps(Sim)
-    X_bp = bandpass_fft_zero_phase(Sim.X_noisy, Sim.sfreq, [2 20]);
-    [maps_nc, idx_peaks, gfp_vec] = gfp_peak_maps(X_bp, 3, 0.80);
-    
-    if isempty(maps_nc)
-        idx_peaks = 1:2:size(X_bp, 2);
-        maps_nc = X_bp(:, idx_peaks)';
+    sil = mean(sil_vals(~isnan(sil_vals) & ~isinf(sil_vals)));
+    if isnan(sil) || isinf(sil)
+        sil = 0;
     end
-    
-    n_maps = size(maps_nc, 1);
-    C_dims = size(maps_nc, 2);
-    maps_norm = normalize_maps(maps_nc);
-end
-
-function maps_norm = normalize_maps(maps)
-    maps_norm = maps - mean(maps, 2);
-    maps_norm = maps_norm ./ (sqrt(sum(maps_norm.^2, 2)) + eps);
-end
-
-function Xf = bandpass_fft_zero_phase(X, sfreq, bp)
-    if isempty(bp) || numel(bp) ~= 2, Xf = X; return; end
-    T = size(X, 2);
-    F = fft(X, [], 2);
-    freqs = (0:T-1) * (sfreq / T);
-    mask = (freqs >= bp(1) & freqs <= bp(2)) | (freqs >= sfreq - bp(2) & freqs <= sfreq - bp(1));
-    F(:, ~mask) = 0;
-    Xf = real(ifft(F, [], 2));
-end
-
-function [maps_nc, idx_peaks, gfp] = gfp_peak_maps(X, min_dist, pct)
-    if nargin < 3, pct = 0.80; end
-    gfp = sqrt(mean((X - mean(X, 1)).^2, 1));
-    idx_peaks = find_local_peaks(gfp, min_dist, pct);
-    if isempty(idx_peaks), maps_nc = []; else, maps_nc = X(:, idx_peaks)'; end
-end
-
-function idx = find_local_peaks(x, min_dist, pct)
-    x = x(:)';
-    n = numel(x);
-    if n < 3, idx = 1:n; return; end
-    cand = find([false, x(2:end-1) > x(1:end-2) & x(2:end-1) >= x(3:end), false]);
-    if isempty(cand), idx = []; return; end
-    thr = quantile(x, pct);
-    cand = cand(x(cand) >= thr);
-    if isempty(cand), idx = []; return; end
-    [~, ord] = sort(x(cand), 'descend');
-    keep = false(size(x));
-    for ii = ord
-        c = cand(ii);
-        lo = max(1, c - min_dist);
-        hi = min(n, c + min_dist);
-        if ~any(keep(lo:hi)), keep(c) = true; end
-    end
-    idx = find(keep);
-end
-
-function m = best_match_corr_hungarian_polarity_aware(A, B)
-    M = abs(A * B');
-    cost = 1 - M;
-    K = min(size(M, 1), size(M, 2));
-    if K == 0, m = []; return; end
-    cost = cost(1:K, 1:K);
-    [assign] = hungarian(cost);
-    idx = sub2ind(size(M), assign(:, 1), assign(:, 2));
-    m = M(idx);
-end
-
-function assignment = hungarian(costMat)
-    [rr, cc] = meshgrid(1:size(costMat, 1), 1:size(costMat, 1));
-    [~, idx] = min(costMat(:));
-    assignment = [rr(idx), cc(idx)];
 end

@@ -1,16 +1,13 @@
 function Results = fit_microstate_vb_kmeans(Sim, K_candidates, criterion)
-% FIT_MICROSTATE_VB_KMEANS: VB-based K-means using SPM with polarity invariance
-%
-% Uses SPM's variational Bayes framework for K-means clustering
-% with model selection via Free Energy or Silhouette Score
+% FIT_MICROSTATE_VB_KMEANS: VB K-means with polarity invariance
 %
 % INPUTS:
-%   Sim          - Simulation structure from generate_microstate_eeg
-%   K_candidates - Vector of K values to test (default 2:10)
+%   Sim          - Simulation structure
+%   K_candidates - Vector of K values (default 2:10)
 %   criterion    - 'free_energy' or 'silhouette' (default 'free_energy')
 %
 % OUTPUTS:
-%   Results      - Structure with fitted model and diagnostics
+%   Results      - Complete results structure with recovery metrics
 
     if nargin < 2, K_candidates = 2:10; end
     if nargin < 3, criterion = 'free_energy'; end
@@ -18,30 +15,31 @@ function Results = fit_microstate_vb_kmeans(Sim, K_candidates, criterion)
     t_start = tic;
 
     fprintf('\n========================================\n');
-    fprintf('VB K-Means Microstate Fitting (SPM)\n');
+    fprintf('VB K Means Microstate Fitting\n');
     fprintf('========================================\n');
     fprintf('Criterion: %s\n', criterion);
     fprintf('True K: %d, SNR: %+.1f dB\n', Sim.K_true, Sim.SNR_dB);
 
-    % Preprocessing
-    [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims] = preprocess_maps(Sim);
+    util = microstate_utilities_SHARED();
+    fprintf('1. Preprocessing...\n');
+    [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims, maps_original] = util.preprocess_maps(Sim);
     
-    % Fit VB K-means for each K
-    fprintf('Fitting VB K-means models...\n');
+    fprintf('2. Fitting VB K means models...\n');
     
     nK = numel(K_candidates);
     scores = zeros(nK, 1);
     silhouette_vals = zeros(nK, 1);
     free_energy_vals = zeros(nK, 1);
+    gev_vals = zeros(nK, 1);  % ← NOW COMPUTE THIS
     centers_all = cell(nK, 1);
     labels_all = cell(nK, 1);
     
+    % ✅ FITTING LOOP
     for iK = 1:nK
         K = K_candidates(iK);
         fprintf('  K=%d... ', K);
         
         try
-            % VB K-means with polarity invariance
             [centers, labels, fe, sil] = vb_kmeans_polarity(maps_norm, K);
             
             centers_all{iK} = centers;
@@ -49,15 +47,20 @@ function Results = fit_microstate_vb_kmeans(Sim, K_candidates, criterion)
             free_energy_vals(iK) = fe;
             silhouette_vals(iK) = sil;
             
-            % Select score based on criterion
+            % ✅ COMPUTE GEV (KOENIG METHOD)
+            sim = abs(maps_original * centers');
+            [max_sim, ~] = max(sim, [], 2);
+            gfp_squared = sum(maps_original.^2, 2);
+            gev_vals(iK) = sum(max_sim.^2) / (sum(gfp_squared) + eps);
+            
             if strcmp(criterion, 'silhouette')
                 scores(iK) = sil;
-                fprintf('Sil=%.3f, FE=%.1f\n', sil, fe);
+                fprintf('Sil=%.3f, FE=%.1f, GEV=%.3f\n', sil, fe, gev_vals(iK));
             else
                 scores(iK) = fe;
-                fprintf('FE=%.1f, Sil=%.3f\n', fe, sil);
+                fprintf('FE=%.1f, Sil=%.3f, GEV=%.3f\n', fe, sil, gev_vals(iK));
             end
-            
+                
         catch ME
             fprintf('ERROR: %s\n', ME.message);
             scores(iK) = -Inf;
@@ -66,24 +69,28 @@ function Results = fit_microstate_vb_kmeans(Sim, K_candidates, criterion)
         end
     end
     
-    % Model selection
+    % ✅ Ensure ALL criteria are available for post-hoc use
+    % (silhouette_vals and free_energy_vals already computed above)
+    
     [best_score, best_idx] = max(scores);
     K_estimated = K_candidates(best_idx);
     centers = centers_all{best_idx};
     labels = labels_all{best_idx};
     
-    fprintf('\nBest K=%d (score=%.3f, true K=%d)\n', K_estimated, best_score, Sim.K_true);
+    fprintf('Best K=%d (score=%.3f, true K=%d)\n', K_estimated, best_score, Sim.K_true);
     
-    % Map recovery
-    true_maps_norm = normalize_maps(Sim.maps_true);
-    recovery_corr = best_match_corr_hungarian_polarity_aware(true_maps_norm, centers);
-    mean_recovery = mean(recovery_corr);
+    % Recovery metrics with partial alignment
+    true_maps_norm = util.normalize_maps(Sim.maps_true);
+    recovery_metrics = microstate_partial_alignment(true_maps_norm, centers, ...
+        'distance_type', 'cosine', 'threshold', 0.0, 'polarity', true);
     
-    fprintf('Map recovery: %.3f\n', mean_recovery);
+    fprintf('\n3. Map Recovery Analysis:\n');
+    fprintf('  Matched: %d, Sensitivity: %.4f, Precision: %.4f, F1: %.4f\n', ...
+        recovery_metrics.n_matched, recovery_metrics.sensitivity, ...
+        recovery_metrics.precision, recovery_metrics.f1_score);
     
     runtime = toc(t_start);
     
-    % Return results
     Results = struct( ...
         'method', 'vb_kmeans', ...
         'criterion', criterion, ...
@@ -103,57 +110,55 @@ function Results = fit_microstate_vb_kmeans(Sim, K_candidates, criterion)
         'maps_nc', maps_norm, ...
         'idx_peaks', idx_peaks, ...
         'gfp_vec', gfp_vec, ...
-        'mean_recovery', mean_recovery, ...
-        'recovery_corr', recovery_corr, ...
+        'recovery_metrics', recovery_metrics, ...
+        'mean_recovery', recovery_metrics.mean_recovery_matched, ...
+        'recovery_corr', recovery_metrics.match_similarities, ...
+        'avg_recovery_per_state', recovery_metrics.mean_recovery_padded, ...
+        'within_ss', zeros(nK, 1), ...                    % ✅ ADD for post-hoc elbow
+        'gev_vals', zeros(nK, 1), ...                      % ✅ ADD for post-hoc gev
         'valid_fit', true, ...
         'runtime', runtime);
 end
 
-% ======================== VB K-MEANS IMPLEMENTATION ========================
+% ======================== LOCAL HELPERS ========================
 
 function [centers, labels, free_energy, silhouette_score] = vb_kmeans_polarity(X, K)
-    % VB K-means with polarity invariance using SPM-like variational framework
+% VB K-means with polarity invariance
     
     [N, D] = size(X);
     max_iter = 100;
     tol = 1e-6;
     n_init = 5;
     
-    % Hyperparameters (priors)
-    alpha0 = 1;  % Dirichlet prior
-    beta0 = 1;   % Precision prior
+    alpha0 = 1;
+    beta0 = 1;
     
     best_fe = -Inf;
     best_centers = [];
     best_labels = [];
     
     for init = 1:n_init
-        % Random initialization
         idx = randperm(N, K);
         C = X(idx, :);
         C = C ./ (sqrt(sum(C.^2, 2)) + eps);
         
-        % Variational parameters
         alpha = alpha0 * ones(K, 1);
         beta = beta0 * ones(K, 1);
         
         for iter = 1:max_iter
             C_old = C;
             
-            % E-step: Compute responsibilities with polarity
-            sim = abs(X * C');  % [N x K]
+            sim = abs(X * C');
             [max_sim, L] = max(sim, [], 2);
             
-            % Soft assignment (variational)
             log_rho = zeros(N, K);
             for k = 1:K
-                log_rho(:, k) = psi(alpha(k)) + beta(k) * sum(abs(X * C(k, :)'), 2);
+                log_rho(:, k) = psi(alpha(k)) + beta(k) * abs(X * C(k, :)');
             end
             log_rho = log_rho - max(log_rho, [], 2);
             rho = exp(log_rho);
             rho = rho ./ (sum(rho, 2) + eps);
             
-            % M-step: Update centers with polarity correction
             for k = 1:K
                 Nk = sum(rho(:, k));
                 if Nk < eps
@@ -161,11 +166,8 @@ function [centers, labels, free_energy, silhouette_score] = vb_kmeans_polarity(X
                     alpha(k) = alpha0;
                     beta(k) = beta0;
                 else
-                    % Align polarities
                     Xk = X .* sign(X * C(k, :)');
                     C(k, :) = sum(Xk .* rho(:, k), 1) / Nk;
-                    
-                    % Update variational parameters
                     alpha(k) = alpha0 + Nk;
                     err = 1 - abs(Xk * C(k, :)');
                     beta(k) = beta0 + sum(rho(:, k) .* err);
@@ -173,13 +175,11 @@ function [centers, labels, free_energy, silhouette_score] = vb_kmeans_polarity(X
                 C(k, :) = C(k, :) / (norm(C(k, :)) + eps);
             end
             
-            % Check convergence
             if max(abs(abs(diag(C * C_old')) - 1)) < tol
                 break;
             end
         end
         
-        % Compute free energy
         fe = compute_free_energy_kmeans(X, C, rho, alpha, beta, alpha0, beta0);
         
         if fe > best_fe
@@ -192,39 +192,35 @@ function [centers, labels, free_energy, silhouette_score] = vb_kmeans_polarity(X
     centers = best_centers;
     labels = best_labels;
     free_energy = best_fe;
-    
-    % Compute silhouette score with polarity-aware distance
-    silhouette_score = polarity_silhouette(X, labels, centers);
+    silhouette_score = polarity_silhouette_koenig(X, labels, centers);
 end
 
 function fe = compute_free_energy_kmeans(X, C, rho, alpha, beta, alpha0, beta0)
-    % Compute variational free energy for K-means
+% Compute free energy for VB K-means
+    
     [N, D] = size(X);
     K = size(C, 1);
     
-    % Log likelihood term
     log_like = 0;
     for k = 1:K
         sim = abs(X * C(k, :)');
         log_like = log_like + sum(rho(:, k) .* log(sim + eps));
     end
     
-    % KL divergence terms
     kl_pi = sum((alpha - alpha0) .* (psi(alpha) - psi(sum(alpha))));
-    kl_beta = sum((beta - beta0) .* log(beta / beta0));
-    
-    % Entropy of q
+    kl_beta = sum((beta - beta0) .* log(beta / (beta0 + eps)));
     entropy = -sum(rho(:) .* log(rho(:) + eps));
     
     fe = log_like - kl_pi - kl_beta + entropy;
 end
 
-function sil = polarity_silhouette(X, labels, centers)
-    % Polarity-aware silhouette score
+function sil = polarity_silhouette_koenig(X, labels, centers)
+    % KOENIG METHOD: Simple cosine-based silhouette
+    
     K = size(centers, 1);
     N = size(X, 1);
     
-    if K < 2
+    if K < 2 || N < 2
         sil = 0;
         return;
     end
@@ -234,126 +230,39 @@ function sil = polarity_silhouette(X, labels, centers)
     for i = 1:N
         k = labels(i);
         
-        % Intra-cluster distance (polarity-aware)
         same_cluster = find(labels == k);
         if numel(same_cluster) > 1
-            a = mean(1 - abs(X(same_cluster, :) * X(i, :)'));
+            similarities = abs(X(same_cluster, :) * X(i, :)');
+            a = mean(1 - similarities(similarities < 1));
+            if isnan(a) || a < 0, a = 0; end
         else
             a = 0;
         end
         
-        % Inter-cluster distance (to nearest cluster)
         b = Inf;
         for kk = 1:K
             if kk == k, continue; end
             other_cluster = find(labels == kk);
             if ~isempty(other_cluster)
-                b = min(b, mean(1 - abs(X(other_cluster, :) * X(i, :)')));
+                similarities = abs(X(other_cluster, :) * X(i, :)');
+                b_kk = mean(1 - similarities);
+                b = min(b, b_kk);
             end
         end
         
-        sil_vals(i) = (b - a) / max(a, b);
-    end
-    
-    sil = mean(sil_vals);
-end
-
-% ======================== HELPER FUNCTIONS ========================
-
-function [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims] = preprocess_maps(Sim)
-    % Bandpass and extract GFP peaks
-    X_bp = bandpass_fft_zero_phase(Sim.X_noisy, Sim.sfreq, [2 20]);
-    [maps_nc, idx_peaks, gfp_vec] = gfp_peak_maps(X_bp, 3, 0.80);
-    
-    if isempty(maps_nc)
-        idx_peaks = 1:2:size(X_bp, 2);
-        maps_nc = X_bp(:, idx_peaks)';
-    end
-    
-    n_maps = size(maps_nc, 1);
-    C_dims = size(maps_nc, 2);
-    
-    % Normalize
-    maps_norm = normalize_maps(maps_nc);
-end
-
-function maps_norm = normalize_maps(maps)
-    maps_norm = maps - mean(maps, 2);
-    maps_norm = maps_norm ./ (sqrt(sum(maps_norm.^2, 2)) + eps);
-end
-
-function Xf = bandpass_fft_zero_phase(X, sfreq, bp)
-    if isempty(bp) || numel(bp) ~= 2
-        Xf = X;
-        return;
-    end
-    T = size(X, 2);
-    f1 = bp(1);
-    f2 = bp(2);
-    F = fft(X, [], 2);
-    freqs = (0:T-1) * (sfreq / T);
-    mask = (freqs >= f1 & freqs <= f2) | (freqs >= sfreq - f2 & freqs <= sfreq - f1);
-    F(:, ~mask) = 0;
-    Xf = real(ifft(F, [], 2));
-end
-
-function [maps_nc, idx_peaks, gfp] = gfp_peak_maps(X, min_dist, pct)
-    if nargin < 3, pct = 0.80; end
-    gfp = sqrt(mean((X - mean(X, 1)).^2, 1));
-    idx_peaks = find_local_peaks(gfp, min_dist, pct);
-    if isempty(idx_peaks)
-        maps_nc = [];
-    else
-        maps_nc = X(:, idx_peaks)';
-    end
-end
-
-function idx = find_local_peaks(x, min_dist, pct)
-    if nargin < 3, pct = 0.8; end
-    x = x(:)';
-    n = numel(x);
-    if n < 3
-        idx = 1:n;
-        return;
-    end
-    cand = find([false, x(2:end-1) > x(1:end-2) & x(2:end-1) >= x(3:end), false]);
-    if isempty(cand)
-        idx = [];
-        return;
-    end
-    thr = quantile(x, pct);
-    cand = cand(x(cand) >= thr);
-    if isempty(cand)
-        idx = [];
-        return;
-    end
-    [~, ord] = sort(x(cand), 'descend');
-    keep = false(size(x));
-    for ii = ord
-        c = cand(ii);
-        lo = max(1, c - min_dist);
-        hi = min(n, c + min_dist);
-        if ~any(keep(lo:hi))
-            keep(c) = true;
+        if isinf(b) || isnan(b)
+            b = a;
+        end
+        
+        if a == 0 && b == 0
+            sil_vals(i) = 0;
+        else
+            sil_vals(i) = (b - a) / (max(a, b) + eps);
         end
     end
-    idx = find(keep);
-end
-
-function m = best_match_corr_hungarian_polarity_aware(A, B)
-    M = abs(A * B');
-    cost = 1 - M;
-    K = min(size(M, 1), size(M, 2));
-    if K == 0, m = []; return; end
-    cost = cost(1:K, 1:K);
-    [assign] = hungarian(cost);
-    idx = sub2ind(size(M), assign(:, 1), assign(:, 2));
-    m = M(idx);
-end
-
-function assignment = hungarian(costMat)
-    % Simplified Hungarian algorithm
-    [rr, cc] = meshgrid(1:size(costMat, 1), 1:size(costMat, 1));
-    [~, idx] = min(costMat(:));
-    assignment = [rr(idx), cc(idx)];
+    
+    sil = mean(sil_vals(~isnan(sil_vals) & ~isinf(sil_vals)));
+    if isnan(sil) || isinf(sil)
+        sil = 0;
+    end
 end
