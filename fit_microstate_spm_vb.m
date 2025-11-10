@@ -16,6 +16,11 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
         criterion = 'silhouette';
     end
     
+    % GEV criterion is only valid for k-means methods, not for VB/GMM
+    if strcmp(criterion, 'gev')
+        error('GEV criterion is not supported for spm_vb method. Use ''silhouette'', ''free_energy'', ''elbow'', or ''elbow_sil_combined'' instead.');
+    end
+    
     t_start = tic;
 
     fprintf('\n========================================\n');
@@ -163,16 +168,33 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     centers = recover_centers_from_labels(maps_norm, labels, K_estimated);
     fprintf('   Recovered %d microstate centers\n', K_estimated);
 
-    % Map recovery
+    % Map recovery (only if ground truth is available)
     fprintf('5. Computing map recovery...\n');
-    true_maps_norm = util.normalize_maps(Sim.maps_true);
-    recovery_metrics = microstate_partial_alignment(true_maps_norm, centers, ...
-        'distance_type', 'cosine', 'threshold', 0.0, 'polarity', true);
-    
-    fprintf('Map Recovery Analysis:\n');
-    fprintf('  K true: %d, K estimated: %d\n', recovery_metrics.K_true, recovery_metrics.K_estimated);
-    fprintf('  Matched: %d, F1: %.4f\n', recovery_metrics.n_matched, recovery_metrics.f1_score);
-    fprintf('  Sensitivity: %.4f, Precision: %.4f\n\n', ...
+    if isfield(Sim, 'maps_true') && ~isempty(Sim.maps_true)
+        true_maps_norm = util.normalize_maps(Sim.maps_true);
+        recovery_metrics = microstate_partial_alignment(true_maps_norm, centers, ...
+            'distance_type', 'cosine', 'threshold', 0.0, 'polarity', true);
+        
+        fprintf('Map Recovery Analysis:\n');
+        fprintf('  K true: %d, K estimated: %d\n', recovery_metrics.K_true, recovery_metrics.K_estimated);
+        fprintf('  Matched: %d, F1: %.4f\n', recovery_metrics.n_matched, recovery_metrics.f1_score);
+        fprintf('  Sensitivity: %.4f, Precision: %.4f\n\n', ...
+            recovery_metrics.sensitivity, recovery_metrics.precision);
+    else
+        % No ground truth - create empty recovery metrics
+        recovery_metrics = struct(...
+            'K_true', NaN, ...
+            'K_estimated', K_estimated, ...
+            'n_matched', 0, ...
+            'mean_recovery_matched', NaN, ...
+            'mean_recovery_padded', NaN, ...
+            'sensitivity', NaN, ...
+            'precision', NaN, ...
+            'f1_score', NaN, ...
+            'match_similarities', []);
+        true_maps_norm = [];
+        fprintf('No ground truth available - skipping recovery metrics\n\n');
+    end
         recovery_metrics.sensitivity, recovery_metrics.precision);
     
     runtime = toc(t_start);

@@ -65,7 +65,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     % ===== ALL CRITERIA (universal) =====
     all_criteria = {'silhouette', 'free_energy', 'elbow', 'elbow_sil_combined', 'gev'};
     
-    method_names = {'kmeans_koenig', 'spm_vb', 'vb_kmeans'};
+    method_names = {'kmeans_koenig', 'spm_vb'};
     
     % Build list of EEG conditions
     eeg_conditions = [];
@@ -177,10 +177,6 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                     Results = fit_microstate_spm_vb(Sim, CONFIG.K_candidates, 'elbow_sil_combined');
                 elseif strcmp(fit_task.method, 'kmeans_koenig')
                     Results = fit_microstate_kmeans_koenig(Sim, CONFIG.K_candidates, 'silhouette');
-                elseif strcmp(fit_task.method, 'vb_kmeans')
-                    Results = fit_microstate_vb_kmeans(Sim, CONFIG.K_candidates, 'free_energy');
-                elseif strcmp(fit_task.method, 'dp_mixture')
-                    Results = fit_microstate_dp_mixture(Sim, CONFIG.K_candidates, 'free_energy');
                 else
                     Results = [];
                 end
@@ -233,10 +229,6 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                     Results = fit_microstate_spm_vb(Sim, CONFIG.K_candidates, 'elbow_sil_combined');
                 elseif strcmp(fit_task.method, 'kmeans_koenig')
                     Results = fit_microstate_kmeans_koenig(Sim, CONFIG.K_candidates, 'silhouette');
-                elseif strcmp(fit_task.method, 'vb_kmeans')
-                    Results = fit_microstate_vb_kmeans(Sim, CONFIG.K_candidates, 'free_energy');
-                elseif strcmp(fit_task.method, 'dp_mixture')
-                    Results = fit_microstate_dp_mixture(Sim, CONFIG.K_candidates, 'free_energy');
                 else
                     Results = [];
                 end
@@ -318,6 +310,11 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
         for c_idx = 1:n_criteria
             run_id = run_id + 1;
             criterion_str = all_criteria{c_idx};
+            
+            % Skip GEV criterion for non-kmeans methods
+            if strcmp(criterion_str, 'gev') && ~strcmp(method_str, 'kmeans_koenig')
+                continue;
+            end
             
             % Extract K using this criterion
             K_selected = select_K_by_criterion(Results, criterion_str);
