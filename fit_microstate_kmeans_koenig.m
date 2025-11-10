@@ -23,7 +23,11 @@ function Results = fit_microstate_kmeans_koenig(Sim, K_candidates, criterion)
     fprintf('K-Means Microstate Fitting (Koenig Method)\n');
     fprintf('========================================\n');
     fprintf('Computing ALL criteria (will apply %s)\n', criterion);
-    fprintf('True K: %d, SNR: %+.1f dB\n', Sim.K_true, Sim.SNR_dB);
+    if isfield(Sim, 'K_true') && ~isnan(Sim.K_true)
+        fprintf('True K: %d, SNR: %+.1f dB\n', Sim.K_true, Sim.SNR_dB);
+    else
+        fprintf('Real data mode (no ground truth)\n');
+    end
 
     util = microstate_utilities_SHARED();
     [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims, maps_original] = util.preprocess_maps(Sim);
@@ -123,7 +127,12 @@ function Results = fit_microstate_kmeans_koenig(Sim, K_candidates, criterion)
     best_idx = K_est == K_candidates;
     best_idx = find(best_idx, 1);
     
-    fprintf('Selected: K=%d (score=%.4f, true K=%d)\n\n', K_est, best_score, Sim.K_true);
+    fprintf('Selected: K=%d (score=%.4f', K_est, best_score);
+    if isfield(Sim, 'K_true') && ~isnan(Sim.K_true)
+        fprintf(', true K=%d)\n\n', Sim.K_true);
+    else
+        fprintf(')\n\n');
+    end
     
     centers = centers_all{best_idx};
     labels = labels_all{best_idx};
@@ -156,14 +165,30 @@ function Results = fit_microstate_kmeans_koenig(Sim, K_candidates, criterion)
     runtime = toc(t_start);
     
     % Return ALL computed scores
+    if isfield(Sim, 'K_true')
+        K_true_val = Sim.K_true;
+    else
+        K_true_val = NaN;
+    end
+    if isfield(Sim, 'SNR_dB')
+        SNR_dB_val = Sim.SNR_dB;
+    else
+        SNR_dB_val = NaN;
+    end
+    if isfield(Sim, 'duration_s')
+        duration_s_val = Sim.duration_s;
+    else
+        duration_s_val = NaN;
+    end
+    
     Results = struct( ...
         'method', 'kmeans_koenig', ...
         'criterion', criterion, ...
-        'K_true', Sim.K_true, ...
+        'K_true', K_true_val, ...
         'K_estimated', K_est, ...
         'K_candidates', K_candidates, ...
-        'SNR_dB', Sim.SNR_dB, ...
-        'duration_s', Sim.duration_s, ...
+        'SNR_dB', SNR_dB_val, ...
+        'duration_s', duration_s_val, ...
         'n_maps', n_maps, ...
         'centers', centers, ...
         'maps_true', true_maps_norm, ...

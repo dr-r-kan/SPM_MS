@@ -27,7 +27,11 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     fprintf('Microstate VB Fitting (SPM)\n');
     fprintf('========================================\n');
     fprintf('Criterion: %s\n', criterion);
-    fprintf('True K: %d, SNR: %+.1f dB\n', Sim.K_true, Sim.SNR_dB);
+    if isfield(Sim, 'K_true') && ~isnan(Sim.K_true)
+        fprintf('True K: %d, SNR: %+.1f dB\n', Sim.K_true, Sim.SNR_dB);
+    else
+        fprintf('Real data mode (no ground truth)\n');
+    end
 
     if ~exist('spm_mix', 'file')
         error('SPM spm_mix not found in MATLAB path');
@@ -59,6 +63,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     free_energy = zeros(nK, 1);
     silhouette_score = zeros(nK, 1);
     within_ss = zeros(nK, 1);
+    gev_vals = zeros(nK, 1);
     vbmix = cell(nK, 1);
 
     for iK = 1:nK
@@ -73,6 +78,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
                 free_energy(iK) = -Inf;
                 silhouette_score(iK) = -1;
                 within_ss(iK) = Inf;
+                gev_vals(iK) = 0;
             else
                 free_energy(iK) = result.fm;
                 vbmix{iK} = result;
@@ -100,6 +106,8 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
             fprintf('ERROR: %s\n', ME.message);
             free_energy(iK) = -Inf;
             silhouette_score(iK) = -1;
+            within_ss(iK) = Inf;
+            gev_vals(iK) = 0;
             within_ss(iK) = Inf;
         end
     end
@@ -160,7 +168,11 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     best_mix = vbmix{best_idx};
     
     fprintf('Best K: %d\n', K_estimated);
-    fprintf('True K: %d\n\n', Sim.K_true);
+    if isfield(Sim, 'K_true') && ~isnan(Sim.K_true)
+        fprintf('True K: %d\n\n', Sim.K_true);
+    else
+        fprintf('\n');
+    end
 
     % Recover centers
     fprintf('4. Recovering microstate topographies...\n');
@@ -195,19 +207,34 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
         true_maps_norm = [];
         fprintf('No ground truth available - skipping recovery metrics\n\n');
     end
-        recovery_metrics.sensitivity, recovery_metrics.precision);
     
     runtime = toc(t_start);
 
     % Return results
+    if isfield(Sim, 'K_true')
+        K_true_val = Sim.K_true;
+    else
+        K_true_val = NaN;
+    end
+    if isfield(Sim, 'SNR_dB')
+        SNR_dB_val = Sim.SNR_dB;
+    else
+        SNR_dB_val = NaN;
+    end
+    if isfield(Sim, 'duration_s')
+        duration_s_val = Sim.duration_s;
+    else
+        duration_s_val = NaN;
+    end
+    
     Results = struct( ...
     'method', 'spm_vb', ...
     'criterion', criterion, ...
-    'K_true', Sim.K_true, ...
+    'K_true', K_true_val, ...
     'K_estimated', K_estimated, ...
     'K_candidates', K_candidates, ...
-    'SNR_dB', Sim.SNR_dB, ...
-    'duration_s', Sim.duration_s, ...
+    'SNR_dB', SNR_dB_val, ...
+    'duration_s', duration_s_val, ...
     'n_maps', n_maps, ...
     'centers', centers, ...
     'maps_true', true_maps_norm, ...
