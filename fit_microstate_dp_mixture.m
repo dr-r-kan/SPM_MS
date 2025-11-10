@@ -79,16 +79,34 @@ function Results = fit_microstate_dp_mixture(Sim, K_candidates, criterion)
     centers = centers_all{best_idx};
     labels = labels_all{best_idx};
     
-    fprintf('Best K=%d (score=%.3f, true K=%d)\n', K_estimated, best_score, Sim.K_true);
+    fprintf('Best K=%d (score=%.3f, true K=%s)\n', K_estimated, best_score, ...
+        iif(isfield(Sim, 'K_true') && ~isnan(Sim.K_true), num2str(Sim.K_true), 'N/A'));
     
-    true_maps_norm = util.normalize_maps(Sim.maps_true);
-    recovery_metrics = microstate_partial_alignment(true_maps_norm, centers, ...
-        'distance_type', 'cosine', 'threshold', 0.0, 'polarity', true);
-    
-    fprintf('\n3. Map Recovery Analysis:\n');
-    fprintf('  Matched: %d, Sensitivity: %.4f, Precision: %.4f, F1: %.4f\n', ...
-        recovery_metrics.n_matched, recovery_metrics.sensitivity, ...
-        recovery_metrics.precision, recovery_metrics.f1_score);
+    % Recovery (only if ground truth is available)
+    if isfield(Sim, 'maps_true') && ~isempty(Sim.maps_true)
+        true_maps_norm = util.normalize_maps(Sim.maps_true);
+        recovery_metrics = microstate_partial_alignment(true_maps_norm, centers, ...
+            'distance_type', 'cosine', 'threshold', 0.0, 'polarity', true);
+        
+        fprintf('\n3. Map Recovery Analysis:\n');
+        fprintf('  Matched: %d, Sensitivity: %.4f, Precision: %.4f, F1: %.4f\n', ...
+            recovery_metrics.n_matched, recovery_metrics.sensitivity, ...
+            recovery_metrics.precision, recovery_metrics.f1_score);
+    else
+        % No ground truth - create empty recovery metrics
+        recovery_metrics = struct(...
+            'K_true', NaN, ...
+            'K_estimated', K_estimated, ...
+            'n_matched', 0, ...
+            'mean_recovery_matched', NaN, ...
+            'mean_recovery_padded', NaN, ...
+            'sensitivity', NaN, ...
+            'precision', NaN, ...
+            'f1_score', NaN, ...
+            'match_similarities', []);
+        true_maps_norm = [];
+        fprintf('\nNo ground truth available - skipping recovery metrics\n');
+    end
     
     runtime = toc(t_start);
     
@@ -267,5 +285,14 @@ function sil = polarity_silhouette_koenig(X, labels, centers)
     sil = mean(sil_vals(~isnan(sil_vals) & ~isinf(sil_vals)));
     if isnan(sil) || isinf(sil)
         sil = 0;
+    end
+end
+
+function out = iif(condition, true_val, false_val)
+    % Inline if function
+    if condition
+        out = true_val;
+    else
+        out = false_val;
     end
 end
