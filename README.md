@@ -7,7 +7,7 @@ A comprehensive comparison of Variational Bayes and classical methods for EEG mi
 
 ## Overview
 
-This project addresses a fundamental challenge in EEG microstate analysis: **automatic determination of the optimal number of microstates (K)**. We compare multiple Variational Bayes (VB) approaches against classical methods.
+This project addresses a fundamental challenge in EEG microstate analysis: **automatic determination of the optimal number of microstates (K)**. We compare Variational Bayes (VB) Gaussian Mixture Models (VBGMM) using SPM to the traditional method.
 
 ### Key Innovation: The Elbow in the ELBO
 
@@ -21,22 +21,22 @@ This provides a principled, data-driven way to select K without manual inspectio
 
 Traditional microstate analysis relies on:
 - **Modified K-means** with polarity invariance (field standard)
-- **Manual K selection** or heuristics (silhouette, GEV)
+- **Manual K selection** or **heuristics** (silhouette, GEV)
 - **Visual inspection** of topographies
 
 Can we do better with **Variational Bayes**?
 
 This project systematically compares:
-1. **VB approaches** (SPM's VB-GMM, VB K-means, Dirichlet Process)
+1. **VB approaches** (SPM's VB-GMM)
 2. **Classical approaches** (standard modified K-means)
-3. **Model selection criteria** (ELBO elbow, silhouette, GEV)
+3. **Model selection criteria** (silhouette, free energy, free energy elbow, GEV, combined silhouette and free energy elbow)
 
 Using **synthetic data with known ground truth**, we can definitively answer: which method works best?
 
 ## Features
 
 ✅ **Synthetic EEG generation** with realistic microstate structure  
-✅ **Multiple VB methods** leveraging SPM's mixture toolbox for Bayesian methods and free energy minimisation
+✅ **VBGMM** leveraging SPM's mixture toolbox for Bayesian methods and free energy minimisation
 ✅ **Elbow detection** on ELBO curves  
 ✅ **Comprehensive comparison** across SNR levels and true K values  
 ✅ **Recovery metrics** even when K is misestimated  
@@ -51,17 +51,7 @@ Using **synthetic data with known ground truth**, we can definitively answer: wh
 
 ## Citation
 
-If you use this code in your research, please cite:
-
-```bibtex
-@software{microstate_vb_comparison_2025,
-  author = {Kandasamy, Rohan},
-  title = {Microstate VB Method Comparison},
-  year = {2025},
-  url = {https://github.com/dr-r-kan/SeizureMicrostateBehaviour},
-  note = {MATLAB implementation comparing Variational Bayes and classical methods for EEG microstate analysis and K selection}
-}
-```
+If you use this code in your research, please cite the respository - but check to see a publication hasn't been added at the time of your publication!
 
 ### Related Work
 
@@ -73,7 +63,7 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Contact
 
-**Dr. R. Kan**  
+**Dr. Rohan Kandasamy**  
 GitHub: [@dr-r-kan](https://github.com/dr-r-kan)
 
 For questions, issues, or collaboration:
@@ -83,11 +73,4 @@ For questions, issues, or collaboration:
 ## Acknowledgments
 
 - **SPM team** at UCL for the mixture toolbox
-- **Microstate community** for establishing methodology standards
-- **MATLAB** for numerical computing infrastructure
-
----
-
-**Made with ☕ and variational inference**
-
-*"Finding the elbow in the ELBO—because sometimes the best puns are also the best science."*
+- **MICROSTATELAB team** for establishing methodology standards
