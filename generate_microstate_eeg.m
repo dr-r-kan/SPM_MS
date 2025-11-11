@@ -15,7 +15,7 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     
     % Load channel positions from template file
     fprintf('Loading channel positions from template...\n');
-    [pos, chanlocs] = load_chanlocs_from_template();
+    [pos, chanlocs, channel_labels] = load_chanlocs_from_template();
     
     if isempty(pos)
         error('Failed to load channel positions from template file');
@@ -23,6 +23,7 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     
     C = size(pos, 1);
     fprintf('✓ Loaded %d channels from template\n', C);
+    fprintf('✓ Channel labels: %s\n', sprintf('%s ', channel_labels{:}));
     
     % Generate true microstate templates with REALISTIC AMPLITUDE
     % Real microstate maps: 20-50 µV peak amplitude (let's use 30 µV as default)
@@ -113,6 +114,7 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         'sfreq', sfreq, ...
         'pos', pos, ...
         'chanlocs', chanlocs, ...  % Channel location structure
+        'channel_labels', {channel_labels}, ...  % ✅ NEW: Channel labels as cell array
         'K_true', K_true, ...
         'SNR_dB', snr_db, ...
         'duration_s', duration_s, ...
@@ -122,13 +124,14 @@ end
 
 % ======================== CHANNEL MONTAGE ========================
 
-function [pos, chanlocs] = load_chanlocs_from_template()
+function [pos, chanlocs, channel_labels] = load_chanlocs_from_template()
 % LOAD_CHANLOCS_FROM_TEMPLATE: Load channel positions from template SET file
 %
 % Uses the same template file as artifact injection to ensure consistency
 
     pos = [];
     chanlocs = [];
+    channel_labels = {};  % ✅ NEW: Initialize labels
     
     try
         % Find template file
@@ -156,6 +159,18 @@ function [pos, chanlocs] = load_chanlocs_from_template()
         
         chanlocs = EEG_template.chanlocs;
         n_channels = length(chanlocs);
+        
+        % ✅ NEW: Extract channel labels from chanlocs
+        channel_labels = cell(n_channels, 1);
+        for i = 1:n_channels
+            if isfield(chanlocs(i), 'labels') && ~isempty(chanlocs(i).labels)
+                channel_labels{i} = chanlocs(i).labels;
+            else
+                channel_labels{i} = sprintf('Ch%03d', i);  % Fallback
+            end
+        end
+        
+        fprintf('✓ Extracted %d channel labels\n', length(channel_labels));
         
         % Extract 3D positions
         pos = zeros(n_channels, 3);
@@ -190,6 +205,7 @@ function [pos, chanlocs] = load_chanlocs_from_template()
         fprintf('Error loading template: %s\n', ME.message);
         pos = [];
         chanlocs = [];
+        channel_labels = {};
     end
 end
 
