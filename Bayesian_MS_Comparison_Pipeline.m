@@ -3,8 +3,23 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
 %
 % Each method is tested with EVERY criterion (where applicable)
 % Results in: n_eeg_conditions × n_methods × n_criteria rows
+%
+% Requirements:
+% spm on path (development version at spm/spm on github)
+% matlab (version R2025a used for this - other versions not tested)
+% Dr Rohan Kandasamy 8-11-2025
+%
+% Using code from Thomas Koenig
+% (the microstates repository at: ThomasKoenigBern/microstates on github)
 
     addpath("Koenig_code");
+
+    % This is a folder which should contain:
+    %  - eeg_kMeans.m
+    %  - L2NormDim.m
+    %  - mywaitbar.m
+    %  - popFitMSMaps.m
+    % All from the "microstates" repository
     
     test = true;
 
@@ -14,7 +29,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
         addParameter(p, 'reps', 1, @isnumeric);
         addParameter(p, 'K_true_vals', [4], @isnumeric);
         addParameter(p, 'SNR_dbs', [10], @isnumeric);
-        addParameter(p, 'K_candidates', 2:3, @isnumeric);
+        addParameter(p, 'K_candidates', 5:6, @isnumeric);
     else
         addParameter(p, 'out_dir', './out_microstate_comparison', @ischar);
         addParameter(p, 'reps', 8, @isnumeric);
@@ -25,7 +40,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     addParameter(p, 'duration_s', 300, @isnumeric);
     addParameter(p, 'sfreq', 250, @isnumeric);
     addParameter(p, 'set_file', 'MetaMaps_2023_06.set', @ischar);
-    addParameter(p, 'n_workers', 10, @isnumeric);
+    addParameter(p, 'n_workers', 2, @isnumeric);
     addParameter(p, 'cleanup', true, @islogical);
     addParameter(p, 'verbose', true, @islogical);
     parse(p, varargin{:});
@@ -65,7 +80,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     % ===== ALL CRITERIA (universal) =====
     all_criteria = {'silhouette', 'free_energy', 'elbow', 'elbow_sil_combined', 'gev'};
     
-    method_names = {'kmeans_koenig', 'spm_vb'};
+    method_names = {'kmeans_koenig', 'spm_vb', 'vb_kmeans'};
     
     % Build list of EEG conditions
     eeg_conditions = [];
@@ -177,6 +192,10 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                     Results = fit_microstate_spm_vb(Sim, CONFIG.K_candidates, 'elbow_sil_combined');
                 elseif strcmp(fit_task.method, 'kmeans_koenig')
                     Results = fit_microstate_kmeans_koenig(Sim, CONFIG.K_candidates, 'silhouette');
+                elseif strcmp(fit_task.method, 'vb_kmeans')
+                    Results = fit_microstate_vb_kmeans(Sim, CONFIG.K_candidates, 'free_energy');
+                elseif strcmp(fit_task.method, 'dp_mixture')
+                    Results = fit_microstate_dp_mixture(Sim, CONFIG.K_candidates, 'free_energy');
                 else
                     Results = [];
                 end
@@ -229,6 +248,10 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                     Results = fit_microstate_spm_vb(Sim, CONFIG.K_candidates, 'elbow_sil_combined');
                 elseif strcmp(fit_task.method, 'kmeans_koenig')
                     Results = fit_microstate_kmeans_koenig(Sim, CONFIG.K_candidates, 'silhouette');
+                elseif strcmp(fit_task.method, 'vb_kmeans')
+                    Results = fit_microstate_vb_kmeans(Sim, CONFIG.K_candidates, 'free_energy');
+                elseif strcmp(fit_task.method, 'dp_mixture')
+                    Results = fit_microstate_dp_mixture(Sim, CONFIG.K_candidates, 'free_energy');
                 else
                     Results = [];
                 end
@@ -311,11 +334,6 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
             run_id = run_id + 1;
             criterion_str = all_criteria{c_idx};
             
-            % Skip GEV criterion for non-kmeans methods
-            if strcmp(criterion_str, 'gev') && ~strcmp(method_str, 'kmeans_koenig')
-                continue;
-            end
-            
             % Extract K using this criterion
             K_selected = select_K_by_criterion(Results, criterion_str);
             
@@ -356,10 +374,19 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
             
             rows = [rows; result_row]; %#ok<AGROW>
             
-            % Save JSON
+            % Save JSON with metadata for plotting & downstream use
             json_file = fullfile(json_dir, [subj_name '.json']);
             try
-                save_microstate_json(Results, Sim, json_file);
+                META = struct();
+                META.subject = subj_name;
+                META.method = method_str;
+                META.criterion = criterion_str;
+                META.K_true = fit_result.K_true;
+                META.K_estimated = K_selected;
+                META.SNR_dB = fit_result.SNR_dB;
+                META.rep = fit_result.rep;
+                META.runtime_s = Results.runtime;
+                save_microstate_json(Results, Sim, json_file, META);
             catch ME
                 fprintf('⚠ Warning: Could not save JSON for %s: %s\n', subj_name, ME.message);
             end
