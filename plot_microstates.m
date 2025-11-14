@@ -6,8 +6,8 @@
 clear all; close all; clc;
 
 %% Load JSON data
-json_file = 'fit_007_K4_SNR+10_spm_vb_free_energy.json';
-json_file_folder = "E:\EEGs\SPM_MS\out_microstate_comparison\microstates_json\";
+json_file = 'fit_003_K4_SNR+10_kmeans_koenig_elbow.json';
+json_file_folder = "E:\EEGs\SPM_MS_old\out_microstate_comparison\microstates_json\";
 name_stem = erase(json_file, '.json');
 json_file = append(json_file_folder, json_file)
 data = jsondecode(fileread(json_file));

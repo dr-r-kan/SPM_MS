@@ -176,6 +176,8 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                 end
                 
                 if ~isempty(Results) && Results.valid_fit
+                    % Store ONLY essential metadata, NOT full Results or Sim
+                    % (Sim will be accessible in the save step, Results is available above)
                     fit_results_for_eeg{m_idx} = struct(...
                         'fit_id', fit_id, ...
                         'eeg_idx', eeg_idx, ...
@@ -183,8 +185,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                         'K_true', K_true, ...
                         'SNR_dB', SNR_dB, ...
                         'method', method_str, ...
-                        'Results', Results, ...
-                        'Sim', Sim);
+                        'Results', Results);
                     fit_errors_for_eeg{m_idx} = [];
                     n_successful_fits = n_successful_fits + 1;
                 else
@@ -219,7 +220,6 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
             
             fit_result = fit_results_for_eeg{m_idx};
             Results = fit_result.Results;
-            Sim_fit = fit_result.Sim;
             method_str = fit_result.method;
             
             % Apply ALL criteria to this ONE fit
@@ -280,7 +280,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                     META.rep = fit_result.rep;
                     META.runtime_s = Results.runtime;
                     META.channel_labels = ch_labels;  % Explicitly pass channel labels from template
-                    save_microstate_json(Results, Sim_fit, json_file, META);
+                    save_microstate_json(Results, Sim, json_file, META);
                 catch ME
                     if CONFIG.verbose
                         fprintf('⚠ Warning: Could not save JSON for %s: %s\n', subj_name, ME.message);
@@ -288,6 +288,10 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                 end
             end
         end
+        
+        % ===== EXPLICIT MEMORY CLEANUP =====
+        % Clear large data structures after processing this EEG
+        clear Sim Results fit_results_for_eeg fit_errors_for_eeg fit_result;
         
         pb.update();
     end
