@@ -9,7 +9,7 @@
 
 function analyze_comparison_results(varargin)
     % ---------- Parse inputs ----------
-    default_results_dir = './out_microstate_comparison/results';
+    default_results_dir = 'E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction\out_microstate_comparison/results';
     default_n_boot = 10000;
     default_n_boot_lmm = 2000;
     default_n_folds = 20;

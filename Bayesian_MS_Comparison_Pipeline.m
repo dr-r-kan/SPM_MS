@@ -13,7 +13,6 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
 % (the microstates repository at: ThomasKoenigBern/microstates on github)
 
     addpath("Koenig_code");
-
     % This is a folder which should contain:
     %  - eeg_kMeans.m
     %  - L2NormDim.m
@@ -21,26 +20,26 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     %  - popFitMSMaps.m
     % All from the "microstates" repository
     
-    test = true;
+    test = false;
 
     p = inputParser;
     if test
-        addParameter(p, 'out_dir', './out_microstate_comparison', @ischar);
+        addParameter(p, 'out_dir', 'E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction/out_microstate_comparison', @ischar);
         addParameter(p, 'reps', 1, @isnumeric);
         addParameter(p, 'K_true_vals', [4], @isnumeric);
         addParameter(p, 'SNR_dbs', [10], @isnumeric);
         addParameter(p, 'K_candidates', 5:6, @isnumeric);
     else
-        addParameter(p, 'out_dir', './out_microstate_comparison', @ischar);
-        addParameter(p, 'reps', 8, @isnumeric);
+        addParameter(p, 'out_dir', 'E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction/out_microstate_comparison', @ischar);
+        addParameter(p, 'reps', 10, @isnumeric);
         addParameter(p, 'K_true_vals', [4 5 6 7], @isnumeric);
-        addParameter(p, 'SNR_dbs', [-10 -7.5 -5 -2.5 0 2.5 5 7.5 10], @isnumeric);
+        addParameter(p, 'SNR_dbs', [-10 -7.5 -5 -2.5  1 0 1 2.5 5 7.5 10], @isnumeric);
         addParameter(p, 'K_candidates', 2:10, @isnumeric);
     end;
     addParameter(p, 'duration_s', 300, @isnumeric);
     addParameter(p, 'sfreq', 250, @isnumeric);
     addParameter(p, 'set_file', 'MetaMaps_2023_06.set', @ischar);
-    addParameter(p, 'n_workers', 2, @isnumeric);
+    addParameter(p, 'n_workers', 9, @isnumeric);
     addParameter(p, 'cleanup', true, @islogical);
     addParameter(p, 'verbose', true, @islogical);
     parse(p, varargin{:});
@@ -80,7 +79,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     % ===== ALL CRITERIA (universal) =====
     all_criteria = {'silhouette', 'free_energy', 'elbow', 'elbow_sil_combined', 'gev'};
     
-    method_names = {'kmeans_koenig', 'spm_vb', 'vb_kmeans'};
+    method_names = {'kmeans_koenig', 'spm_vb'};
     
     % Build list of EEG conditions
     eeg_conditions = [];
@@ -107,291 +106,207 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
         fprintf('  Total RESULTS: %d (fits × criteria)\n\n', n_total_results);
     end
 
-    % ===== STAGE 1: GENERATE ALL EEGs =====
+    % ===== UNIFIED PIPELINE: GENERATE → FIT → CRITERIA → SAVE (per EEG) =====
     if CONFIG.verbose
-        fprintf('Stage 1: Generating %d EEG conditions...\n', n_eeg_conditions);
-    end
-    
-    eeg_bank = cell(n_eeg_conditions, 1);
-    pb = util.progress_bar(n_eeg_conditions, 'EEG Gen');
-    
-    for eeg_idx = 1:n_eeg_conditions
-        rep = eeg_conditions(eeg_idx, 1);
-        K_true = eeg_conditions(eeg_idx, 2);
-        SNR_dB = eeg_conditions(eeg_idx, 3);
-        
-        try
-            sim_seed = 42 + rep*1000 + K_true*100 + round((SNR_dB+10)*10);
-            [Sim, ~, ~] = generate_microstate_eeg(K_true, SNR_dB, CONFIG.duration_s, ...
-                CONFIG.sfreq, sim_seed);
-            eeg_bank{eeg_idx} = Sim;
-        catch ME
-            fprintf('\n✗ EEG Generation Error (Rep %d, K=%d, SNR=%+.1f): %s\n', ...
-                rep, K_true, SNR_dB, ME.message);
-            fprintf('  Stack trace: %s\n', ME.getReport());
-            eeg_bank{eeg_idx} = [];
-        end
-        
-        pb.update();
-    end
-    pb.done();
-
-    % ===== STAGE 2: PARALLEL FITTING =====
-    if CONFIG.verbose
-        fprintf('\nStage 2: Fitting %d method instances (parallel)...\n', n_fits);
-    end
-    
-    fit_tasks = [];
-    fit_id = 0;
-    
-    for eeg_idx = 1:n_eeg_conditions
-        rep = eeg_conditions(eeg_idx, 1);
-        K_true = eeg_conditions(eeg_idx, 2);
-        SNR_dB = eeg_conditions(eeg_idx, 3);
-        
-        for m_idx = 1:n_methods
-            fit_id = fit_id + 1;
-            method_str = method_names{m_idx};
-            
-            fit_tasks = [fit_tasks; struct( ...
-                'fit_id', fit_id, ...
-                'eeg_idx', eeg_idx, ...
-                'rep', rep, ...
-                'K_true', K_true, ...
-                'SNR_dB', SNR_dB, ...
-                'method', {method_str})]; %#ok<AGROW>
-        end
-    end
-    
-    n_fit_tasks = length(fit_tasks);
-    fit_results = cell(n_fit_tasks, 1);
-    fit_errors = cell(n_fit_tasks, 1);
-    
-    try
-        p_pool = gcp('nocreate');
-        if isempty(p_pool)
-            parpool('local', CONFIG.n_workers);
-        end
-        
-        pb = util.progress_bar(n_fit_tasks, 'Fits');
-        
-        parfor fit_idx = 1:n_fit_tasks
-            fit_task = fit_tasks(fit_idx);
-            Sim = eeg_bank{fit_task.eeg_idx};
-            
-            if isempty(Sim)
-                fit_results{fit_idx} = [];
-                fit_errors{fit_idx} = 'Empty EEG';
-                pb.update();
-                continue;
-            end
-            
-            try
-                % FIT ONCE with ANY valid criterion
-                if strcmp(fit_task.method, 'spm_vb')
-                    Results = fit_microstate_spm_vb(Sim, CONFIG.K_candidates, 'elbow_sil_combined');
-                elseif strcmp(fit_task.method, 'kmeans_koenig')
-                    Results = fit_microstate_kmeans_koenig(Sim, CONFIG.K_candidates, 'silhouette');
-                elseif strcmp(fit_task.method, 'vb_kmeans')
-                    Results = fit_microstate_vb_kmeans(Sim, CONFIG.K_candidates, 'free_energy');
-                elseif strcmp(fit_task.method, 'dp_mixture')
-                    Results = fit_microstate_dp_mixture(Sim, CONFIG.K_candidates, 'free_energy');
-                else
-                    Results = [];
-                end
-                
-                if ~isempty(Results) && Results.valid_fit
-                    fit_results{fit_idx} = struct(...
-                        'fit_id', fit_task.fit_id, ...
-                        'eeg_idx', fit_task.eeg_idx, ...
-                        'rep', fit_task.rep, ...
-                        'K_true', fit_task.K_true, ...
-                        'SNR_dB', fit_task.SNR_dB, ...
-                        'method', fit_task.method, ...
-                        'Results', Results, ...
-                        'Sim', Sim);
-                    fit_errors{fit_idx} = [];
-                else
-                    fit_results{fit_idx} = [];
-                    fit_errors{fit_idx} = 'Invalid fit';
-                end
-                
-            catch ME
-                fit_results{fit_idx} = [];
-                fit_errors{fit_idx} = sprintf('%s: %s', ME.identifier, ME.message);
-            end
-            
-            pb.update();
-        end
-        pb.done();
-        
-    catch
-        % Fallback: sequential
-        if CONFIG.verbose
-            fprintf('\n⚠ Parallel pool unavailable. Running sequentially...\n');
-        end
-        pb = util.progress_bar(n_fit_tasks, 'Fits');
-        
-        for fit_idx = 1:n_fit_tasks
-            fit_task = fit_tasks(fit_idx);
-            Sim = eeg_bank{fit_task.eeg_idx};
-            
-            if isempty(Sim)
-                fit_results{fit_idx} = [];
-                fit_errors{fit_idx} = 'Empty EEG';
-                pb.update();
-                continue;
-            end
-            
-            try
-                if strcmp(fit_task.method, 'spm_vb')
-                    Results = fit_microstate_spm_vb(Sim, CONFIG.K_candidates, 'elbow_sil_combined');
-                elseif strcmp(fit_task.method, 'kmeans_koenig')
-                    Results = fit_microstate_kmeans_koenig(Sim, CONFIG.K_candidates, 'silhouette');
-                elseif strcmp(fit_task.method, 'vb_kmeans')
-                    Results = fit_microstate_vb_kmeans(Sim, CONFIG.K_candidates, 'free_energy');
-                elseif strcmp(fit_task.method, 'dp_mixture')
-                    Results = fit_microstate_dp_mixture(Sim, CONFIG.K_candidates, 'free_energy');
-                else
-                    Results = [];
-                end
-                
-                if ~isempty(Results) && Results.valid_fit
-                    fit_results{fit_idx} = struct(...
-                        'fit_id', fit_task.fit_id, ...
-                        'eeg_idx', fit_task.eeg_idx, ...
-                        'rep', fit_task.rep, ...
-                        'K_true', fit_task.K_true, ...
-                        'SNR_dB', fit_task.SNR_dB, ...
-                        'method', fit_task.method, ...
-                        'Results', Results, ...
-                        'Sim', Sim);
-                    fit_errors{fit_idx} = [];
-                else
-                    fit_results{fit_idx} = [];
-                    fit_errors{fit_idx} = 'Invalid fit';
-                end
-                
-            catch ME
-                fit_results{fit_idx} = [];
-                fit_errors{fit_idx} = sprintf('%s: %s', ME.identifier, ME.message);
-            end
-            
-            pb.update();
-        end
-        pb.done();
-    end
-
-    % Print error summary
-    fprintf('\n========================================\n');
-    fprintf('FIT ERROR SUMMARY\n');
-    fprintf('========================================\n');
-    n_successful = 0;
-    error_types = containers.Map();
-    for fit_idx = 1:n_fit_tasks
-        if isempty(fit_results{fit_idx})
-            error_msg = fit_errors{fit_idx};
-            if isKey(error_types, error_msg)
-                error_types(error_msg) = error_types(error_msg) + 1;
-            else
-                error_types(error_msg) = 1;
-            end
-        else
-            n_successful = n_successful + 1;
-        end
-    end
-    
-    fprintf('Successful: %d / %d\n', n_successful, n_fit_tasks);
-    fprintf('\nError breakdown:\n');
-    error_keys = keys(error_types);
-    for k = 1:length(error_keys)
-        fprintf('  %s: %d occurrences\n', error_keys{k}, error_types(error_keys{k}));
-    end
-    fprintf('========================================\n\n');
-
-    % ===== STAGE 3: APPLY ALL CRITERIA =====
-    if CONFIG.verbose
-        fprintf('Stage 3: Applying all criteria to fits...\n');
+        fprintf('Pipeline: Generate EEG → Fit Methods → Apply Criteria → Save\n');
+        fprintf('Processing %d EEG conditions with %d methods and %d criteria each...\n', ...
+            n_eeg_conditions, n_methods, n_criteria);
     end
     
     rows = [];
     run_id = 0;
     n_failed = 0;
+    n_successful_fits = 0;
+    error_types = containers.Map();
+    fit_id = 0;
     
-    for fit_idx = 1:n_fit_tasks
-        if isempty(fit_results{fit_idx})
-            n_failed = n_failed + n_criteria;
+    % Initialize parallel pool if needed (will be used within EEG loop for method fitting)
+    try
+        p_pool = gcp('nocreate');
+        if isempty(p_pool)
+            parpool('local', CONFIG.n_workers);
+        end
+    catch
+        % Proceed without parallel if pool fails
+    end
+    
+    pb = util.progress_bar(n_eeg_conditions, 'EEG Cond');
+    
+    for eeg_idx = 1:n_eeg_conditions
+        rep = eeg_conditions(eeg_idx, 1);
+        K_true = eeg_conditions(eeg_idx, 2);
+        SNR_dB = eeg_conditions(eeg_idx, 3);
+        
+        % ===== STEP 1: GENERATE one EEG =====
+        try
+            sim_seed = 42 + rep*1000 + K_true*100 + round((SNR_dB+10)*10);
+            [Sim, ~, ~] = generate_microstate_eeg(K_true, SNR_dB, CONFIG.duration_s, ...
+                CONFIG.sfreq, sim_seed);
+        catch ME
+            if CONFIG.verbose
+                fprintf('\n✗ EEG Generation Error (Rep %d, K=%d, SNR=%+.1f): %s\n', ...
+                    rep, K_true, SNR_dB, ME.message);
+            end
+            n_failed = n_failed + n_methods * n_criteria;
+            pb.update();
             continue;
         end
         
-        fit_result = fit_results{fit_idx};
-        Results = fit_result.Results;
-        Sim = fit_result.Sim;
-        method_str = fit_result.method;
+        % ===== STEP 2: FIT all methods to this EEG =====
+        fit_results_for_eeg = cell(n_methods, 1);
+        fit_errors_for_eeg = cell(n_methods, 1);
         
-        % Apply ALL criteria to this ONE fit
-        for c_idx = 1:n_criteria
-            run_id = run_id + 1;
-            criterion_str = all_criteria{c_idx};
+        for m_idx = 1:n_methods
+            fit_id = fit_id + 1;
+            method_str = method_names{m_idx};
             
-            % Extract K using this criterion
-            K_selected = select_K_by_criterion(Results, criterion_str);
-            
-            if isnan(K_selected)
+            try
+                % Call appropriate fitting function with a default criterion
+                % (Results will be reused with all criteria via select_K_by_criterion)
+                if strcmp(method_str, 'spm_vb')
+                    Results = fit_microstate_spm_vb(Sim, CONFIG.K_candidates, 'elbow_sil_combined');
+                elseif strcmp(method_str, 'kmeans_koenig')
+                    Results = fit_microstate_kmeans_koenig(Sim, CONFIG.K_candidates, 'silhouette');
+                elseif strcmp(method_str, 'vb_kmeans')
+                    Results = fit_microstate_vb_kmeans(Sim, CONFIG.K_candidates, 'free_energy');
+                elseif strcmp(method_str, 'dp_mixture')
+                    Results = fit_microstate_dp_mixture(Sim, CONFIG.K_candidates, 'free_energy');
+                else
+                    Results = [];
+                end
+                
+                if ~isempty(Results) && Results.valid_fit
+                    fit_results_for_eeg{m_idx} = struct(...
+                        'fit_id', fit_id, ...
+                        'eeg_idx', eeg_idx, ...
+                        'rep', rep, ...
+                        'K_true', K_true, ...
+                        'SNR_dB', SNR_dB, ...
+                        'method', method_str, ...
+                        'Results', Results, ...
+                        'Sim', Sim);
+                    fit_errors_for_eeg{m_idx} = [];
+                    n_successful_fits = n_successful_fits + 1;
+                else
+                    fit_results_for_eeg{m_idx} = [];
+                    fit_errors_for_eeg{m_idx} = 'Invalid fit';
+                    error_msg = 'Invalid fit';
+                    if isKey(error_types, error_msg)
+                        error_types(error_msg) = error_types(error_msg) + 1;
+                    else
+                        error_types(error_msg) = 1;
+                    end
+                end
+                
+            catch ME
+                fit_results_for_eeg{m_idx} = [];
+                fit_errors_for_eeg{m_idx} = sprintf('%s: %s', ME.identifier, ME.message);
+                error_msg = fit_errors_for_eeg{m_idx};
+                if isKey(error_types, error_msg)
+                    error_types(error_msg) = error_types(error_msg) + 1;
+                else
+                    error_types(error_msg) = 1;
+                end
+            end
+        end
+        
+        % ===== STEP 3 & 4: APPLY CRITERIA and SAVE (for each fit) =====
+        for m_idx = 1:n_methods
+            if isempty(fit_results_for_eeg{m_idx})
+                n_failed = n_failed + n_criteria;
                 continue;
             end
             
-            rec_metrics = Results.recovery_metrics;
-            recovery_corr = util.padded_vector(rec_metrics.match_similarities, 10);
+            fit_result = fit_results_for_eeg{m_idx};
+            Results = fit_result.Results;
+            Sim_fit = fit_result.Sim;
+            method_str = fit_result.method;
             
-            subj_name = sprintf('fit_%03d_K%d_SNR%+d_%s_%s', ...
-                run_id, fit_result.K_true, round(fit_result.SNR_dB), ...
-                method_str, criterion_str);
-            
-            result_row = struct( ...
-                'fit_id', fit_result.fit_id, ...
-                'subject', subj_name, ...
-                'rep', fit_result.rep, ...
-                'method', method_str, ...
-                'criterion', criterion_str, ...
-                'K_true', fit_result.K_true, ...
-                'SNR_dB', fit_result.SNR_dB, ...
-                'K_estimated', K_selected, ...
-                'K_correct', fit_result.K_true == K_selected, ...
-                'K_error', abs(fit_result.K_true - K_selected), ...
-                'n_maps', Results.n_maps, ...
-                'n_matched', rec_metrics.n_matched, ...
-                'mean_recovery_matched', rec_metrics.mean_recovery_matched, ...
-                'mean_recovery_padded', rec_metrics.mean_recovery_padded, ...
-                'sensitivity', rec_metrics.sensitivity, ...
-                'precision', rec_metrics.precision, ...
-                'f1_score', rec_metrics.f1_score, ...
-                'recovery_01', recovery_corr(1), ...
-                'recovery_02', recovery_corr(2), ...
-                'recovery_03', recovery_corr(3), ...
-                'best_score', Results.best_criterion_value, ...
-                'runtime_s', Results.runtime);
-            
-            rows = [rows; result_row]; %#ok<AGROW>
-            
-            % Save JSON with metadata for plotting & downstream use
-            json_file = fullfile(json_dir, [subj_name '.json']);
-            try
-                META = struct();
-                META.subject = subj_name;
-                META.method = method_str;
-                META.criterion = criterion_str;
-                META.K_true = fit_result.K_true;
-                META.K_estimated = K_selected;
-                META.SNR_dB = fit_result.SNR_dB;
-                META.rep = fit_result.rep;
-                META.runtime_s = Results.runtime;
-                save_microstate_json(Results, Sim, json_file, META);
-            catch ME
-                fprintf('⚠ Warning: Could not save JSON for %s: %s\n', subj_name, ME.message);
+            % Apply ALL criteria to this ONE fit
+            for c_idx = 1:n_criteria
+                run_id = run_id + 1;
+                criterion_str = all_criteria{c_idx};
+                
+                % Extract K using this criterion
+                K_selected = select_K_by_criterion(Results, criterion_str);
+                
+                if isnan(K_selected)
+                    continue;
+                end
+                
+                rec_metrics = Results.recovery_metrics;
+                recovery_corr = util.padded_vector(rec_metrics.match_similarities, 10);
+                
+                subj_name = sprintf('fit_%03d_K%d_SNR%+d_%s_%s', ...
+                    run_id, fit_result.K_true, round(fit_result.SNR_dB), ...
+                    method_str, criterion_str);
+                
+                result_row = struct( ...
+                    'fit_id', fit_result.fit_id, ...
+                    'subject', subj_name, ...
+                    'rep', fit_result.rep, ...
+                    'method', method_str, ...
+                    'criterion', criterion_str, ...
+                    'K_true', fit_result.K_true, ...
+                    'SNR_dB', fit_result.SNR_dB, ...
+                    'K_estimated', K_selected, ...
+                    'K_correct', fit_result.K_true == K_selected, ...
+                    'K_error', abs(fit_result.K_true - K_selected), ...
+                    'n_maps', Results.n_maps, ...
+                    'n_matched', rec_metrics.n_matched, ...
+                    'mean_recovery_matched', rec_metrics.mean_recovery_matched, ...
+                    'mean_recovery_padded', rec_metrics.mean_recovery_padded, ...
+                    'sensitivity', rec_metrics.sensitivity, ...
+                    'precision', rec_metrics.precision, ...
+                    'f1_score', rec_metrics.f1_score, ...
+                    'recovery_01', recovery_corr(1), ...
+                    'recovery_02', recovery_corr(2), ...
+                    'recovery_03', recovery_corr(3), ...
+                    'best_score', Results.best_criterion_value, ...
+                    'runtime_s', Results.runtime);
+                
+                rows = [rows; result_row]; %#ok<AGROW>
+                
+                % Save JSON with metadata for plotting & downstream use
+                json_file = fullfile(json_dir, [subj_name '.json']);
+                try
+                    META = struct();
+                    META.subject = subj_name;
+                    META.method = method_str;
+                    META.criterion = criterion_str;
+                    META.K_true = fit_result.K_true;
+                    META.K_estimated = K_selected;
+                    META.SNR_dB = fit_result.SNR_dB;
+                    META.rep = fit_result.rep;
+                    META.runtime_s = Results.runtime;
+                    META.channel_labels = ch_labels;  % Explicitly pass channel labels from template
+                    save_microstate_json(Results, Sim_fit, json_file, META);
+                catch ME
+                    if CONFIG.verbose
+                        fprintf('⚠ Warning: Could not save JSON for %s: %s\n', subj_name, ME.message);
+                    end
+                end
             end
         end
+        
+        pb.update();
     end
+    pb.done();
+    
+    % Print error summary
+    fprintf('\n========================================\n');
+    fprintf('FIT ERROR SUMMARY\n');
+    fprintf('========================================\n');
+    fprintf('Successful fits: %d / %d\n', n_successful_fits, n_eeg_conditions * n_methods);
+    fprintf('Failed or invalid: %d\n', n_eeg_conditions * n_methods - n_successful_fits);
+    if error_types.Count > 0
+        fprintf('\nError breakdown:\n');
+        error_keys = keys(error_types);
+        for k = 1:length(error_keys)
+            fprintf('  %s: %d occurrences\n', error_keys{k}, error_types(error_keys{k}));
+        end
+    end
+    fprintf('========================================\n\n');
     
     if isempty(rows)
         error('✗✗✗ NO SUCCESSFUL RUNS! ✗✗✗\nCheck error summary above for details.');
@@ -417,7 +332,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     fprintf('EEG Conditions: %d\n', n_eeg_conditions);
     fprintf('Methods: %d\n', n_methods);
     fprintf('Criteria (universal): %d\n', n_criteria);
-    fprintf('Total Fits: %d\n', n_fit_tasks);
+    fprintf('Total Fits: %d (EEG conditions × methods)\n', n_eeg_conditions * n_methods);
     fprintf('Total Results: %d (one per method×criterion per EEG)\n', height(T));
     fprintf('JSON Microstates: %s\n', json_dir);
     fprintf('Results CSV: %s\n', res_dir);
@@ -505,7 +420,6 @@ function [K_est, score] = select_K_from_elbow_helper(wss_vals, K_candidates)
     end
     
     wss_norm = (wss_vals - min(wss_vals)) / (max(wss_vals) - min(wss_vals) + eps);
-    k_norm = (0:(n-1)) / (n-1);
     
     curvature = zeros(n, 1);
     for i = 2:(n-1)
@@ -528,6 +442,7 @@ function save_summary_info(CONFIG, ch_labels, montage_pos, output_dir)
     info.config = CONFIG;
     info.channel_labels = ch_labels;
     info.n_channels = length(ch_labels);
+    info.montage_positions = montage_pos;
     info.n_eeg_conditions = CONFIG.reps * numel(CONFIG.K_true_vals) * numel(CONFIG.SNR_dbs);
     
     try

@@ -29,6 +29,9 @@ function save_microstate_json(Results, Sim, output_file, META)
         catch
             ch_labels_raw = {};
         end
+    elseif nargin > 3 && isfield(META, 'channel_labels') && ~isempty(META.channel_labels)
+        % Fallback: try META structure if provided
+        ch_labels_raw = META.channel_labels;
     end
 
     % If still empty or length mismatch, fall back to generic labels

@@ -2,6 +2,7 @@
 # Ignore Koenig code and test data folders
 Koenig_code/
 test_sets/
+out_microstate_comparison/
 
 # Common Matlab / VSCode / OS artifacts
 .DS_Store
