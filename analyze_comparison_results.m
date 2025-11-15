@@ -187,11 +187,11 @@ function analyze_comparison_results(varargin)
     % ---------- Outcomes ----------
     % Note: runtime_s is excluded from main comparison plots and handled separately
     outcomes = {'K_correct', 'f1_score', 'sensitivity', 'precision', 'mean_recovery_matched', 'K_abs_error'};
-    outcome_labels = {'K Selection Accuracy', 'F1 Score', 'Sensitivity', 'Precision', 'Mean Matched Correlation', 'Absolute K Error'};
+    outcome_labels = {'K_{true} Selection Accuracy', 'F1 Score', 'Sensitivity', 'Precision', 'Mean Matched Correlation', 'Absolute K Error'};
     
     % Full outcomes list (including runtime) for LMM analysis
     outcomes_full = {'K_correct', 'f1_score', 'sensitivity', 'precision', 'runtime_s', 'mean_recovery_matched', 'K_abs_error'};
-    outcome_labels_full = {'K Selection Accuracy', 'F1 Score', 'Sensitivity', 'Precision', 'Runtime (s)', 'Mean Matched Correlation', 'Absolute K Error'};
+    outcome_labels_full = {'K_{true} Selection Accuracy', 'F1 Score', 'Sensitivity', 'Precision', 'Runtime (s)', 'Mean Matched Correlation', 'Absolute K Error'};
 
     % ---------- Analyses ----------
     fprintf('1) METHOD effects\n');    method_results = analyze_factor_effects_with_ci(T, 'method', outcomes_full, fid);
@@ -833,7 +833,7 @@ function create_avg_k_error_plot(T, plots_dir)
     set(gca,'XTick',1:nC,'XTickLabel',clean_levels,'XTickLabelRotation',45,'YTick',1:nM,...
             'YTickLabel',cellfun(@(s)strrep(s,'_',' '),methods,'UniformOutput',false), ...
             'Color', 'white', 'XColor', 'black', 'YColor', 'black');
-    title('Average Signed K Error (K_{estimated} - K_{true})', 'FontSize', 12, 'FontWeight', 'bold');
+    title('Average Signed K Error (K_{est} - K_{true})', 'FontSize', 12, 'FontWeight', 'bold');
     for m = 1:nM
         for c = 1:nC
             if ~isnan(mean_err(m,c)), text(c,m,sprintf('%.2f\n(n=%d)',mean_err(m,c),count_n(m,c)),...

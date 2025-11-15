@@ -6,8 +6,9 @@
 clear all; close all; clc;
 
 %% Load JSON data
-json_file = 'fit_003_K4_SNR+10_kmeans_koenig_elbow.json';
-json_file_folder = "E:\EEGs\SPM_MS_old\out_microstate_comparison\microstates_json\";
+json_file = 'fit_017_K4_SNR-8_spm_vb_free_energy.json';
+json_file_folder = "E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction\out_microstate_comparison\microstates_json\";
+plot_folder = "E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction\out_microstate_comparison\plots\";
 name_stem = erase(json_file, '.json');
 json_file = append(json_file_folder, json_file)
 data = jsondecode(fileread(json_file));
@@ -346,11 +347,17 @@ if n_extra_est > 0
         set(h_cbar, 'FontSize', 9);
     end
     meta_str = format_meta_short(META);
-    title_str = sprintf('Unmatched/Extra Estimated Microstates (%d states)\n%s', n_extra_est, meta_str);
+    % Split metadata at K_true to put it on a new line
+    if contains(meta_str, 'K_{true}')
+        parts = strsplit(meta_str, 'K_{true}');
+        title_str = sprintf('Unmatched/Extra Estimated Microstates (%d states)\n%s\nK_{true}%s', n_extra_est, parts{1}, parts{2});
+    else
+        title_str = sprintf('Unmatched/Extra Estimated Microstates (%d states)\n%s', n_extra_est, meta_str);
+    end
     t_extra.Title.String = title_str;
     t_extra.Title.FontSize = 14;
     t_extra.Title.FontWeight = 'bold';
-    t_extra.Title.Interpreter = 'none';
+    t_extra.Title.Interpreter = 'tex';
     try
         t_extra.Title.Color = [0 0 0];
     catch
@@ -363,12 +370,14 @@ fprintf('\nSaving figures...\n');
 
 if isfield(data, 'matches') && ~isempty(data.matches)
     save_name = sprintf('%s_matched_detail.png', name_stem);
+    save_name = append(plot_folder, save_name);
     saveas(fig_matched, save_name);
     fprintf('✓ Saved matched plot\n');
 end
 
 if n_extra_est > 0
     save_name = sprintf('%s_unmatched_estimated.png', name_stem);
+    save_name = append(plot_folder, save_name);
     saveas(fig_extra, save_name);
     fprintf('✓ Saved unmatched plot\n');
 end
@@ -382,11 +391,21 @@ function s = format_meta_short(M)
         s = '';
         return;
     end
+    
+    % Get formatters from utilities
+    util = microstate_utilities_SHARED();
+    
     parts = {};
-    if isfield(M, 'method'), parts{end+1} = sprintf('Method: %s', M.method); end
-    if isfield(M, 'criterion'), parts{end+1} = sprintf('Criterion: %s', M.criterion); end
-    if isfield(M, 'K_true'), parts{end+1} = sprintf('K_true: %d', M.K_true); end
-    if isfield(M, 'K_estimated'), parts{end+1} = sprintf('K_est: %d', M.K_estimated); end
+    if isfield(M, 'method')
+        method_display = util.format_method_name(M.method);
+        parts{end+1} = sprintf('Method: %s', method_display);
+    end
+    if isfield(M, 'criterion')
+        criterion_display = util.format_criterion_name(M.criterion);
+        parts{end+1} = sprintf('Criterion: %s', criterion_display);
+    end
+    if isfield(M, 'K_true'), parts{end+1} = sprintf('K_{true}: %d', M.K_true); end
+    if isfield(M, 'K_estimated'), parts{end+1} = sprintf('K_{est}: %d', M.K_estimated); end
     if isfield(M, 'SNR_dB'), parts{end+1} = sprintf('SNR: %+.0fdB', M.SNR_dB); end
     if isfield(M, 'runtime_s'), parts{end+1} = sprintf('Runtime: %.1fs', M.runtime_s); end
     s = strjoin(parts, ' | ');

@@ -463,6 +463,7 @@ function print_summary(T)
     fprintf('COMPARISON SUMMARY\n');
     fprintf('========================================\n');
     
+    util = microstate_utilities_SHARED();
     methods = unique(T.method);
     if istable(methods), methods = table2cell(methods); end
     
@@ -479,7 +480,9 @@ function print_summary(T)
         matched = mean(T.n_matched(mask), 'omitnan');
         rt = mean(T.runtime_s(mask), 'omitnan');
         
-        fprintf('%-20s %9.1f%% %10.3f %10.1f %9.1fs\n', m, acc, f1, matched, rt);
+        % Format method name for display
+        m_display = util.format_method_name(m);
+        fprintf('%-20s %9.1f%% %10.3f %10.1f %9.1fs\n', m_display, acc, f1, matched, rt);
     end
     
     fprintf('\n');

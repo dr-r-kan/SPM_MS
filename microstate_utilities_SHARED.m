@@ -8,6 +8,8 @@ function utils = microstate_utilities_SHARED()
     utils.bandpass_filter = @bandpass_fft_zero_phase_internal;
     utils.extract_gfp_peaks = @gfp_peak_maps_internal;
     utils.padded_vector = @pad_vector_internal;
+    utils.format_method_name = @format_method_name_internal;
+    utils.format_criterion_name = @format_criterion_name_internal;
     utils.progress_bar = @progbar_internal;
     utils.duration_string = @dur_str_internal;
     utils.on_off_string = @onoff_internal;
@@ -201,4 +203,52 @@ function pos = fibonacci_sphere_internal(C)
     z = 1 - 2 * i / C;
     r = sqrt(max(0, 1 - z.^2));
     pos = [r.*cos(phi), r.*sin(phi), z];
+end
+
+% ======================== DISPLAY FORMATTING ========================
+
+function display_name = format_method_name_internal(method_code)
+% FORMAT_METHOD_NAME_INTERNAL: Convert method code to display name
+% Examples: 'kmeans_koenig' -> 'K-means', 'spm_vb' -> 'VB GMM'
+    
+    if ischar(method_code) || isstring(method_code)
+        method_code = char(method_code);
+    end
+    
+    switch method_code
+        case 'kmeans_koenig'
+            display_name = 'K-means';
+        case 'spm_vb'
+            display_name = 'VB GMM';
+        case 'vb_kmeans'
+            display_name = 'VB K-means';
+        case 'dp_mixture'
+            display_name = 'DP Mixture';
+        otherwise
+            display_name = method_code;  % Fallback to original
+    end
+end
+
+function display_name = format_criterion_name_internal(criterion_code)
+% FORMAT_CRITERION_NAME_INTERNAL: Convert criterion code to display name
+% Examples: 'elbow_sil_combined' -> 'Elbow+Silhouette'
+    
+    if ischar(criterion_code) || isstring(criterion_code)
+        criterion_code = char(criterion_code);
+    end
+    
+    switch criterion_code
+        case 'silhouette'
+            display_name = 'Silhouette';
+        case 'free_energy'
+            display_name = 'Free Energy';
+        case 'elbow'
+            display_name = 'Elbow';
+        case 'elbow_sil_combined'
+            display_name = 'Elbow+Silhouette';
+        case 'gev'
+            display_name = 'GEV';
+        otherwise
+            display_name = criterion_code;  % Fallback to original
+    end
 end
