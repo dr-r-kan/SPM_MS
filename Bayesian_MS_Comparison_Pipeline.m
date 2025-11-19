@@ -173,12 +173,13 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                 else
                     % Reduce to specified montage
                     [EEG_reduced, pos_reduced, chanlocs_reduced, labels_reduced, indices] = ...
-                        select_montage_subset(Sim_full.EEG, Sim_full.pos, ...
-                        Sim_full.chanlocs, ch_labels, montage_type);
+                        select_montage_subset(Sim_full.X_noisy, Sim_full.pos, ...
+                        Sim_full.chanlocs, Sim_full.channel_labels, montage_type);
                     
                     % Create reduced Sim structure
                     Sim = Sim_full;
-                    Sim.EEG = EEG_reduced;
+                    Sim.X_noisy = EEG_reduced;
+                    Sim.X_clean = Sim_full.X_clean(indices, :);
                     Sim.pos = pos_reduced;
                     Sim.chanlocs = chanlocs_reduced;
                     Sim.channel_labels = labels_reduced;
@@ -190,7 +191,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                 
                 % Add montage metadata to Sim
                 Sim.montage_type = montage_type;
-                Sim.n_channels = size(Sim.EEG, 1);
+                Sim.n_channels = size(Sim.X_noisy, 1);
                 
             catch ME
                 if CONFIG.verbose
