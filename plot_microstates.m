@@ -26,6 +26,17 @@ end
 fprintf('Loaded JSON metadata:\n');
 disp(META);
 
+% Extract montage information if present
+montage_type = 'full';
+n_leads = 71;
+if isfield(META, 'montage_type')
+    montage_type = META.montage_type;
+end
+if isfield(META, 'n_leads')
+    n_leads = META.n_leads;
+end
+fprintf('Montage: %s (%d leads)\n', montage_type, n_leads);
+
 %% Extract data from JSON
 true_microstates = data.true_microstates;
 estimated_microstates = data.estimated_microstates;
@@ -403,6 +414,13 @@ function s = format_meta_short(M)
     if isfield(M, 'criterion')
         criterion_display = util.format_criterion_name(M.criterion);
         parts{end+1} = sprintf('Criterion: %s', criterion_display);
+    end
+    if isfield(M, 'montage_type')
+        montage_str = M.montage_type;
+        if isfield(M, 'n_leads')
+            montage_str = sprintf('%s (%d leads)', montage_str, M.n_leads);
+        end
+        parts{end+1} = sprintf('Montage: %s', montage_str);
     end
     if isfield(M, 'K_true'), parts{end+1} = sprintf('K_{true}: %d', M.K_true); end
     if isfield(M, 'K_estimated'), parts{end+1} = sprintf('K_{est}: %d', M.K_estimated); end
