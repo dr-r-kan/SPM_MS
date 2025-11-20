@@ -62,6 +62,19 @@ function analyze_comparison_results(varargin)
     T = readtable(csv_file);
     fprintf('✓ Loaded %d observations\n\n', height(T));
 
+    % ---------- Backward compatibility: Add montage columns if missing ----------
+    if ~ismember('montage_type', T.Properties.VariableNames)
+        fprintf('⚠ Legacy results detected: montage_type column not found\n');
+        fprintf('  Adding default montage_type = ''full''\n\n');
+        T.montage_type = repmat({'full'}, height(T), 1);
+    end
+
+    if ~ismember('n_leads', T.Properties.VariableNames)
+        fprintf('⚠ Legacy results detected: n_leads column not found\n');
+        fprintf('  Adding default n_leads = 71 (full montage)\n\n');
+        T.n_leads = repmat(71, height(T), 1);
+    end
+
     % ---------- Derived columns ----------
     % K_error signed
     if ismember('K_estimated', T.Properties.VariableNames) && ismember('K_true', T.Properties.VariableNames)
@@ -234,6 +247,13 @@ function analyze_comparison_results(varargin)
     
     create_avg_k_error_plot(T, plots_dir);
     create_abs_k_error_plot(T, plots_dir);
+
+    % ---------- Montage Comparison (if montage data available) ----------
+    montages = unique(T.montage_type);
+    if length(montages) > 1
+        fprintf('Generating montage comparison plots...\n');
+        create_montage_comparison_plots(T, outcomes, outcome_labels, plots_dir);
+    end
 
     fprintf('All plots saved in %s\n', plots_dir);
 end
@@ -929,4 +949,225 @@ end
 
 function r = ifthenelse(cond, true_val, false_val)
     if cond, r = true_val; else r = false_val; end
+end
+
+function create_montage_comparison_plots(T, outcomes, outcome_labels, plots_dir)
+    % CREATE_MONTAGE_COMPARISON_PLOTS: Generate montage robustness analysis plots
+    %
+    % Creates plots comparing performance across different montages:
+    %   - K estimation accuracy vs lead count
+    %   - Recovery metrics vs lead count
+    %   - Boxplots by montage for key outcomes
+    
+    montages = unique(T.montage_type);
+    methods = unique(T.method);
+    
+    % Get lead counts for each montage
+    lead_counts = zeros(size(montages));
+    for i = 1:length(montages)
+        idx = find(strcmp(T.montage_type, montages{i}), 1);
+        if ~isempty(idx)
+            lead_counts(i) = T.n_leads(idx);
+        end
+    end
+    
+    % Sort by lead count
+    [lead_counts, sort_idx] = sort(lead_counts);
+    montages = montages(sort_idx);
+    
+    % ===== PLOT 1: K Accuracy vs Lead Count =====
+    fig = figure('Position', [100 100 1200 500]);
+    colors = lines(length(methods));
+    
+    % Subplot 1: Accuracy by method
+    subplot(1, 2, 1);
+    hold on;
+    
+    for m = 1:length(methods)
+        method = methods{m};
+        acc = zeros(size(montages));
+        err = zeros(size(montages));
+        
+        for i = 1:length(montages)
+            idx = strcmp(T.montage_type, montages{i}) & strcmp(T.method, method);
+            if any(idx)
+                acc(i) = mean(T.K_correct(idx));
+                err(i) = std(T.K_correct(idx)) / sqrt(sum(idx));
+            end
+        end
+        
+        errorbar(lead_counts, acc * 100, err * 100, 'o-', ...
+            'LineWidth', 2, 'MarkerSize', 8, 'Color', colors(m, :), ...
+            'DisplayName', strrep(method, '_', ' '));
+    end
+    
+    xlabel('Number of Leads', 'FontSize', 12);
+    ylabel('K Estimation Accuracy (%)', 'FontSize', 12);
+    title('K Estimation Accuracy vs Lead Count', 'FontSize', 14);
+    legend('Location', 'best', 'FontSize', 11);
+    grid on;
+    set(gca, 'FontSize', 11);
+    
+    % Subplot 2: Mean absolute error
+    subplot(1, 2, 2);
+    hold on;
+    
+    for m = 1:length(methods)
+        method = methods{m};
+        mae = zeros(size(montages));
+        err = zeros(size(montages));
+        
+        for i = 1:length(montages)
+            idx = strcmp(T.montage_type, montages{i}) & strcmp(T.method, method);
+            if any(idx) && ismember('K_abs_error', T.Properties.VariableNames)
+                mae(i) = mean(T.K_abs_error(idx));
+                err(i) = std(T.K_abs_error(idx)) / sqrt(sum(idx));
+            elseif any(idx) && ismember('K_error', T.Properties.VariableNames)
+                mae(i) = mean(abs(T.K_error(idx)));
+                err(i) = std(abs(T.K_error(idx))) / sqrt(sum(idx));
+            end
+        end
+        
+        errorbar(lead_counts, mae, err, 'o-', ...
+            'LineWidth', 2, 'MarkerSize', 8, 'Color', colors(m, :), ...
+            'DisplayName', strrep(method, '_', ' '));
+    end
+    
+    xlabel('Number of Leads', 'FontSize', 12);
+    ylabel('Mean Absolute K Error', 'FontSize', 12);
+    title('K Error vs Lead Count', 'FontSize', 14);
+    legend('Location', 'best', 'FontSize', 11);
+    grid on;
+    set(gca, 'FontSize', 11);
+    
+    saveas(fig, fullfile(plots_dir, 'montage_k_accuracy_vs_leads.png'));
+    close(fig);
+    
+    % ===== PLOT 2: Recovery vs Lead Count =====
+    if ismember('mean_recovery_matched', T.Properties.VariableNames)
+        fig = figure('Position', [100 100 1200 500]);
+        
+        % Subplot 1: Mean Recovery (Matched)
+        subplot(1, 2, 1);
+        hold on;
+        
+        for m = 1:length(methods)
+            method = methods{m};
+            rec = zeros(size(montages));
+            err = zeros(size(montages));
+            
+            for i = 1:length(montages)
+                idx = strcmp(T.montage_type, montages{i}) & strcmp(T.method, method);
+                if any(idx)
+                    rec(i) = mean(T.mean_recovery_matched(idx));
+                    err(i) = std(T.mean_recovery_matched(idx)) / sqrt(sum(idx));
+                end
+            end
+            
+            errorbar(lead_counts, rec, err, 'o-', ...
+                'LineWidth', 2, 'MarkerSize', 8, 'Color', colors(m, :), ...
+                'DisplayName', strrep(method, '_', ' '));
+        end
+        
+        xlabel('Number of Leads', 'FontSize', 12);
+        ylabel('Mean Recovery (Matched)', 'FontSize', 12);
+        title('Recovery vs Lead Count', 'FontSize', 14);
+        legend('Location', 'best', 'FontSize', 11);
+        grid on;
+        set(gca, 'FontSize', 11);
+        
+        % Subplot 2: Sensitivity
+        subplot(1, 2, 2);
+        hold on;
+        
+        if ismember('sensitivity', T.Properties.VariableNames)
+            for m = 1:length(methods)
+                method = methods{m};
+                sen = zeros(size(montages));
+                err = zeros(size(montages));
+                
+                for i = 1:length(montages)
+                    idx = strcmp(T.montage_type, montages{i}) & strcmp(T.method, method);
+                    if any(idx)
+                        sen(i) = mean(T.sensitivity(idx));
+                        err(i) = std(T.sensitivity(idx)) / sqrt(sum(idx));
+                    end
+                end
+                
+                errorbar(lead_counts, sen, err, 'o-', ...
+                    'LineWidth', 2, 'MarkerSize', 8, 'Color', colors(m, :), ...
+                    'DisplayName', strrep(method, '_', ' '));
+            end
+            
+            xlabel('Number of Leads', 'FontSize', 12);
+            ylabel('Sensitivity', 'FontSize', 12);
+            title('Sensitivity vs Lead Count', 'FontSize', 14);
+            legend('Location', 'best', 'FontSize', 11);
+            grid on;
+            set(gca, 'FontSize', 11);
+        end
+        
+        saveas(fig, fullfile(plots_dir, 'montage_recovery_vs_leads.png'));
+        close(fig);
+    end
+    
+    % ===== PLOT 3: Boxplots by Montage =====
+    % Create montage labels with lead counts
+    montage_labels = cell(size(montages));
+    for i = 1:length(montages)
+        montage_labels{i} = sprintf('%s (%d)', montages{i}, lead_counts(i));
+    end
+    
+    % K Accuracy boxplot
+    fig = figure('Position', [100 100 800 600]);
+    
+    data_groups = [];
+    group_labels = {};
+    
+    for i = 1:length(montages)
+        idx = strcmp(T.montage_type, montages{i});
+        if any(idx)
+            data_groups = [data_groups; T.K_correct(idx) * 100]; %#ok<AGROW>
+            group_labels = [group_labels; repmat(montage_labels(i), sum(idx), 1)]; %#ok<AGROW>
+        end
+    end
+    
+    boxplot(data_groups, group_labels);
+    ylabel('K Estimation Accuracy (%)', 'FontSize', 12);
+    xlabel('Montage', 'FontSize', 12);
+    title('K Estimation Accuracy by Montage', 'FontSize', 14);
+    grid on;
+    set(gca, 'FontSize', 11);
+    
+    saveas(fig, fullfile(plots_dir, 'montage_k_accuracy_boxplot.png'));
+    close(fig);
+    
+    % Recovery boxplot (if available)
+    if ismember('mean_recovery_matched', T.Properties.VariableNames)
+        fig = figure('Position', [100 100 800 600]);
+        
+        data_groups = [];
+        group_labels = {};
+        
+        for i = 1:length(montages)
+            idx = strcmp(T.montage_type, montages{i});
+            if any(idx)
+                data_groups = [data_groups; T.mean_recovery_matched(idx)]; %#ok<AGROW>
+                group_labels = [group_labels; repmat(montage_labels(i), sum(idx), 1)]; %#ok<AGROW>
+            end
+        end
+        
+        boxplot(data_groups, group_labels);
+        ylabel('Mean Recovery (Matched)', 'FontSize', 12);
+        xlabel('Montage', 'FontSize', 12);
+        title('Mean Recovery by Montage', 'FontSize', 14);
+        grid on;
+        set(gca, 'FontSize', 11);
+        
+        saveas(fig, fullfile(plots_dir, 'montage_recovery_boxplot.png'));
+        close(fig);
+    end
+    
+    fprintf('✓ Montage comparison plots saved\n');
+end
 end
