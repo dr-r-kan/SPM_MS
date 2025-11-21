@@ -6,9 +6,9 @@
 clear all; close all; clc;
 
 %% Load JSON data
-json_file = 'fit_041_K4_SNR+1_kmeans_koenig_silhouette.json';
-json_file_folder = "E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction\out_microstate_comparison\microstates_json\";
-plot_folder = "E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction\out_microstate_comparison\plots\";
+json_file = 'fit_001_K4_SNR-10_full_kmeans_koenig_silhouette.json';
+json_file_folder = '/home/rohan/PycharmProjects/SPM_MS/Output/microstates_json/';
+plot_folder = '/home/rohan/PycharmProjects/SPM_MS/Output/plots/';
 name_stem = erase(json_file, '.json');
 json_file = append(json_file_folder, json_file)
 data = jsondecode(fileread(json_file));

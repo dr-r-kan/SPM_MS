@@ -180,6 +180,15 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     centers = recover_centers_from_labels(maps_norm, labels, K_estimated);
     fprintf('   Recovered %d microstate centers\n', K_estimated);
 
+    % Extract confidence (posterior weights) from VBGMM
+    if isfield(best_mix, 'n')
+        cluster_weights = best_mix.n / sum(best_mix.n);
+    elseif isfield(best_mix, 'gamma')
+        cluster_weights = sum(best_mix.gamma, 1) / sum(best_mix.gamma(:));
+    else
+        cluster_weights = ones(1, K_estimated) / K_estimated;
+    end
+
     % Map recovery (only if ground truth is available)
     fprintf('5. Computing map recovery...\n');
     if isfield(Sim, 'maps_true') && ~isempty(Sim.maps_true)
@@ -237,6 +246,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     'duration_s', duration_s_val, ...
     'n_maps', n_maps, ...
     'centers', centers, ...
+    'cluster_weights', cluster_weights, ...  % ✅ Added confidence measure
     'maps_true', true_maps_norm, ...
     'labels', labels, ...
     'free_energy', free_energy, ...

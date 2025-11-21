@@ -24,13 +24,13 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
 
     p = inputParser;
     if test
-        addParameter(p, 'out_dir', 'E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction/out_microstate_comparison', @ischar);
+        addParameter(p, 'out_dir', 'Output', @ischar);
         addParameter(p, 'reps', 1, @isnumeric);
         addParameter(p, 'K_true_vals', [4], @isnumeric);
         addParameter(p, 'SNR_dbs', [10], @isnumeric);
         addParameter(p, 'K_candidates', 5:6, @isnumeric);
     else
-        addParameter(p, 'out_dir', 'E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction/out_microstate_comparison', @ischar);
+        addParameter(p, 'out_dir', 'Output', @ischar);
         addParameter(p, 'reps', 10, @isnumeric);
         addParameter(p, 'K_true_vals', [4 5 6 7], @isnumeric);
         addParameter(p, 'SNR_dbs', [-10 -7.5 -5 -2.5  1 0 1 2.5 5 7.5 10], @isnumeric);
@@ -39,10 +39,10 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     addParameter(p, 'duration_s', 300, @isnumeric);
     addParameter(p, 'sfreq', 250, @isnumeric);
     addParameter(p, 'set_file', 'MetaMaps_2023_06.set', @ischar);
-    addParameter(p, 'n_workers', 9, @isnumeric);
+    addParameter(p, 'n_workers', 12, @isnumeric);
     addParameter(p, 'cleanup', true, @islogical);
     addParameter(p, 'verbose', true, @islogical);
-    addParameter(p, 'montages', {'full'}, @iscell);  % NEW: montage robustness analysis
+    addParameter(p, 'montages', {'full', '10-20-20', '10-20-12'}, @iscell);  % montage robustness analysis
     parse(p, varargin{:});
     
     CONFIG = p.Results;
@@ -130,15 +130,29 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     try
         p_pool = gcp('nocreate');
         if isempty(p_pool)
-            parpool('local', CONFIG.n_workers);
+            % Check available cores and set pool size
+            max_workers = maxNumCompThreads();
+            n_workers = min(CONFIG.n_workers, max_workers);
+            fprintf('Starting parallel pool with %d workers (max available: %d)\n', n_workers, max_workers);
+            parpool('local', n_workers);
+        else
+            fprintf('Using existing parallel pool with %d workers\n', p_pool.NumWorkers);
         end
-    catch
-        % Proceed without parallel if pool fails
+    catch ME
+        fprintf('Warning: Could not start parallel pool: %s\n', ME.message);
+        fprintf('Falling back to serial execution\n');
     end
     
-    pb = util.progress_bar(n_eeg_conditions, 'EEG Cond');
+    % Prepare for parallel execution
+    all_results = cell(n_eeg_conditions, 1);
     
-    for eeg_idx = 1:n_eeg_conditions
+    % We cannot use the progress bar object inside parfor easily
+    fprintf('Starting parallel processing of %d EEG conditions...\n', n_eeg_conditions);
+    
+    parfor eeg_idx = 1:n_eeg_conditions
+        % Local variables for this iteration
+        local_rows = [];
+        
         rep = eeg_conditions(eeg_idx, 1);
         K_true = eeg_conditions(eeg_idx, 2);
         SNR_dB = eeg_conditions(eeg_idx, 3);
@@ -153,8 +167,6 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                 fprintf('\n✗ EEG Generation Error (Rep %d, K=%d, SNR=%+.1f): %s\n', ...
                     rep, K_true, SNR_dB, ME.message);
             end
-            n_failed = n_failed + n_montages * n_methods * n_criteria;
-            pb.update();
             continue;
         end
         
@@ -169,6 +181,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
             if strcmp(montage_type, 'full')
                 % Use full montage
                 Sim = Sim_full;
+                Sim.n_channels = size(Sim_full.X_noisy, 1);
             else
                 % Reduce to specific montage
                 [EEG_reduced, pos_reduced, chanlocs_reduced, labels_reduced, ~] = ...
@@ -201,10 +214,8 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
             
             % ===== STEP 3: FIT all methods to this montage =====
             fit_results_for_montage = cell(n_methods, 1);
-            fit_errors_for_montage = cell(n_methods, 1);
             
             for m_idx = 1:n_methods
-                fit_id = fit_id + 1;
                 method_str = method_names{m_idx};
                 
                 try
@@ -226,7 +237,6 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                         % Store ONLY essential metadata, NOT full Results or Sim
                         % (Sim will be accessible in the save step, Results is available above)
                         fit_results_for_montage{m_idx} = struct(...
-                            'fit_id', fit_id, ...
                             'eeg_idx', eeg_idx, ...
                             'rep', rep, ...
                             'K_true', K_true, ...
@@ -235,35 +245,19 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                             'montage_type', montage_type, ...
                             'n_leads', Sim.n_leads, ...
                             'Results', Results);
-                        fit_errors_for_montage{m_idx} = [];
-                        n_successful_fits = n_successful_fits + 1;
                     else
                         fit_results_for_montage{m_idx} = [];
-                        fit_errors_for_montage{m_idx} = 'Invalid fit';
-                        error_msg = 'Invalid fit';
-                        if isKey(error_types, error_msg)
-                            error_types(error_msg) = error_types(error_msg) + 1;
-                        else
-                            error_types(error_msg) = 1;
-                        end
                     end
                     
                 catch ME
                     fit_results_for_montage{m_idx} = [];
-                    fit_errors_for_montage{m_idx} = sprintf('%s: %s', ME.identifier, ME.message);
-                    error_msg = fit_errors_for_montage{m_idx};
-                    if isKey(error_types, error_msg)
-                        error_types(error_msg) = error_types(error_msg) + 1;
-                    else
-                        error_types(error_msg) = 1;
-                    end
+                    fprintf('Fit Error (%s): %s\n', method_str, ME.message);
                 end
             end
             
             % ===== STEP 4 & 5: APPLY CRITERIA and SAVE (for each fit) =====
             for m_idx = 1:n_methods
                 if isempty(fit_results_for_montage{m_idx})
-                    n_failed = n_failed + n_criteria;
                     continue;
                 end
                 
@@ -273,7 +267,6 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                 
                 % Apply ALL criteria to this ONE fit
                 for c_idx = 1:n_criteria
-                    run_id = run_id + 1;
                     criterion_str = all_criteria{c_idx};
                     
                     % Extract K using this criterion
@@ -286,12 +279,13 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                     rec_metrics = Results.recovery_metrics;
                     recovery_corr = util.padded_vector(rec_metrics.match_similarities, 10);
                     
-                    subj_name = sprintf('fit_%03d_K%d_SNR%+d_%s_%s_%s', ...
-                        run_id, fit_result.K_true, round(fit_result.SNR_dB), ...
+                    % Generate a temporary subject name (IDs will be fixed later)
+                    subj_name = sprintf('fit_E%d_M%d_K%d_SNR%+d_%s_%s_%s', ...
+                        eeg_idx, m_idx, fit_result.K_true, round(fit_result.SNR_dB), ...
                         montage_type, method_str, criterion_str);
                     
                     result_row = struct( ...
-                        'fit_id', fit_result.fit_id, ...
+                        'fit_id', 0, ... % Placeholder
                         'subject', subj_name, ...
                         'rep', fit_result.rep, ...
                         'method', method_str, ...
@@ -316,7 +310,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                         'best_score', Results.best_criterion_value, ...
                         'runtime_s', Results.runtime);
                     
-                    rows = [rows; result_row]; %#ok<AGROW>
+                    local_rows = [local_rows; result_row]; 
                     
                     % Save JSON with metadata for plotting & downstream use
                     json_file = fullfile(json_dir, [subj_name '.json']);
@@ -343,13 +337,20 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
             end
         end  % End montage loop
         
-        % ===== EXPLICIT MEMORY CLEANUP =====
-        % Clear large data structures after processing this EEG
-        clear Sim Sim_full Results fit_results_for_montage fit_errors_for_montage fit_result;
+        % Store results for this EEG condition
+        all_results{eeg_idx} = local_rows;
         
-        pb.update();
+    end  % End PARFOR loop
+    
+    % Combine all results
+    rows = vertcat(all_results{:});
+    
+    % Fix IDs
+    if ~isempty(rows)
+        for i = 1:length(rows)
+            rows(i).fit_id = i;
+        end
     end
-    pb.done();
     
     % Print error summary
     fprintf('\n========================================\n');
