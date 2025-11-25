@@ -6,14 +6,14 @@
 clear all; close all; clc;
 
 %% Load JSON data
-json_file = 'fit_001_K4_SNR-10_full_kmeans_koenig_silhouette.json';
-json_file_folder = '/home/rohan/PycharmProjects/SPM_MS/Output/microstates_json/';
+json_file = 'fit_E1_M2_K4_SNR+10_10-20-12_ovl00_spm_vb_elbow_sil_combined.json';
+json_file_folder = '~/PycharmProjects/SPM_MS/Output/microstates_json/';
 plot_folder = '/home/rohan/PycharmProjects/SPM_MS/Output/plots/';
 name_stem = erase(json_file, '.json');
-json_file = append(json_file_folder, json_file)
+json_file = append(json_file_folder, json_file);
 data = jsondecode(fileread(json_file));
 
-set_file = 'MetaMaps_2023_06.set';
+set_file = 'MetaMaps_2023_06.set'; % template for montage
 
 % Extract metadata if present
 if isfield(data, 'metadata')

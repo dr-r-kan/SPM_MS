@@ -2,15 +2,16 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
 % BAYESIAN_MS_COMPARISON_PIPELINE: ALL method-criterion combinations
 %
 % Each method is tested with EVERY criterion (where applicable)
-% Results in: n_eeg_conditions × n_methods × n_criteria rows
 %
 % Requirements:
 % spm on path (development version at spm/spm on github)
 % matlab (version R2025a used for this - other versions not tested)
 % Dr Rohan Kandasamy 8-11-2025
+% 
+% Experimental data run on 25-11-2025
 %
-% Using code from Thomas Koenig
-% (the microstates repository at: ThomasKoenigBern/microstates on github)
+% Using code from Thomas Koenig (MICROSTATELAB group)
+% (the "microstates" repository at: ThomasKoenigBern/microstates on github)
 
     addpath("Koenig_code");
     % This is a folder which should contain:
@@ -19,6 +20,9 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     %  - mywaitbar.m
     %  - popFitMSMaps.m
     % All from the "microstates" repository
+
+    % we also need to make sure the spm toolbox is to hand:
+    addpath("/home/rohan/spm/toolbox/mixture/"); % modify to the correct path on your system if needed
     
     test = false;
 
@@ -31,9 +35,9 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
         addParameter(p, 'K_candidates', 5:6, @isnumeric);
     else
         addParameter(p, 'out_dir', 'Output', @ischar);
-        addParameter(p, 'reps', 10, @isnumeric);
+        addParameter(p, 'reps', 8, @isnumeric);
         addParameter(p, 'K_true_vals', [4 5 6 7], @isnumeric);
-        addParameter(p, 'SNR_dbs', [-10 -7.5 -5 -2.5  1 0 1 2.5 5 7.5 10], @isnumeric);
+        addParameter(p, 'SNR_dbs', [-9 -3  1 0 1 3], @isnumeric);
         addParameter(p, 'K_candidates', 2:10, @isnumeric);
     end;
     addParameter(p, 'duration_s', 300, @isnumeric);
@@ -43,6 +47,9 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     addParameter(p, 'cleanup', true, @islogical);
     addParameter(p, 'verbose', true, @islogical);
     addParameter(p, 'montages', {'full', '10-20-20', '10-20-12'}, @iscell);  % montage robustness analysis
+    addParameter(p, 'overlap_probs', [0 0.5 1.0], @isnumeric); % run with and without overlap
+    addParameter(p, 'overlap_ms_range', [10 40], @isnumeric);
+    addParameter(p, 'overlap_strength', 0.5, @isnumeric);
     parse(p, varargin{:});
     
     CONFIG = p.Results;
@@ -75,7 +82,9 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
         fprintf('Reps: %d | K true: %s | SNR: %s\n', ...
             CONFIG.reps, mat2str(CONFIG.K_true_vals), mat2str(CONFIG.SNR_dbs));
         fprintf('Channels: %d | Workers: %d\n', n_channels, CONFIG.n_workers);
-        fprintf('Montages: %s\n\n', strjoin(CONFIG.montages, ', '));
+        fprintf('Montages: %s\n', strjoin(CONFIG.montages, ', '));
+        fprintf('Overlap probs: %s (ms range %s, strength %.2f)\n\n', ...
+            mat2str(CONFIG.overlap_probs), mat2str(CONFIG.overlap_ms_range), CONFIG.overlap_strength);
     end
 
     % ===== ALL CRITERIA (universal) =====
@@ -85,13 +94,18 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     
     % Montages to test
     n_montages = length(CONFIG.montages);
+    overlap_probs = CONFIG.overlap_probs;
+    n_overlap_conditions = length(overlap_probs);
     
     % Build list of EEG conditions
     eeg_conditions = [];
     for rep = 1:CONFIG.reps
         for K_true = CONFIG.K_true_vals
             for SNR_dB = CONFIG.SNR_dbs
-                eeg_conditions = [eeg_conditions; rep, K_true, SNR_dB]; %#ok<AGROW>
+                for ov = 1:n_overlap_conditions
+                    overlap_prob = overlap_probs(ov);
+                    eeg_conditions = [eeg_conditions; rep, K_true, SNR_dB, overlap_prob]; %#ok<AGROW>
+                end
             end
         end
     end
@@ -104,7 +118,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     
     if CONFIG.verbose
         fprintf('PIPELINE STRUCTURE:\n');
-        fprintf('  EEG conditions: %d\n', n_eeg_conditions);
+        fprintf('  EEG conditions: %d (includes %d overlap settings)\n', n_eeg_conditions, n_overlap_conditions);
         fprintf('  Montages: %d\n', n_montages);
         fprintf('  Methods: %d\n', n_methods);
         fprintf('  Criteria (applied to all): %d\n', n_criteria);
@@ -156,12 +170,16 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
         rep = eeg_conditions(eeg_idx, 1);
         K_true = eeg_conditions(eeg_idx, 2);
         SNR_dB = eeg_conditions(eeg_idx, 3);
+        overlap_prob = eeg_conditions(eeg_idx, 4);
         
         % ===== STEP 1: GENERATE one EEG (full montage, 71 channels) =====
         try
             sim_seed = 42 + rep*1000 + K_true*100 + round((SNR_dB+10)*10);
             [Sim, ~, ~] = generate_microstate_eeg(K_true, SNR_dB, CONFIG.duration_s, ...
-                CONFIG.sfreq, sim_seed);
+                CONFIG.sfreq, sim_seed, struct(...
+                    'prob', overlap_prob, ...
+                    'ms_range', CONFIG.overlap_ms_range, ...
+                    'strength', CONFIG.overlap_strength));
         catch ME
             if CONFIG.verbose
                 fprintf('\n✗ EEG Generation Error (Rep %d, K=%d, SNR=%+.1f): %s\n', ...
@@ -280,9 +298,10 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                     recovery_corr = util.padded_vector(rec_metrics.match_similarities, 10);
                     
                     % Generate a temporary subject name (IDs will be fixed later)
-                    subj_name = sprintf('fit_E%d_M%d_K%d_SNR%+d_%s_%s_%s', ...
+                    overlap_tag = sprintf('ovl%02d', round(100 * Sim.overlap_prob));
+                    subj_name = sprintf('fit_E%d_M%d_K%d_SNR%+d_%s_%s_%s_%s', ...
                         eeg_idx, m_idx, fit_result.K_true, round(fit_result.SNR_dB), ...
-                        montage_type, method_str, criterion_str);
+                        montage_type, overlap_tag, method_str, criterion_str);
                     
                     result_row = struct( ...
                         'fit_id', 0, ... % Placeholder
@@ -292,6 +311,10 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                         'criterion', criterion_str, ...
                         'K_true', fit_result.K_true, ...
                         'SNR_dB', fit_result.SNR_dB, ...
+                        'overlap_prob', Sim.overlap_prob, ...
+                        'overlap_strength', Sim.overlap_strength, ...
+                        'overlap_ms_min', Sim.overlap_ms_range(1), ...
+                        'overlap_ms_max', Sim.overlap_ms_range(end), ...
                         'montage_type', montage_type, ...
                         'n_leads', fit_result.n_leads, ...
                         'K_estimated', K_selected, ...
@@ -325,6 +348,10 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                         META.rep = fit_result.rep;
                         META.montage_type = montage_type;
                         META.n_leads = fit_result.n_leads;
+                        META.overlap_prob = Sim.overlap_prob;
+                        META.overlap_ms_range = Sim.overlap_ms_range;
+                        META.overlap_strength = Sim.overlap_strength;
+                        META.n_overlap_events = Sim.n_overlap_events;
                         META.runtime_s = Results.runtime;
                         META.channel_labels = Sim.channel_labels;  % Use Sim.channel_labels (montage-specific)
                         save_microstate_json(Results, Sim, json_file, META);
@@ -388,7 +415,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     
     fprintf('\n========================================\n');
     fprintf('Pipeline Complete!\n');
-    fprintf('EEG Conditions: %d\n', n_eeg_conditions);
+    fprintf('EEG Conditions: %d (overlap settings: %s)\n', n_eeg_conditions, mat2str(overlap_probs));
     fprintf('Montages: %d\n', n_montages);
     fprintf('Methods: %d\n', n_methods);
     fprintf('Criteria (universal): %d\n', n_criteria);
@@ -503,7 +530,8 @@ function save_summary_info(CONFIG, ch_labels, montage_pos, output_dir)
     info.channel_labels = ch_labels;
     info.n_channels = length(ch_labels);
     info.montage_positions = montage_pos;
-    info.n_eeg_conditions = CONFIG.reps * numel(CONFIG.K_true_vals) * numel(CONFIG.SNR_dbs);
+    info.n_eeg_conditions = CONFIG.reps * numel(CONFIG.K_true_vals) * numel(CONFIG.SNR_dbs) * numel(CONFIG.overlap_probs);
+    info.overlap_probs = CONFIG.overlap_probs;
     
     try
         json_info = jsonencode(info);
