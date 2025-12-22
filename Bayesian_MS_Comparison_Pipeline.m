@@ -2,15 +2,16 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
 % BAYESIAN_MS_COMPARISON_PIPELINE: ALL method-criterion combinations
 %
 % Each method is tested with EVERY criterion (where applicable)
-% Results in: n_eeg_conditions × n_methods × n_criteria rows
 %
 % Requirements:
 % spm on path (development version at spm/spm on github)
 % matlab (version R2025a used for this - other versions not tested)
 % Dr Rohan Kandasamy 8-11-2025
+% 
+% Experimental data run on 25-11-2025
 %
-% Using code from Thomas Koenig
-% (the microstates repository at: ThomasKoenigBern/microstates on github)
+% Using code from Thomas Koenig (MICROSTATELAB group)
+% (the "microstates" repository at: ThomasKoenigBern/microstates on github)
 
     addpath("Koenig_code");
     % This is a folder which should contain:
@@ -19,29 +20,36 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     %  - mywaitbar.m
     %  - popFitMSMaps.m
     % All from the "microstates" repository
+
+    % we also need to make sure the spm toolbox is to hand:
+    addpath("/home/rohan/spm/toolbox/mixture/"); % modify to the correct path on your system if needed
     
     test = false;
 
     p = inputParser;
     if test
-        addParameter(p, 'out_dir', 'E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction/out_microstate_comparison', @ischar);
+        addParameter(p, 'out_dir', 'Output', @ischar);
         addParameter(p, 'reps', 1, @isnumeric);
         addParameter(p, 'K_true_vals', [4], @isnumeric);
         addParameter(p, 'SNR_dbs', [10], @isnumeric);
         addParameter(p, 'K_candidates', 5:6, @isnumeric);
     else
-        addParameter(p, 'out_dir', 'E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction/out_microstate_comparison', @ischar);
-        addParameter(p, 'reps', 10, @isnumeric);
+        addParameter(p, 'out_dir', 'Output', @ischar);
+        addParameter(p, 'reps', 8, @isnumeric);
         addParameter(p, 'K_true_vals', [4 5 6 7], @isnumeric);
-        addParameter(p, 'SNR_dbs', [-10 -7.5 -5 -2.5  1 0 1 2.5 5 7.5 10], @isnumeric);
+        addParameter(p, 'SNR_dbs', [-9 -3  1 0 1 3], @isnumeric);
         addParameter(p, 'K_candidates', 2:10, @isnumeric);
     end;
     addParameter(p, 'duration_s', 300, @isnumeric);
     addParameter(p, 'sfreq', 250, @isnumeric);
     addParameter(p, 'set_file', 'MetaMaps_2023_06.set', @ischar);
-    addParameter(p, 'n_workers', 9, @isnumeric);
+    addParameter(p, 'n_workers', 12, @isnumeric);
     addParameter(p, 'cleanup', true, @islogical);
     addParameter(p, 'verbose', true, @islogical);
+    addParameter(p, 'montages', {'full', '10-20-20', '10-20-12'}, @iscell);  % montage robustness analysis
+    addParameter(p, 'overlap_probs', [0 0.5 1.0], @isnumeric); % run with and without overlap
+    addParameter(p, 'overlap_ms_range', [10 40], @isnumeric);
+    addParameter(p, 'overlap_strength', 0.5, @isnumeric);
     parse(p, varargin{:});
     
     CONFIG = p.Results;
@@ -73,20 +81,31 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
         fprintf('Output: %s\n', CONFIG.out_dir);
         fprintf('Reps: %d | K true: %s | SNR: %s\n', ...
             CONFIG.reps, mat2str(CONFIG.K_true_vals), mat2str(CONFIG.SNR_dbs));
-        fprintf('Channels: %d | Workers: %d\n\n', n_channels, CONFIG.n_workers);
+        fprintf('Channels: %d | Workers: %d\n', n_channels, CONFIG.n_workers);
+        fprintf('Montages: %s\n', strjoin(CONFIG.montages, ', '));
+        fprintf('Overlap probs: %s (ms range %s, strength %.2f)\n\n', ...
+            mat2str(CONFIG.overlap_probs), mat2str(CONFIG.overlap_ms_range), CONFIG.overlap_strength);
     end
 
     % ===== ALL CRITERIA (universal) =====
     all_criteria = {'silhouette', 'free_energy', 'elbow', 'elbow_sil_combined', 'gev'};
     
-    method_names = {'kmeans_koenig', 'spm_vb'};
+    method_names = {'kmeans_koenig', 'spm_vb', 'spm_kmeans'};
+    
+    % Montages to test
+    n_montages = length(CONFIG.montages);
+    overlap_probs = CONFIG.overlap_probs;
+    n_overlap_conditions = length(overlap_probs);
     
     % Build list of EEG conditions
     eeg_conditions = [];
     for rep = 1:CONFIG.reps
         for K_true = CONFIG.K_true_vals
             for SNR_dB = CONFIG.SNR_dbs
-                eeg_conditions = [eeg_conditions; rep, K_true, SNR_dB]; %#ok<AGROW>
+                for ov = 1:n_overlap_conditions
+                    overlap_prob = overlap_probs(ov);
+                    eeg_conditions = [eeg_conditions; rep, K_true, SNR_dB, overlap_prob]; %#ok<AGROW>
+                end
             end
         end
     end
@@ -94,23 +113,24 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     n_eeg_conditions = size(eeg_conditions, 1);
     n_methods = length(method_names);
     n_criteria = length(all_criteria);
-    n_fits = n_eeg_conditions * n_methods;
+    n_fits = n_eeg_conditions * n_montages * n_methods;
     n_total_results = n_fits * n_criteria;
     
     if CONFIG.verbose
         fprintf('PIPELINE STRUCTURE:\n');
-        fprintf('  EEG conditions: %d\n', n_eeg_conditions);
+        fprintf('  EEG conditions: %d (includes %d overlap settings)\n', n_eeg_conditions, n_overlap_conditions);
+        fprintf('  Montages: %d\n', n_montages);
         fprintf('  Methods: %d\n', n_methods);
         fprintf('  Criteria (applied to all): %d\n', n_criteria);
-        fprintf('  Total FITS: %d (one per method+EEG)\n', n_fits);
+        fprintf('  Total FITS: %d (one per montage+method+EEG)\n', n_fits);
         fprintf('  Total RESULTS: %d (fits × criteria)\n\n', n_total_results);
     end
 
     % ===== UNIFIED PIPELINE: GENERATE → FIT → CRITERIA → SAVE (per EEG) =====
     if CONFIG.verbose
-        fprintf('Pipeline: Generate EEG → Fit Methods → Apply Criteria → Save\n');
-        fprintf('Processing %d EEG conditions with %d methods and %d criteria each...\n', ...
-            n_eeg_conditions, n_methods, n_criteria);
+        fprintf('Pipeline: Generate EEG → Montage → Fit Methods → Apply Criteria → Save\n');
+        fprintf('Processing %d EEG conditions with %d montages, %d methods and %d criteria each...\n', ...
+            n_eeg_conditions, n_montages, n_methods, n_criteria);
     end
     
     rows = [];
@@ -124,185 +144,249 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     try
         p_pool = gcp('nocreate');
         if isempty(p_pool)
-            parpool('local', CONFIG.n_workers);
+            % Check available cores and set pool size
+            max_workers = maxNumCompThreads();
+            n_workers = min(CONFIG.n_workers, max_workers);
+            fprintf('Starting parallel pool with %d workers (max available: %d)\n', n_workers, max_workers);
+            parpool('local', n_workers);
+        else
+            fprintf('Using existing parallel pool with %d workers\n', p_pool.NumWorkers);
         end
-    catch
-        % Proceed without parallel if pool fails
+    catch ME
+        fprintf('Warning: Could not start parallel pool: %s\n', ME.message);
+        fprintf('Falling back to serial execution\n');
     end
     
-    pb = util.progress_bar(n_eeg_conditions, 'EEG Cond');
+    % Prepare for parallel execution
+    all_results = cell(n_eeg_conditions, 1);
     
-    for eeg_idx = 1:n_eeg_conditions
+    % We cannot use the progress bar object inside parfor easily
+    fprintf('Starting parallel processing of %d EEG conditions...\n', n_eeg_conditions);
+    
+    parfor eeg_idx = 1:n_eeg_conditions
+        % Local variables for this iteration
+        local_rows = [];
+        
         rep = eeg_conditions(eeg_idx, 1);
         K_true = eeg_conditions(eeg_idx, 2);
         SNR_dB = eeg_conditions(eeg_idx, 3);
+        overlap_prob = eeg_conditions(eeg_idx, 4);
         
-        % ===== STEP 1: GENERATE one EEG =====
+        % ===== STEP 1: GENERATE one EEG (full montage, 71 channels) =====
         try
             sim_seed = 42 + rep*1000 + K_true*100 + round((SNR_dB+10)*10);
             [Sim, ~, ~] = generate_microstate_eeg(K_true, SNR_dB, CONFIG.duration_s, ...
-                CONFIG.sfreq, sim_seed);
+                CONFIG.sfreq, sim_seed, struct(...
+                    'prob', overlap_prob, ...
+                    'ms_range', CONFIG.overlap_ms_range, ...
+                    'strength', CONFIG.overlap_strength));
         catch ME
             if CONFIG.verbose
                 fprintf('\n✗ EEG Generation Error (Rep %d, K=%d, SNR=%+.1f): %s\n', ...
                     rep, K_true, SNR_dB, ME.message);
             end
-            n_failed = n_failed + n_methods * n_criteria;
-            pb.update();
             continue;
         end
         
-        % ===== STEP 2: FIT all methods to this EEG =====
-        fit_results_for_eeg = cell(n_methods, 1);
-        fit_errors_for_eeg = cell(n_methods, 1);
+        % Store full Sim before montage reduction
+        Sim_full = Sim;
         
-        for m_idx = 1:n_methods
-            fit_id = fit_id + 1;
-            method_str = method_names{m_idx};
+        % ===== STEP 2: LOOP over MONTAGES =====
+        for montage_idx = 1:n_montages
+            montage_type = CONFIG.montages{montage_idx};
             
-            try
-                % Call appropriate fitting function with a default criterion
-                % (Results will be reused with all criteria via select_K_by_criterion)
-                if strcmp(method_str, 'spm_vb')
-                    Results = fit_microstate_spm_vb(Sim, CONFIG.K_candidates, 'elbow_sil_combined');
-                elseif strcmp(method_str, 'kmeans_koenig')
-                    Results = fit_microstate_kmeans_koenig(Sim, CONFIG.K_candidates, 'silhouette');
-                elseif strcmp(method_str, 'vb_kmeans')
-                    Results = fit_microstate_vb_kmeans(Sim, CONFIG.K_candidates, 'free_energy');
-                elseif strcmp(method_str, 'dp_mixture')
-                    Results = fit_microstate_dp_mixture(Sim, CONFIG.K_candidates, 'free_energy');
-                else
-                    Results = [];
-                end
+            % Apply montage selection
+            if strcmp(montage_type, 'full')
+                % Use full montage
+                Sim = Sim_full;
+                Sim.n_channels = size(Sim_full.X_noisy, 1);
+            else
+                % Reduce to specific montage
+                [EEG_reduced, pos_reduced, chanlocs_reduced, labels_reduced, ~] = ...
+                    select_montage_subset(Sim_full.X_noisy, Sim_full.pos, ...
+                    Sim_full.chanlocs, ch_labels, montage_type);
                 
-                if ~isempty(Results) && Results.valid_fit
-                    % Store ONLY essential metadata, NOT full Results or Sim
-                    % (Sim will be accessible in the save step, Results is available above)
-                    fit_results_for_eeg{m_idx} = struct(...
-                        'fit_id', fit_id, ...
-                        'eeg_idx', eeg_idx, ...
-                        'rep', rep, ...
-                        'K_true', K_true, ...
-                        'SNR_dB', SNR_dB, ...
-                        'method', method_str, ...
-                        'Results', Results);
-                    fit_errors_for_eeg{m_idx} = [];
-                    n_successful_fits = n_successful_fits + 1;
-                else
-                    fit_results_for_eeg{m_idx} = [];
-                    fit_errors_for_eeg{m_idx} = 'Invalid fit';
-                    error_msg = 'Invalid fit';
-                    if isKey(error_types, error_msg)
-                        error_types(error_msg) = error_types(error_msg) + 1;
+                % Also reduce clean signal and true maps
+                [X_clean_reduced, ~, ~, ~, ~] = ...
+                    select_montage_subset(Sim_full.X_clean, Sim_full.pos, ...
+                    Sim_full.chanlocs, ch_labels, montage_type);
+                
+                [maps_true_reduced, ~, ~, ~, ~] = ...
+                    select_montage_subset(Sim_full.maps_true, Sim_full.pos, ...
+                    Sim_full.chanlocs, ch_labels, montage_type);
+                
+                % Create reduced Sim structure
+                Sim = Sim_full;
+                Sim.X_noisy = EEG_reduced;
+                Sim.X_clean = X_clean_reduced;
+                Sim.pos = pos_reduced;
+                Sim.chanlocs = chanlocs_reduced;
+                Sim.channel_labels = labels_reduced;
+                Sim.maps_true = maps_true_reduced;
+                Sim.n_channels = length(labels_reduced);
+            end
+            
+            % Add montage info to Sim
+            Sim.montage_type = montage_type;
+            Sim.n_leads = Sim.n_channels;
+            
+            % ===== STEP 3: FIT all methods to this montage =====
+            fit_results_for_montage = cell(n_methods, 1);
+            
+            for m_idx = 1:n_methods
+                method_str = method_names{m_idx};
+                
+                try
+                    % Call appropriate fitting function with a default criterion
+                    % (Results will be reused with all criteria via select_K_by_criterion)
+                    if strcmp(method_str, 'spm_vb')
+                        Results = fit_microstate_spm_vb(Sim, CONFIG.K_candidates, 'elbow_sil_combined');
+                    elseif strcmp(method_str, 'kmeans_koenig')
+                        Results = fit_microstate_kmeans_koenig(Sim, CONFIG.K_candidates, 'silhouette');
+                    elseif strcmp(method_str, 'spm_kmeans')
+                        Results = fit_microstate_spm_kmeans(Sim, CONFIG.K_candidates, 'silhouette');
+                    elseif strcmp(method_str, 'vb_kmeans')
+                        Results = fit_microstate_vb_kmeans(Sim, CONFIG.K_candidates, 'free_energy');
+                    elseif strcmp(method_str, 'dp_mixture')
+                        Results = fit_microstate_dp_mixture(Sim, CONFIG.K_candidates, 'free_energy');
                     else
-                        error_types(error_msg) = 1;
+                        Results = [];
                     end
-                end
-                
-            catch ME
-                fit_results_for_eeg{m_idx} = [];
-                fit_errors_for_eeg{m_idx} = sprintf('%s: %s', ME.identifier, ME.message);
-                error_msg = fit_errors_for_eeg{m_idx};
-                if isKey(error_types, error_msg)
-                    error_types(error_msg) = error_types(error_msg) + 1;
-                else
-                    error_types(error_msg) = 1;
+                    
+                    if ~isempty(Results) && Results.valid_fit
+                        % Store ONLY essential metadata, NOT full Results or Sim
+                        % (Sim will be accessible in the save step, Results is available above)
+                        fit_results_for_montage{m_idx} = struct(...
+                            'eeg_idx', eeg_idx, ...
+                            'rep', rep, ...
+                            'K_true', K_true, ...
+                            'SNR_dB', SNR_dB, ...
+                            'method', method_str, ...
+                            'montage_type', montage_type, ...
+                            'n_leads', Sim.n_leads, ...
+                            'Results', Results);
+                    else
+                        fit_results_for_montage{m_idx} = [];
+                    end
+                    
+                catch ME
+                    fit_results_for_montage{m_idx} = [];
+                    fprintf('Fit Error (%s): %s\n', method_str, ME.message);
                 end
             end
-        end
-        
-        % ===== STEP 3 & 4: APPLY CRITERIA and SAVE (for each fit) =====
-        for m_idx = 1:n_methods
-            if isempty(fit_results_for_eeg{m_idx})
-                n_failed = n_failed + n_criteria;
-                continue;
-            end
             
-            fit_result = fit_results_for_eeg{m_idx};
-            Results = fit_result.Results;
-            method_str = fit_result.method;
-            
-            % Apply ALL criteria to this ONE fit
-            for c_idx = 1:n_criteria
-                run_id = run_id + 1;
-                criterion_str = all_criteria{c_idx};
-                
-                % Extract K using this criterion
-                K_selected = select_K_by_criterion(Results, criterion_str);
-                
-                if isnan(K_selected)
+            % ===== STEP 4 & 5: APPLY CRITERIA and SAVE (for each fit) =====
+            for m_idx = 1:n_methods
+                if isempty(fit_results_for_montage{m_idx})
                     continue;
                 end
                 
-                rec_metrics = Results.recovery_metrics;
-                recovery_corr = util.padded_vector(rec_metrics.match_similarities, 10);
+                fit_result = fit_results_for_montage{m_idx};
+                Results = fit_result.Results;
+                method_str = fit_result.method;
                 
-                subj_name = sprintf('fit_%03d_K%d_SNR%+d_%s_%s', ...
-                    run_id, fit_result.K_true, round(fit_result.SNR_dB), ...
-                    method_str, criterion_str);
-                
-                result_row = struct( ...
-                    'fit_id', fit_result.fit_id, ...
-                    'subject', subj_name, ...
-                    'rep', fit_result.rep, ...
-                    'method', method_str, ...
-                    'criterion', criterion_str, ...
-                    'K_true', fit_result.K_true, ...
-                    'SNR_dB', fit_result.SNR_dB, ...
-                    'K_estimated', K_selected, ...
-                    'K_correct', fit_result.K_true == K_selected, ...
-                    'K_error', abs(fit_result.K_true - K_selected), ...
-                    'n_maps', Results.n_maps, ...
-                    'n_matched', rec_metrics.n_matched, ...
-                    'mean_recovery_matched', rec_metrics.mean_recovery_matched, ...
-                    'mean_recovery_padded', rec_metrics.mean_recovery_padded, ...
-                    'sensitivity', rec_metrics.sensitivity, ...
-                    'precision', rec_metrics.precision, ...
-                    'f1_score', rec_metrics.f1_score, ...
-                    'recovery_01', recovery_corr(1), ...
-                    'recovery_02', recovery_corr(2), ...
-                    'recovery_03', recovery_corr(3), ...
-                    'best_score', Results.best_criterion_value, ...
-                    'runtime_s', Results.runtime);
-                
-                rows = [rows; result_row]; %#ok<AGROW>
-                
-                % Save JSON with metadata for plotting & downstream use
-                json_file = fullfile(json_dir, [subj_name '.json']);
-                try
-                    META = struct();
-                    META.subject = subj_name;
-                    META.method = method_str;
-                    META.criterion = criterion_str;
-                    META.K_true = fit_result.K_true;
-                    META.K_estimated = K_selected;
-                    META.SNR_dB = fit_result.SNR_dB;
-                    META.rep = fit_result.rep;
-                    META.runtime_s = Results.runtime;
-                    META.channel_labels = ch_labels;  % Explicitly pass channel labels from template
-                    save_microstate_json(Results, Sim, json_file, META);
-                catch ME
-                    if CONFIG.verbose
-                        fprintf('⚠ Warning: Could not save JSON for %s: %s\n', subj_name, ME.message);
+                % Apply ALL criteria to this ONE fit
+                for c_idx = 1:n_criteria
+                    criterion_str = all_criteria{c_idx};
+                    
+                    % Extract K using this criterion
+                    K_selected = select_K_by_criterion(Results, criterion_str);
+                    
+                    if isnan(K_selected)
+                        continue;
+                    end
+                    
+                    rec_metrics = Results.recovery_metrics;
+                    recovery_corr = util.padded_vector(rec_metrics.match_similarities, 10);
+                    
+                    % Generate a temporary subject name (IDs will be fixed later)
+                    overlap_tag = sprintf('ovl%02d', round(100 * Sim.overlap_prob));
+                    subj_name = sprintf('fit_E%d_M%d_K%d_SNR%+d_%s_%s_%s_%s', ...
+                        eeg_idx, m_idx, fit_result.K_true, round(fit_result.SNR_dB), ...
+                        montage_type, overlap_tag, method_str, criterion_str);
+                    
+                    result_row = struct( ...
+                        'fit_id', 0, ... % Placeholder
+                        'subject', subj_name, ...
+                        'rep', fit_result.rep, ...
+                        'method', method_str, ...
+                        'criterion', criterion_str, ...
+                        'K_true', fit_result.K_true, ...
+                        'SNR_dB', fit_result.SNR_dB, ...
+                        'overlap_prob', Sim.overlap_prob, ...
+                        'overlap_strength', Sim.overlap_strength, ...
+                        'overlap_ms_min', Sim.overlap_ms_range(1), ...
+                        'overlap_ms_max', Sim.overlap_ms_range(end), ...
+                        'montage_type', montage_type, ...
+                        'n_leads', fit_result.n_leads, ...
+                        'K_estimated', K_selected, ...
+                        'K_correct', fit_result.K_true == K_selected, ...
+                        'K_error', abs(fit_result.K_true - K_selected), ...
+                        'n_maps', Results.n_maps, ...
+                        'n_matched', rec_metrics.n_matched, ...
+                        'mean_recovery_matched', rec_metrics.mean_recovery_matched, ...
+                        'mean_recovery_padded', rec_metrics.mean_recovery_padded, ...
+                        'sensitivity', rec_metrics.sensitivity, ...
+                        'precision', rec_metrics.precision, ...
+                        'f1_score', rec_metrics.f1_score, ...
+                        'recovery_01', recovery_corr(1), ...
+                        'recovery_02', recovery_corr(2), ...
+                        'recovery_03', recovery_corr(3), ...
+                        'best_score', Results.best_criterion_value, ...
+                        'runtime_s', Results.runtime);
+                    
+                    local_rows = [local_rows; result_row]; 
+                    
+                    % Save JSON with metadata for plotting & downstream use
+                    json_file = fullfile(json_dir, [subj_name '.json']);
+                    try
+                        META = struct();
+                        META.subject = subj_name;
+                        META.method = method_str;
+                        META.criterion = criterion_str;
+                        META.K_true = fit_result.K_true;
+                        META.K_estimated = K_selected;
+                        META.SNR_dB = fit_result.SNR_dB;
+                        META.rep = fit_result.rep;
+                        META.montage_type = montage_type;
+                        META.n_leads = fit_result.n_leads;
+                        META.overlap_prob = Sim.overlap_prob;
+                        META.overlap_ms_range = Sim.overlap_ms_range;
+                        META.overlap_strength = Sim.overlap_strength;
+                        META.n_overlap_events = Sim.n_overlap_events;
+                        META.runtime_s = Results.runtime;
+                        META.channel_labels = Sim.channel_labels;  % Use Sim.channel_labels (montage-specific)
+                        save_microstate_json(Results, Sim, json_file, META);
+                    catch ME
+                        if CONFIG.verbose
+                            fprintf('⚠ Warning: Could not save JSON for %s: %s\n', subj_name, ME.message);
+                        end
                     end
                 end
             end
+        end  % End montage loop
+        
+        % Store results for this EEG condition
+        all_results{eeg_idx} = local_rows;
+        
+    end  % End PARFOR loop
+    
+    % Combine all results
+    rows = vertcat(all_results{:});
+    
+    % Fix IDs
+    if ~isempty(rows)
+        for i = 1:length(rows)
+            rows(i).fit_id = i;
         end
-        
-        % ===== EXPLICIT MEMORY CLEANUP =====
-        % Clear large data structures after processing this EEG
-        clear Sim Results fit_results_for_eeg fit_errors_for_eeg fit_result;
-        
-        pb.update();
     end
-    pb.done();
     
     % Print error summary
     fprintf('\n========================================\n');
     fprintf('FIT ERROR SUMMARY\n');
     fprintf('========================================\n');
-    fprintf('Successful fits: %d / %d\n', n_successful_fits, n_eeg_conditions * n_methods);
-    fprintf('Failed or invalid: %d\n', n_eeg_conditions * n_methods - n_successful_fits);
+    fprintf('Successful fits: %d / %d\n', n_successful_fits, n_eeg_conditions * n_montages * n_methods);
+    fprintf('Failed or invalid: %d\n', n_eeg_conditions * n_montages * n_methods - n_successful_fits);
     if error_types.Count > 0
         fprintf('\nError breakdown:\n');
         error_keys = keys(error_types);
@@ -333,11 +417,12 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     
     fprintf('\n========================================\n');
     fprintf('Pipeline Complete!\n');
-    fprintf('EEG Conditions: %d\n', n_eeg_conditions);
+    fprintf('EEG Conditions: %d (overlap settings: %s)\n', n_eeg_conditions, mat2str(overlap_probs));
+    fprintf('Montages: %d\n', n_montages);
     fprintf('Methods: %d\n', n_methods);
     fprintf('Criteria (universal): %d\n', n_criteria);
-    fprintf('Total Fits: %d (EEG conditions × methods)\n', n_eeg_conditions * n_methods);
-    fprintf('Total Results: %d (one per method×criterion per EEG)\n', height(T));
+    fprintf('Total Fits: %d (EEG conditions × montages × methods)\n', n_eeg_conditions * n_montages * n_methods);
+    fprintf('Total Results: %d (one per method×criterion per montage per EEG)\n', height(T));
     fprintf('JSON Microstates: %s\n', json_dir);
     fprintf('Results CSV: %s\n', res_dir);
     fprintf('========================================\n');
@@ -447,7 +532,8 @@ function save_summary_info(CONFIG, ch_labels, montage_pos, output_dir)
     info.channel_labels = ch_labels;
     info.n_channels = length(ch_labels);
     info.montage_positions = montage_pos;
-    info.n_eeg_conditions = CONFIG.reps * numel(CONFIG.K_true_vals) * numel(CONFIG.SNR_dbs);
+    info.n_eeg_conditions = CONFIG.reps * numel(CONFIG.K_true_vals) * numel(CONFIG.SNR_dbs) * numel(CONFIG.overlap_probs);
+    info.overlap_probs = CONFIG.overlap_probs;
     
     try
         json_info = jsonencode(info);

@@ -77,6 +77,12 @@ function save_microstate_json(Results, Sim, output_file, META)
             % Use sanitized label as JSON key
             state_data.(ch_labels{c}) = double(val);
         end
+        
+        % Add confidence measure if available
+        if isfield(Results, 'cluster_weights') && length(Results.cluster_weights) >= k
+            state_data.confidence = Results.cluster_weights(k);
+        end
+        
         json_data.estimated_microstates.(state_key) = state_data;
     end
     
@@ -94,6 +100,16 @@ function save_microstate_json(Results, Sim, output_file, META)
     json_data.metadata.n_channels = C;
     if isfield(Results, 'n_maps'), json_data.metadata.n_samples_analyzed = Results.n_maps; end
     if isfield(Results, 'runtime'), json_data.metadata.runtime_s = Results.runtime; end
+    
+    % Add Free Energy if available (Global Model Confidence)
+    if isfield(Results, 'best_criterion_value') && ...
+            (strcmp(Results.criterion, 'free_energy') || strcmp(Results.method, 'spm_vb'))
+        json_data.metadata.model_evidence_free_energy = Results.best_criterion_value;
+    end
+    if isfield(Results, 'free_energy')
+        % If full vector is available, save the one corresponding to K_estimated
+        % (This might be redundant with best_criterion_value but explicit)
+    end
 
     % Merge optional metadata (pipeline-level) if provided - values in META override previous
     if nargin >= 4 && ~isempty(META) && isstruct(META)

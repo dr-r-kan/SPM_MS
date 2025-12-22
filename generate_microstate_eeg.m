@@ -1,15 +1,23 @@
-function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duration_s, sfreq, seed)
+function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duration_s, sfreq, seed, overlap_opts)
 % GENERATE_MICROSTATE_EEG: Generate synthetic EEG with REALISTIC amplitudes
 %
 % Microstate amplitudes: 10-50 µV (typical values from literature)
 % Pink noise baseline: 5-20 µV 
 % GFP range: 0.5-3 µV
+% Optional temporal overlap between adjacent microstates
 %
 % NOTE: Generates 71-channel EEG to match artifact template montage
 % Uses channel positions from template file
 
     if nargin < 4, sfreq = 250; end
     if nargin < 5, seed = 42; end
+    if nargin < 6, overlap_opts = struct(); end
+    
+    overlap_defaults = struct( ...
+        'prob', 0, ...                % Probability a boundary is overlapped
+        'ms_range', [10 40], ...      % Min/max overlap duration in ms
+        'strength', 0.5);             % Weight of the secondary state during overlap
+    overlap_opts = fill_overlap_defaults(overlap_opts, overlap_defaults);
     
     rng(seed, 'twister');
     
@@ -39,9 +47,10 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     mean_dur_ms = 80;
     mean_dur_samples = max(1, round((mean_dur_ms/1000)*sfreq));
     
-    % Generate clean EEG
-    X_clean = zeros(C, T);
-    z = zeros(1, T);
+    % Generate clean EEG (store segments for optional overlap)
+    X_clean_base = zeros(C, T);
+    z = zeros(1, T);  %#ok<NASGU> % Ground-truth labels (dominant state per sample)
+    segments = struct('state', {}, 'start', {}, 'len', {}, 'template', {}, 'gfp', {});
     
     p_switch = 1 / mean_dur_samples;
     cur_state = randi(K_true);
@@ -59,8 +68,14 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         gfp_env = ar1_positive_realistic(dwell, 0.98, 0.2);  % 0.3-0.8 range
         
         seg_idx = t:(t + dwell - 1);
+        segments(end+1) = struct(...
+            'state', cur_state, ...
+            'start', t, ...
+            'len', dwell, ...
+            'template', template, ...
+            'gfp', gfp_env); %#ok<AGROW>
+        
         z(seg_idx) = cur_state;
-        X_clean(:, seg_idx) = template * gfp_env;
         
         % Pick next state
         if K_true > 1
@@ -70,6 +85,18 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         
         t = t + dwell;
     end
+    
+    % Reconstruct clean EEG without overlap
+    for s = 1:numel(segments)
+        seg = segments(s);
+        seg_idx = seg.start:min(T, seg.start + seg.len - 1);
+        seg_gfp = seg.gfp(1:numel(seg_idx));
+        X_clean_base(:, seg_idx) = X_clean_base(:, seg_idx) + seg.template * seg_gfp;
+    end
+    
+    rng_state = rng;  % isolate overlap randomness from downstream noise generation
+    [X_clean, overlap_events] = apply_microstate_overlap(X_clean_base, segments, overlap_opts, sfreq, T);
+    rng(rng_state);
     
     % Generate PINK noise with REALISTIC AMPLITUDE
     % Background EEG: 5-20 µV RMS (let's use 10 µV as baseline)
@@ -119,7 +146,86 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         'SNR_dB', snr_db, ...
         'duration_s', duration_s, ...
         'microstate_amplitude_uv', microstate_amplitude_uv, ...
-        'background_noise_rms_uv', background_noise_rms_uv);
+        'background_noise_rms_uv', background_noise_rms_uv, ...
+        'overlap_prob', overlap_opts.prob, ...
+        'overlap_ms_range', overlap_opts.ms_range, ...
+        'overlap_strength', overlap_opts.strength, ...
+        'overlap_events', overlap_events, ...
+        'n_overlap_events', numel(overlap_events));
+end
+
+function opts = fill_overlap_defaults(opts, defaults)
+    if ~isstruct(opts)
+        opts = struct();
+    end
+    fields = fieldnames(defaults);
+    for i = 1:numel(fields)
+        f = fields{i};
+        if ~isfield(opts, f) || isempty(opts.(f))
+            opts.(f) = defaults.(f);
+        end
+    end
+    if numel(opts.ms_range) == 1
+        opts.ms_range = [opts.ms_range opts.ms_range];
+    end
+end
+
+function [X_out, events] = apply_microstate_overlap(X_base, segments, overlap_opts, sfreq, T)
+% APPLY_MICROSTATE_OVERLAP: inject partial overlap around segment boundaries
+%
+% Uses cross-fade style mixing so adjacent states co-activate without
+% exploding amplitude. The base signal remains untouched when prob = 0.
+
+    X_out = X_base;
+    events = struct('boundary_sample', {}, 'overlap_len', {}, 'strength', {});
+    
+    if overlap_opts.prob <= 0 || numel(segments) < 2
+        return;
+    end
+    
+    min_len = max(1, round(overlap_opts.ms_range(1) / 1000 * sfreq));
+    max_len = max(min_len, round(overlap_opts.ms_range(2) / 1000 * sfreq));
+    strength = max(0, min(1, overlap_opts.strength));
+    
+    for s = 1:(numel(segments) - 1)
+        if rand() > overlap_opts.prob
+            continue;
+        end
+        
+        seg_a = segments(s);
+        seg_b = segments(s + 1);
+        boundary = seg_a.start + seg_a.len - 1;
+        
+        overlap_len = min([max_len, seg_a.len, seg_b.len, T - boundary]);
+        if overlap_len < min_len
+            continue;
+        end
+        
+        % Fade-in of next state on the tail of the current state
+        pre_idx = (boundary - overlap_len + 1):boundary;
+        w_forward = linspace(0, strength, numel(pre_idx));
+        for i = 1:numel(pre_idx)
+            idx = pre_idx(i);
+            b_idx = min(i, numel(seg_b.gfp));
+            bleed = seg_b.template * seg_b.gfp(b_idx);
+            X_out(:, idx) = (1 - w_forward(i)) * X_out(:, idx) + w_forward(i) * bleed;
+        end
+        
+        % Fade-out of previous state into start of next state
+        post_idx = seg_b.start:min(T, seg_b.start + overlap_len - 1);
+        w_backward = linspace(strength, 0, numel(post_idx));
+        for i = 1:numel(post_idx)
+            idx = post_idx(i);
+            a_idx = max(1, seg_a.len - overlap_len + i);
+            bleed = seg_a.template * seg_a.gfp(a_idx);
+            X_out(:, idx) = (1 - w_backward(i)) * X_out(:, idx) + w_backward(i) * bleed;
+        end
+        
+        events(end+1) = struct(...
+            'boundary_sample', boundary, ...
+            'overlap_len', overlap_len, ...
+            'strength', strength); %#ok<AGROW>
+    end
 end
 
 % ======================== CHANNEL MONTAGE ========================
