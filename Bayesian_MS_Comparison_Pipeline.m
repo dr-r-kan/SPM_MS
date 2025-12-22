@@ -90,7 +90,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     % ===== ALL CRITERIA (universal) =====
     all_criteria = {'silhouette', 'free_energy', 'elbow', 'elbow_sil_combined', 'gev'};
     
-    method_names = {'kmeans_koenig', 'spm_vb'};
+    method_names = {'kmeans_koenig', 'spm_vb', 'spm_kmeans'};
     
     % Montages to test
     n_montages = length(CONFIG.montages);
@@ -243,6 +243,8 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                         Results = fit_microstate_spm_vb(Sim, CONFIG.K_candidates, 'elbow_sil_combined');
                     elseif strcmp(method_str, 'kmeans_koenig')
                         Results = fit_microstate_kmeans_koenig(Sim, CONFIG.K_candidates, 'silhouette');
+                    elseif strcmp(method_str, 'spm_kmeans')
+                        Results = fit_microstate_spm_kmeans(Sim, CONFIG.K_candidates, 'silhouette');
                     elseif strcmp(method_str, 'vb_kmeans')
                         Results = fit_microstate_vb_kmeans(Sim, CONFIG.K_candidates, 'free_energy');
                     elseif strcmp(method_str, 'dp_mixture')

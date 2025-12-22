@@ -27,16 +27,30 @@ Traditional microstate analysis relies on:
 Can we do better with **Variational Bayes**?
 
 This project systematically compares:
-1. **VB approaches** (SPM's VB-GMM)
-2. **Classical approaches** (standard modified K-means)
-3. **Model selection criteria** (silhouette, free energy, free energy elbow, GEV, combined silhouette and free energy elbow)
+1. **Classical K-means** (Koenig's standard method)
+2. **SPM K-means** (K-means as GMM limit case with isotropic covariance, σ² → 0)
+3. **VB-GMM** (SPM's full Variational Bayes with free covariance)
+4. **Model selection criteria** (silhouette, free energy, free energy elbow, GEV, combined silhouette and free energy elbow)
 
 Using **synthetic data with known ground truth**, we can definitively answer: which method works best?
+
+### SPM K-Means: Theoretical Foundation
+
+The **SPM K-Means** method validates that K-means clustering emerges as a limit case of Gaussian Mixture Models (GMMs) with:
+- **Isotropic (spherical) covariance**: All clusters have equal spherical covariance
+- **Infinitesimal variance**: σ² → 0 forces soft assignments to become hard
+- **Mathematical equivalence**: Proven in literature (arXiv:1704.04812, Celeux & Govaert 1992)
+
+This bridges the gap between classical K-means and Bayesian methods, showing:
+- **Koenig K-means** ↔ **SPM K-means** (should give similar results)
+- **SPM K-means** vs **VB GMM** (demonstrates value of full covariance modeling)
 
 ## Features
 
 ✅ **Synthetic EEG generation** with realistic microstate structure  
-✅ **VBGMM** leveraging SPM's mixture toolbox for Bayesian methods and free energy minimisation
+✅ **Three complementary methods**: Classical K-means, SPM K-means (GMM limit), and VB-GMM  
+✅ **Theoretical validation**: Confirms GMM → K-means equivalence in practice  
+✅ **VBGMM** leveraging SPM's mixture toolbox for Bayesian methods and free energy minimisation  
 ✅ **Elbow detection** on ELBO curves  
 ✅ **Comprehensive comparison** across SNR levels and true K values  
 ✅ **Recovery metrics** even when K is misestimated  
