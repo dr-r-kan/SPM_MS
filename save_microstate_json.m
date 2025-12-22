@@ -143,7 +143,7 @@ function save_microstate_json(Results, Sim, output_file, META)
     end
     
     % ===== MATCHING INFORMATION =====
-    if ~isempty(metrics.match_assignment)
+    if isfield(metrics, 'match_assignment') && ~isempty(metrics.match_assignment)
         json_data.matches = struct();
         for i = 1:size(metrics.match_assignment, 1)
             est_idx = metrics.match_assignment(i, 1);

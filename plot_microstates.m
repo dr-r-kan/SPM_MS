@@ -6,7 +6,7 @@
 clear all; close all; clc;
 
 %% Load JSON data
-json_file = 'fit_017_K4_SNR-8_spm_vb_free_energy.json';
+json_file = 'fit_041_K4_SNR+1_kmeans_koenig_silhouette.json';
 json_file_folder = "E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction\out_microstate_comparison\microstates_json\";
 plot_folder = "E:\OneDrive - University College London\Microstates\Variational Bayesian Microstate Extraction\out_microstate_comparison\plots\";
 name_stem = erase(json_file, '.json');
