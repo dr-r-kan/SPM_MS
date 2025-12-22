@@ -8,7 +8,7 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
 %   eeg_file     - Path to EEG file (.set, .mat, or other supported format)
 %   
 % OPTIONAL NAME-VALUE PAIRS:
-%   'method'         - Analysis method: 'kmeans_koenig' or 'spm_vb' (default: 'spm_vb')
+%   'method'         - Analysis method: 'kmeans_koenig', 'spm_kmeans', or 'spm_vb' (default: 'spm_vb')
 %   'criterion'      - Selection criterion (default: auto-select based on method)
 %   'K_candidates'   - Vector of K values to test (default: 2:10)
 %   'true_maps'      - Optional ground truth maps for validation (default: [])
@@ -52,6 +52,8 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
     if isempty(CONFIG.criterion)
         if strcmp(CONFIG.method, 'spm_vb')
             CONFIG.criterion = 'elbow_sil_combined';
+        elseif strcmp(CONFIG.method, 'spm_kmeans')
+            CONFIG.criterion = 'silhouette';
         else
             CONFIG.criterion = 'silhouette';
         end
@@ -60,6 +62,9 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
     % Validate method and criterion combination
     if strcmp(CONFIG.method, 'spm_vb') && strcmp(CONFIG.criterion, 'gev')
         error('GEV criterion is not supported for spm_vb method. Use ''silhouette'', ''free_energy'', ''elbow'', or ''elbow_sil_combined'' instead.');
+    end
+    if strcmp(CONFIG.method, 'spm_kmeans') && (strcmp(CONFIG.criterion, 'free_energy') || strcmp(CONFIG.criterion, 'elbow_sil_combined'))
+        error('Criterion %s is not supported for spm_kmeans method. Use ''silhouette'', ''gev'', or ''elbow'' instead.', CONFIG.criterion);
     end
     
     if CONFIG.verbose
@@ -170,8 +175,10 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
             Results = fit_microstate_spm_vb(Sim, CONFIG.K_candidates, CONFIG.criterion);
         elseif strcmp(CONFIG.method, 'kmeans_koenig')
             Results = fit_microstate_kmeans_koenig(Sim, CONFIG.K_candidates, CONFIG.criterion);
+        elseif strcmp(CONFIG.method, 'spm_kmeans')
+            Results = fit_microstate_spm_kmeans(Sim, CONFIG.K_candidates, CONFIG.criterion);
         else
-            error('Unknown method: %s. Use ''kmeans_koenig'' or ''spm_vb''.', CONFIG.method);
+            error('Unknown method: %s. Use ''kmeans_koenig'', ''spm_kmeans'', or ''spm_vb''.', CONFIG.method);
         end
     catch ME
         fprintf('\n✗ Analysis failed: %s\n', ME.message);

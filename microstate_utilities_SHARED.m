@@ -220,6 +220,8 @@ function display_name = format_method_name_internal(method_code)
             display_name = 'K-means';
         case 'spm_vb'
             display_name = 'VB GMM';
+        case 'spm_kmeans'
+            display_name = 'SPM K-means';
         case 'vb_kmeans'
             display_name = 'VB K-means';
         case 'dp_mixture'
