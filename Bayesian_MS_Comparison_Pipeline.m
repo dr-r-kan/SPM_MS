@@ -39,6 +39,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     else
         addParameter(p, 'out_dir', 'Output', @ischar);
         addParameter(p, 'reps', 8, @isnumeric);
+        addParameter(p, 'rep_vals', [], @isnumeric);
         addParameter(p, 'K_true_vals', [4 5 6 7], @isnumeric);
         addParameter(p, 'SNR_dbs', [-9 -3  1 0 1 3], @isnumeric);
         addParameter(p, 'K_candidates', 2:10, @isnumeric);
@@ -59,6 +60,12 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     
     CONFIG = p.Results;
     util = microstate_utilities_SHARED();
+    if isempty(CONFIG.rep_vals)
+        rep_vals = 1:CONFIG.reps;
+    else
+        rep_vals = CONFIG.rep_vals(:)';
+        CONFIG.reps = numel(rep_vals);
+    end
 
     % Load channel information
     if CONFIG.verbose
@@ -84,8 +91,8 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
         fprintf('ALL METHOD × CRITERION COMBINATIONS\n');
         fprintf('========================================\n');
         fprintf('Output: %s\n', CONFIG.out_dir);
-        fprintf('Reps: %d | K true: %s | SNR: %s\n', ...
-            CONFIG.reps, mat2str(CONFIG.K_true_vals), mat2str(CONFIG.SNR_dbs));
+        fprintf('Reps: %s | K true: %s | SNR: %s\n', ...
+            mat2str(rep_vals), mat2str(CONFIG.K_true_vals), mat2str(CONFIG.SNR_dbs));
         fprintf('Channels: %d | Workers: %d\n', n_channels, CONFIG.n_workers);
         fprintf('Montages: %s\n', strjoin(CONFIG.montages, ', '));
         fprintf('Overlap probs: %s (ms range %s, strength %.2f)\n\n', ...
@@ -95,8 +102,8 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     % ===== ALL CRITERIA (universal) =====
     all_criteria = {'silhouette', 'free_energy', 'elbow', 'elbow_sil_combined', 'gev'};
     
-    % Allow the user to restrict methods; default list includes SPM variants
-    method_names = {'kmeans_koenig', 'spm_vb', 'spm_kmeans'};
+    % First-line validation is focused on the VB method.
+    method_names = {'spm_vb', 'kmeans_koenig', 'spm_kmeans'};
     
     % Inject SPM path if provided
     if ~isempty(CONFIG.spm_path) && exist(CONFIG.spm_path, 'dir')
@@ -121,7 +128,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     
     % Build list of EEG conditions
     eeg_conditions = [];
-    for rep = 1:CONFIG.reps
+    for rep = rep_vals
         for K_true = CONFIG.K_true_vals
             for SNR_dB = CONFIG.SNR_dbs
                 for ov = 1:n_overlap_conditions
@@ -434,34 +441,34 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
         end
     end
     
-    % Print error summary
-    fprintf('\n========================================\n');
-    fprintf('FIT ERROR SUMMARY\n');
-    fprintf('========================================\n');
-    fprintf('Successful fits: %d / %d\n', n_successful_fits, n_eeg_conditions * n_montages * n_methods);
-    fprintf('Failed or invalid: %d\n', n_eeg_conditions * n_montages * n_methods - n_successful_fits);
-    if error_types.Count > 0
-        fprintf('\nError breakdown:\n');
-        error_keys = keys(error_types);
-        for k = 1:length(error_keys)
-            fprintf('  %s: %d occurrences\n', error_keys{k}, error_types(error_keys{k}));
-        end
-    end
-    fprintf('========================================\n\n');
-    
     if isempty(rows)
         error('✗✗✗ NO SUCCESSFUL RUNS! ✗✗✗\nCheck error summary above for details.');
     end
     
     % Convert to table
     T = struct2table(rows);
+    total_expected_fits = n_eeg_conditions * n_montages * n_methods;
+    successful_fit_count = count_unique_method_fits(T);
+    failed_fit_count = total_expected_fits - successful_fit_count;
+
+    fprintf('\n========================================\n');
+    fprintf('FIT SUMMARY\n');
+    fprintf('========================================\n');
+    fprintf('Successful method fits: %d / %d\n', successful_fit_count, total_expected_fits);
+    fprintf('Failed or invalid method fits: %d\n', failed_fit_count);
+    fprintf('Criterion result rows: %d\n', height(T));
+    fprintf('========================================\n\n');
     
     % Save CSV
     summary_csv = fullfile(res_dir, 'comparison_results.csv');
     writetable(T, summary_csv);
+    criterion_summary_csv = fullfile(res_dir, 'k_selection_summary_by_method_criterion.csv');
+    Tcrit = k_selection_summary_by_method_criterion(T);
+    writetable(Tcrit, criterion_summary_csv);
     
     if CONFIG.verbose
         fprintf('✓ Saved: %s\n', summary_csv);
+        fprintf('âœ“ Saved: %s\n', criterion_summary_csv);
         fprintf('  Successful: %d rows | Failed: %d\n', height(T), n_failed);
     end
     
@@ -482,6 +489,22 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
 end
 
 % ======================== HELPERS ========================
+
+function n = count_unique_method_fits(T)
+    keys = strcat( ...
+        string(T.rep), "|", ...
+        string(T.K_true), "|", ...
+        string(T.SNR_dB), "|", ...
+        string(T.overlap_prob), "|", ...
+        string(T.montage_type), "|", ...
+        string(T.method));
+    n = numel(unique(keys));
+end
+
+function Tcrit = k_selection_summary_by_method_criterion(T)
+    Tcrit = groupsummary(T, {'method', 'criterion'}, {'mean', 'std'}, {'K_correct', 'K_error'});
+    Tcrit.accuracy_pct = 100 * Tcrit.mean_K_correct;
+end
 
 function K_selected = select_K_by_criterion(Results, criterion)
     switch criterion
@@ -585,7 +608,12 @@ function save_summary_info(CONFIG, ch_labels, montage_pos, output_dir)
     info.channel_labels = ch_labels;
     info.n_channels = length(ch_labels);
     info.montage_positions = montage_pos;
-    info.n_eeg_conditions = CONFIG.reps * numel(CONFIG.K_true_vals) * numel(CONFIG.SNR_dbs) * numel(CONFIG.overlap_probs);
+    if isfield(CONFIG, 'rep_vals') && ~isempty(CONFIG.rep_vals)
+        n_rep_conditions = numel(CONFIG.rep_vals);
+    else
+        n_rep_conditions = CONFIG.reps;
+    end
+    info.n_eeg_conditions = n_rep_conditions * numel(CONFIG.K_true_vals) * numel(CONFIG.SNR_dbs) * numel(CONFIG.overlap_probs);
     info.overlap_probs = CONFIG.overlap_probs;
     
     try
@@ -622,6 +650,29 @@ function print_summary(T)
         % Format method name for display
         m_display = util.format_method_name(m);
         fprintf('%-20s %9.1f%% %10.3f %10.1f %9.1fs\n', m_display, acc, f1, matched, rt);
+    end
+
+    criteria = unique(T.criterion);
+    if istable(criteria), criteria = table2cell(criteria); end
+
+    fprintf('\nK Selection Accuracy by Method and Criterion:\n');
+    fprintf('%-20s %-22s %10s %10s %8s\n', 'Method', 'Criterion', 'Accuracy', 'Mean |err|', 'N');
+    fprintf('%s\n', repmat('-', 1, 76));
+
+    for m_idx = 1:length(methods)
+        m = methods{m_idx};
+        for c_idx = 1:length(criteria)
+            c = criteria{c_idx};
+            mask = strcmp(T.method, m) & strcmp(T.criterion, c);
+            if ~any(mask)
+                continue;
+            end
+            acc = 100 * mean(T.K_correct(mask));
+            kerr = mean(T.K_error(mask), 'omitnan');
+            m_display = util.format_method_name(m);
+            fprintf('%-20s %-22s %9.1f%% %10.3f %8d\n', ...
+                m_display, c, acc, kerr, nnz(mask));
+        end
     end
     
     fprintf('\n');
