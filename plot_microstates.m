@@ -6,9 +6,9 @@
 clear all; close all; clc;
 
 %% Load JSON data
-json_file = 'fit_E1_M2_K4_SNR+10_10-20-12_ovl00_spm_vb_elbow_sil_combined.json';
-json_file_folder = '~/PycharmProjects/SPM_MS/Output/microstates_json/';
-plot_folder = '/home/rohan/PycharmProjects/SPM_MS/Output/plots/';
+json_file = 'fit_E12_M3_K4_SNR+0_full_ovl100_spm_kmeans_silhouette.json';
+json_file_folder = 'E:\EEGs\SPM_MS\Output\microstates_json\';
+plot_folder = 'E:\EEGs\SPM_MS\Output\plots\';
 name_stem = erase(json_file, '.json');
 json_file = append(json_file_folder, json_file);
 data = jsondecode(fileread(json_file));

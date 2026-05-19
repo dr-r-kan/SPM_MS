@@ -31,10 +31,10 @@ function Results = fit_microstate_kmeans_koenig(Sim, K_candidates, criterion)
 
     util = microstate_utilities_SHARED();
     [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims, maps_original] = util.preprocess_maps(Sim);
-    
+    features = maps_norm;
     fprintf('Fitting K-means for K = %s...\n', mat2str(K_candidates));
-    
     nK = numel(K_candidates);
+    R = 20; % Number of restarts (can be parameterized)
     
     % Compute ALL criteria
     gev_vals = zeros(nK, 1);

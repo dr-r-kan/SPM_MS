@@ -1,59 +1,16 @@
 function Results = fit_microstate_spm_kmeans(Sim, K_candidates, criterion)
 % FIT_MICROSTATE_SPM_KMEANS: K-means as limit case of GMM using SPM
 %
-% Implements K-means clustering through SPM's Gaussian Mixture Model framework
-% with isotropic (spherical) covariance and infinitesimal variance (σ² → 0).
-% This represents the mathematical limit where GMM soft assignments become
-% hard K-means assignments.
-%
-% Mathematical Foundation:
-%   - Uses isotropic/spherical covariance constraint (EII model)
-%   - Sets variance to very small value (1e-6) to approximate hard assignments
-%   - E-Step: Soft GMM responsibilities → hard K-means assignments (argmax)
-%   - M-Step: Cluster centers converge to means of assigned points
-%   - Validates theoretical equivalence: GMM → K-means
-%
-% Key Differences from fit_microstate_spm_vb:
-%   - Forces isotropic/spherical covariance (not full covariance)
-%   - Uses infinitesimal variance for hard assignments
-%   - Does NOT support 'free_energy' criterion (not meaningful for degenerate GMM)
-%   - Does NOT support 'elbow_sil_combined' (use individual criteria)
-%
-% Key Differences from fit_microstate_kmeans_koenig:
-%   - Uses SPM's optimization framework instead of eeg_kMeans
-%   - Works in PCA space initially, then recovers centers in original space
-%   - Shows GMM → K-means equivalence holds in practice
-%
-% INPUTS:
-%   Sim          - Simulation structure
-%   K_candidates - Vector of K values to test
-%   criterion    - 'silhouette', 'gev', or 'elbow' (NOT 'free_energy')
-%
-% OUTPUTS:
-%   Results      - Complete results with recovery metrics
-%
-% References:
-%   - arXiv:1704.04812: "k-means as a variational EM approximation of GMMs"
-%   - Celeux & Govaert, 1992: "A classification EM algorithm"
+% Uses SPM's mixture model with isotropic covariance and tiny variance to approximate hard K-means.
 
-    if nargin < 2
-        K_candidates = 2:10;
-    end
-    if nargin < 3
-        criterion = 'silhouette';
-    end
-    
-    % Validate criterion - free_energy not supported for degenerate GMM
-    if strcmp(criterion, 'free_energy') || strcmp(criterion, 'elbow_sil_combined')
-        error(['%s criterion is not supported for spm_kmeans method. ' ...
-               'Use ''silhouette'', ''gev'', or ''elbow'' instead.'], criterion);
-    end
-    
+    if nargin < 2, K_candidates = 2:10; end
+    if nargin < 3, criterion = 'silhouette'; end
+
     t_start = tic;
 
     fprintf('\n========================================\n');
     fprintf('SPM K-Means Microstate Fitting\n');
-    fprintf('(GMM with Isotropic Covariance, σ² → 0)\n');
+    fprintf('(GMM with Isotropic Covariance, sigma^2 -> 0)\n');
     fprintf('========================================\n');
     fprintf('Computing ALL criteria (will apply %s)\n', criterion);
     if isfield(Sim, 'K_true') && ~isnan(Sim.K_true)
@@ -66,75 +23,57 @@ function Results = fit_microstate_spm_kmeans(Sim, K_candidates, criterion)
         error('SPM spm_mix not found in MATLAB path');
     end
 
-    % Load shared utilities
     util = microstate_utilities_SHARED();
 
-    % Preprocessing (using shared utility)
+    % Preprocessing
     fprintf('1. Preprocessing...\n');
     [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims, maps_original] = util.preprocess_maps(Sim);
     fprintf('   Extracted %d GFP peak maps (%d channels)\n', n_maps, C_dims);
 
-    % Dimensionality reduction (same as spm_vb)
-    fprintf('2. Dimensionality reduction...\n');
-    [coeff, score, latent] = pca(maps_norm);
-    var_explained = cumsum(latent) / sum(latent);
-    n_dims = find(var_explained >= 0.95, 1, 'first');
-    n_dims = min(n_dims, 20);
-    n_dims = max(n_dims, 5);
-    features = score(:, 1:n_dims);
-    fprintf('   Using %d PCA dimensions (%.1f%% variance)\n', n_dims, var_explained(n_dims)*100);
+    features = maps_norm;
+    fprintf('2. Using normalized maps as features: %d dims\n', size(features,2));
 
-    % Fit SPM GMM with isotropic covariance and small variance
-    fprintf('3. Fitting SPM GMM models (isotropic, σ²=1e-6)...\n');
+    if ~isfield(Sim, 'n_restarts'), R = 20; else, R = Sim.n_restarts; end
+
+    % Fit models across K
+    fprintf('3. Fitting SPM GMM models (isotropic, sigma^2=1e-6)...\n');
     nK = numel(K_candidates);
     gev_vals = zeros(nK, 1);
     silhouette_vals = zeros(nK, 1);
     within_ss = zeros(nK, 1);
+    free_energy_vals = zeros(nK, 1);
     centers_all = cell(nK, 1);
     labels_all = cell(nK, 1);
     exp_var_all = zeros(nK, 1);
-    vbmix = cell(nK, 1);
+
+    variance_small = 1e-4; % slightly larger to avoid degenerate covariances
 
     for iK = 1:nK
         K = K_candidates(iK);
         fprintf('   K=%d... ', K);
-        
         try
-            % Fit GMM with isotropic covariance
-            % Use spm_mix with covariance_type parameter if available
-            % Otherwise, post-process to force isotropic covariance
             result = spm_mix(features, K, 0);
-            
-            % Force isotropic (spherical) covariance with small variance
-            % This approximates hard K-means assignments
-            variance_small = 1e-6;
             for k = 1:K
                 D = size(features, 2);
                 result.state(k).C = variance_small * eye(D);
             end
-            
-            vbmix{iK} = result;
-            
-            % Get hard assignments (argmax of responsibilities)
+
             labels = assign_samples_hard(features, result);
-            labels_all{iK} = labels;
-            
-            % Recover centers in original space (with polarity alignment like Koenig)
             centers = recover_centers_from_labels(maps_norm, labels, K);
+
+            % Polarity-aware warm start to sharpen centers and recover empty clusters
+            [labels, centers] = polarity_kmeans_warmstart(maps_norm, K, 10, max(10, R));
+
             centers_all{iK} = centers;
-            
-            % Compute ALL scores (following Koenig methodology)
-            
-            % 1. GEV (KOENIG METHOD: uses original amplitudes)
+            labels_all{iK} = labels;
+
             sim = abs(maps_original * centers');
             [max_sim, ~] = max(sim, [], 2);
             gfp_squared = sum(maps_original.^2, 2);
             gev_vals(iK) = sum(max_sim.^2) / (sum(gfp_squared) + eps);
-            
-            % 2. Silhouette (KOENIG METHOD - polarity-insensitive cosine-based)
+
             silhouette_vals(iK) = silhouette_microstatelab(maps_norm, labels, centers);
-            
-            % 3. Within-cluster sum of squares (Elbow)
+
             wss = 0;
             for k = 1:K
                 cluster_maps = maps_norm(labels == k, :);
@@ -144,8 +83,13 @@ function Results = fit_microstate_spm_kmeans(Sim, K_candidates, criterion)
                 end
             end
             within_ss(iK) = wss;
-            
-            % Compute explained variance per cluster
+
+            if isfield(result, 'fm') && ~isempty(result.fm)
+                free_energy_vals(iK) = result.fm;
+            else
+                free_energy_vals(iK) = -Inf;
+            end
+
             exp_var_per_cluster = zeros(K, 1);
             for k = 1:K
                 cluster_idx = find(labels == k);
@@ -157,65 +101,55 @@ function Results = fit_microstate_spm_kmeans(Sim, K_candidates, criterion)
                 end
             end
             exp_var_all(iK) = mean(exp_var_per_cluster);
-            
-            fprintf('GEV=%.3f, Sil=%.3f, WSS=%.1f, ExpVar=%.3f\n', ...
-                gev_vals(iK), silhouette_vals(iK), within_ss(iK), exp_var_all(iK));
-            
+            fprintf('OK\n');
         catch ME
             fprintf('ERROR: %s\n', ME.message);
             gev_vals(iK) = 0;
             silhouette_vals(iK) = -1;
             within_ss(iK) = Inf;
             exp_var_all(iK) = 0;
+            free_energy_vals(iK) = -Inf;
+            centers_all{iK} = [];
+            labels_all{iK} = [];
         end
     end
-    
-    % Select K using specified criterion
-    fprintf('\nModel selection using: %s\n', criterion);
-    
-    switch criterion
+
+    % Select K based on criterion
+    switch lower(criterion)
         case 'silhouette'
-            % KOENIG METHOD: Simple max
             [K_est, best_score] = select_K_from_silhouette_koenig(silhouette_vals, K_candidates);
-            
         case 'gev'
             [best_score, idx] = max(gev_vals);
             K_est = K_candidates(idx);
-            fprintf('  GEV: selected K=%d (GEV=%.4f)\n', K_est, best_score);
-            
         case 'elbow'
             [K_est, best_score] = select_K_from_elbow(within_ss, K_candidates);
-            
+        case 'elbow_sil_combined'
+            [K_est, best_score] = select_K_combined_elbow_silhouette(free_energy_vals, K_candidates, silhouette_vals);
+        case 'free_energy'
+            [best_score, idx] = max(free_energy_vals);
+            K_est = K_candidates(idx);
         otherwise
-            error('Unknown criterion: %s', criterion);
+            [K_est, best_score] = select_K_from_silhouette_koenig(silhouette_vals, K_candidates);
     end
-    
-    best_idx = K_est == K_candidates;
-    best_idx = find(best_idx, 1);
-    
-    fprintf('Selected: K=%d (score=%.4f', K_est, best_score);
-    if isfield(Sim, 'K_true') && ~isnan(Sim.K_true)
-        fprintf(', true K=%d)\n\n', Sim.K_true);
-    else
-        fprintf(')\n\n');
-    end
-    
-    centers = centers_all{best_idx};
-    labels = labels_all{best_idx};
-    
-    % Recovery (only if ground truth is available)
+    idx = find(K_candidates == K_est, 1);
+    if isempty(idx), idx = 1; end
+
+    centers = centers_all{idx};
+    labels = labels_all{idx};
+
+    fprintf('3b. Selected K=%d via %s (score=%.4f)\n', K_est, criterion, best_score);
+
+    % Recovery
     fprintf('4. Computing map recovery...\n');
     if isfield(Sim, 'maps_true') && ~isempty(Sim.maps_true)
         true_maps_norm = util.normalize_maps(Sim.maps_true);
         recovery_metrics = microstate_partial_alignment(true_maps_norm, centers, ...
             'distance_type', 'cosine', 'threshold', 0.0, 'polarity', true);
-        
         fprintf('Map Recovery: Matched=%d, F1=%.4f, Sens=%.4f, Prec=%.4f\n\n', ...
             recovery_metrics.n_matched, recovery_metrics.f1_score, ...
             recovery_metrics.sensitivity, recovery_metrics.precision);
     else
-        % No ground truth - create empty recovery metrics
-        recovery_metrics = struct(...
+        recovery_metrics = struct( ...
             'K_true', NaN, ...
             'K_estimated', K_est, ...
             'n_matched', 0, ...
@@ -228,26 +162,13 @@ function Results = fit_microstate_spm_kmeans(Sim, K_candidates, criterion)
         true_maps_norm = [];
         fprintf('No ground truth available - skipping recovery metrics\n\n');
     end
-    
+
     runtime = toc(t_start);
-    
-    % Return ALL computed scores (same structure as other methods)
-    if isfield(Sim, 'K_true')
-        K_true_val = Sim.K_true;
-    else
-        K_true_val = NaN;
-    end
-    if isfield(Sim, 'SNR_dB')
-        SNR_dB_val = Sim.SNR_dB;
-    else
-        SNR_dB_val = NaN;
-    end
-    if isfield(Sim, 'duration_s')
-        duration_s_val = Sim.duration_s;
-    else
-        duration_s_val = NaN;
-    end
-    
+
+    if isfield(Sim, 'K_true'), K_true_val = Sim.K_true; else, K_true_val = NaN; end
+    if isfield(Sim, 'SNR_dB'), SNR_dB_val = Sim.SNR_dB; else, SNR_dB_val = NaN; end
+    if isfield(Sim, 'duration_s'), duration_s_val = Sim.duration_s; else, duration_s_val = NaN; end
+
     Results = struct( ...
         'method', 'spm_kmeans', ...
         'criterion', criterion, ...
@@ -262,7 +183,7 @@ function Results = fit_microstate_spm_kmeans(Sim, K_candidates, criterion)
         'labels', labels, ...
         'gev_vals', gev_vals, ...
         'silhouette_vals', silhouette_vals, ...
-        'free_energy_vals', zeros(nK, 1), ...  % Not meaningful for degenerate GMM
+        'free_energy_vals', free_energy_vals, ...
         'within_ss', within_ss, ...
         'explained_variance', exp_var_all, ...
         'best_criterion_value', best_score, ...
@@ -315,6 +236,96 @@ function [K_est, score] = select_K_from_elbow(wss_vals, K_candidates)
     score = curvature(idx);
     
     fprintf('  Elbow: K=%d (WSS=%.1f, curvature=%.4f)\n', K_est, wss_vals(idx), score);
+end
+
+function [K_est, score] = select_K_combined_elbow_silhouette(fe_vals, K_candidates, sil_vals)
+    % Combined heuristic: elbow on free-energy trend + silhouette tie-break
+    fe_valid = fe_vals;
+    K_valid = K_candidates;
+    sil_valid = sil_vals;
+    
+    fe_norm = (fe_valid - min(fe_valid)) / (max(fe_valid) - min(fe_valid) + eps);
+    k_norm = (K_valid - min(K_valid)) / (max(K_valid) - min(K_valid) + eps);
+    
+    elbow_scores = zeros(size(fe_norm));
+    for i = 2:length(fe_norm)-1
+        p1 = [k_norm(1), fe_norm(1)];
+        p2 = [k_norm(end), fe_norm(end)];
+        p = [k_norm(i), fe_norm(i)];
+        elbow_scores(i) = distance_from_line(p1, p2, p);
+    end
+    
+    elbow_scores(1) = 0;
+    elbow_scores(end) = 0;
+    
+    [max_elbow, idx_elbow] = max(elbow_scores);
+    cand_idx = find(elbow_scores >= 0.9 * max_elbow);
+    
+    sil_subset = sil_valid(cand_idx);
+    [best_sil, best_sub_idx] = max(sil_subset);
+    
+    best_idx = cand_idx(best_sub_idx);
+    K_est = K_valid(best_idx);
+    score = (max_elbow + best_sil) / 2;
+    
+    fprintf('  Combined elbow+silhouette: K=%d (elbow=%.4f, sil=%.4f)\n', K_est, max_elbow, best_sil);
+end
+
+function d = distance_from_line(p1, p2, p)
+    if all(p1 == p2)
+        d = 0;
+        return;
+    end
+    num = abs((p2(2)-p1(2))*p(1) - (p2(1)-p1(1))*p(2) + p2(1)*p1(2) - p2(2)*p1(1));
+    den = sqrt((p2(2)-p1(2))^2 + (p2(1)-p1(1))^2);
+    d = num / (den + eps);
+end
+
+function [labels_best, centers_best] = polarity_kmeans_warmstart(maps_norm, K, n_iter, n_restarts)
+    % Simple polarity-aware K-means with random map seeds
+    if nargin < 3, n_iter = 10; end
+    if nargin < 4, n_restarts = 10; end
+    N = size(maps_norm, 1);
+    best_inertia = Inf;
+    labels_best = [];
+    centers_best = [];
+    for r = 1:n_restarts
+        seed_idx = randperm(N, K);
+        centers = maps_norm(seed_idx, :);
+        for it = 1:n_iter
+            % Assignment with polarity (absolute cosine similarity)
+            sims = abs(maps_norm * centers');
+            [~, labels] = max(sims, [], 2);
+            % Update centers
+            for k = 1:K
+                idx = find(labels == k);
+                if isempty(idx)
+                    centers(k, :) = maps_norm(randi(N), :);
+                    continue;
+                end
+                cluster = maps_norm(idx, :);
+                ref = cluster(1, :);
+                aligned = cluster;
+                flips = (cluster * ref') < 0;
+                aligned(flips, :) = -aligned(flips, :);
+                c = mean(aligned, 1);
+                c = c - mean(c);
+                cn = norm(c);
+                if cn > 0, c = c / cn; end
+                centers(k, :) = c;
+            end
+        end
+        inertia = sum(1 - abs(maps_norm * centers(labels, :)'), 'all');
+        if inertia < best_inertia
+            best_inertia = inertia;
+            labels_best = labels;
+            centers_best = centers;
+        end
+    end
+    if isempty(labels_best)
+        labels_best = ones(N,1);
+        centers_best = maps_norm(1:K, :);
+    end
 end
 
 % ======================== GMM HELPERS ========================

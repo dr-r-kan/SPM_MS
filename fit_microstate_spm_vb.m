@@ -42,20 +42,19 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
 
     % Preprocessing (using shared utility)
     fprintf('1. Preprocessing...\n');
-    [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims] = util.preprocess_maps(Sim);
-    fprintf('   Extracted %d GFP peak maps (%d channels)\n', n_maps, C_dims);
-    
     [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims, maps_original] = util.preprocess_maps(Sim);
+    fprintf('   Extracted %d GFP peak maps (%d channels)\n', n_maps, C_dims);
 
-    % Dimensionality reduction
-    fprintf('2. Dimensionality reduction...\n');
-    [coeff, score, latent] = pca(maps_norm);
-    var_explained = cumsum(latent) / sum(latent);
-    n_dims = find(var_explained >= 0.95, 1, 'first');
-    n_dims = min(n_dims, 20);
-    n_dims = max(n_dims, 5);
-    features = score(:, 1:n_dims);
-    fprintf('   Using %d PCA dimensions (%.1f%% variance)\n', n_dims, var_explained(n_dims)*100);
+    % SPM's mixture code is fragile in the full sensor space for real EEG:
+    % microstate maps are average-reference normalized, so the channel-space
+    % covariance is rank-deficient.  Fit the mixture in a finite PCA subspace,
+    % then recover topographies from labels in the original normalized maps.
+    [linear_features, pca_info] = pca_features_for_spm(maps_norm);
+    [features, polarity_feature_info] = polarity_invariant_projective_features(linear_features);
+    fprintf(['2. Using polarity-invariant PCA features: %d PCA dims -> %d projective dims ', ...
+        '(%.3f%% variance, rank %d of %d channels)\n'], ...
+        size(linear_features, 2), size(features, 2), ...
+        pca_info.variance_explained_pct, pca_info.rank_est, C_dims);
 
     % Fit VB GMM
     fprintf('3. Fitting VB GMM models using SPM...\n');
@@ -65,15 +64,21 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     within_ss = zeros(nK, 1);
     gev_vals = zeros(nK, 1);
     vbmix = cell(nK, 1);
+    centers_all = cell(nK, 1);
+    labels_all = cell(nK, 1);
+    K_effective = K_candidates(:);
+    polarity_duplicate_info = cell(nK, 1);
 
     for iK = 1:nK
         K = K_candidates(iK);
         fprintf('   K=%d... ', K);
         
         try
-            result = spm_mix(features, K, 0);
+            % Use isotropic covariance to avoid singularity; evalc prevents
+            % SPM internals from dumping large NaN matrices to the console.
+            evalc('result = spm_mix(features, K, 0);');
             
-            if isnan(result.fm) || isinf(result.fm) || result.fm == 0
+            if ~is_valid_spm_mix_result(result)
                 fprintf('Invalid\n');
                 free_energy(iK) = -Inf;
                 silhouette_score(iK) = -1;
@@ -87,20 +92,33 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
                 
                 % ✅ Recover centers to compute GEV
                 temp_centers = recover_centers_from_labels(maps_norm, labels, K);
+                [labels, temp_centers] = polarity_refine_to_target_k(maps_norm, labels, temp_centers, K, 25);
+                K_eff = K;
+                labels_all{iK} = labels;
+                centers_all{iK} = temp_centers;
+                K_effective(iK) = K_eff;
+                polarity_duplicate_info{iK} = detect_polarity_duplicate_centers(temp_centers, 0.85);
                 sim = abs(maps_original * temp_centers');
                 [max_sim, ~] = max(sim, [], 2);
                 gfp_squared = sum(maps_original.^2, 2);
                 gev_vals(iK) = sum(max_sim.^2) / (sum(gfp_squared) + eps);
 
-                % Compute silhouette using Euclidean distance in PCA space
-                sil = compute_silhouette_euclidean(features, labels);
+                % Compute silhouette using cosine distance in map space
+                % (matching Koenig's polarity-invariant topography metric).
+                sil = silhouette_cosine(maps_norm, labels, temp_centers);
                 silhouette_score(iK) = sil;
                 
                 % Compute within-cluster sum of squares for elbow method
-                wss = compute_within_ss(features, labels, K);
+                wss = compute_within_ss(maps_norm, labels, K_eff);
                 within_ss(iK) = wss;
                 
-                fprintf('F=%.1f, Sil=%.3f, WSS=%.1f\n', result.fm, sil, wss);
+                dup_count = size(polarity_duplicate_info{iK}.pairs, 1);
+                if dup_count > 0
+                    fprintf('F=%.1f, Sil=%.3f, WSS=%.1f, polarity-duplicate pairs=%d\n', ...
+                        result.fm, sil, wss, dup_count);
+                else
+                    fprintf('F=%.1f, Sil=%.3f, WSS=%.1f\n', result.fm, sil, wss);
+                end
             end
         catch ME
             fprintf('ERROR: %s\n', ME.message);
@@ -164,10 +182,10 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
             error('Unknown criterion: %s', criterion);
     end
     
-    K_estimated = K_candidates(best_idx);
-    best_mix = vbmix{best_idx};
-    
-    fprintf('Best K: %d\n', K_estimated);
+    K_model_selected = K_candidates(best_idx);
+    K_estimated = K_effective(best_idx);
+    fprintf('Best model K: %d; effective polarity-invariant K: %d\n', ...
+        K_model_selected, K_estimated);
     if isfield(Sim, 'K_true') && ~isnan(Sim.K_true)
         fprintf('True K: %d\n\n', Sim.K_true);
     else
@@ -176,18 +194,15 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
 
     % Recover centers
     fprintf('4. Recovering microstate topographies...\n');
-    labels = assign_samples(features, best_mix);
-    centers = recover_centers_from_labels(maps_norm, labels, K_estimated);
+    labels = labels_all{best_idx};
+    centers = centers_all{best_idx};
     fprintf('   Recovered %d microstate centers\n', K_estimated);
 
-    % Extract confidence (posterior weights) from VBGMM
-    if isfield(best_mix, 'n')
-        cluster_weights = best_mix.n / sum(best_mix.n);
-    elseif isfield(best_mix, 'gamma')
-        cluster_weights = sum(best_mix.gamma, 1) / sum(best_mix.gamma(:));
-    else
-        cluster_weights = ones(1, K_estimated) / K_estimated;
+    cluster_weights = zeros(1, K_estimated);
+    for k = 1:K_estimated
+        cluster_weights(k) = mean(labels == k);
     end
+    cluster_weights = cluster_weights / (sum(cluster_weights) + eps);
 
     % Map recovery (only if ground truth is available)
     fprintf('5. Computing map recovery...\n');
@@ -241,7 +256,9 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     'criterion', criterion, ...
     'K_true', K_true_val, ...
     'K_estimated', K_estimated, ...
+    'K_model_selected', K_model_selected, ...
     'K_candidates', K_candidates, ...
+    'K_effective_vals', K_effective, ...
     'SNR_dB', SNR_dB_val, ...
     'duration_s', duration_s_val, ...
     'n_maps', n_maps, ...
@@ -258,6 +275,9 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     'maps_nc', maps_norm, ...
     'idx_peaks', idx_peaks, ...
     'gfp_vec', gfp_vec, ...
+    'pca_info', pca_info, ...
+    'polarity_feature_info', polarity_feature_info, ...
+    'polarity_duplicate_info', {polarity_duplicate_info}, ...
     'recovery_metrics', recovery_metrics, ...
     'mean_recovery', recovery_metrics.mean_recovery_matched, ...
     'recovery_corr', recovery_metrics.match_similarities, ...
@@ -364,6 +384,295 @@ function labels = assign_samples(X, vbmix)
     [~, labels] = max(log_prob, [], 2);
 end
 
+function [features, info] = pca_features_for_spm(maps_norm)
+%PCA_FEATURES_FOR_SPM Return a numerically stable feature space for spm_mix.
+
+    [N, D] = size(maps_norm);
+    [coeff, score, latent] = pca(maps_norm, 'Centered', true);
+    latent = real(latent(:));
+    total_var = sum(latent);
+    if total_var <= eps
+        features = maps_norm;
+        info = struct('rank_est', size(features, 2), ...
+            'n_dims', size(features, 2), ...
+            'variance_explained_pct', 100);
+        return;
+    end
+
+    tol = max(size(maps_norm)) * eps(max(latent));
+    rank_est = sum(latent > tol);
+    var_explained = cumsum(latent) / total_var;
+    n_dims = find(var_explained >= 0.999, 1, 'first');
+    if isempty(n_dims)
+        n_dims = rank_est;
+    end
+    % The polarity-invariant outer-product embedding grows as D*(D+1)/2.
+    % Keep the linear PCA subspace deliberately compact so SPM's VB mixture
+    % remains well-conditioned in real EEG, where rank can otherwise expand
+    % to a numerically awkward projective space.
+    n_dims = min([n_dims, rank_est, N - 1, D - 1, 8]);
+    n_dims = max(1, n_dims);
+
+    features = score(:, 1:n_dims);
+    scale = std(features, 0, 1);
+    scale(scale < eps) = 1;
+    features = features ./ scale;
+
+    info = struct('rank_est', rank_est, ...
+        'n_dims', n_dims, ...
+        'variance_explained_pct', 100 * var_explained(n_dims), ...
+        'coeff', coeff(:, 1:n_dims), ...
+        'latent', latent(1:n_dims));
+end
+
+function [features_projective, info] = polarity_invariant_projective_features(features_linear)
+%POLARITY_INVARIANT_PROJECTIVE_FEATURES Make x and -x identical to SPM.
+%
+% For unit vectors, ||xx' - yy'|| is a monotonic function of
+% 1 - (x'y)^2, which is the standard polarity-invariant microstate
+% distance.  The sqrt(2) scaling on off-diagonal terms preserves the
+% Frobenius inner product after vectorising the upper triangle.
+
+    Y = normalize_rows(features_linear);
+    D = size(Y, 2);
+    n_features = D * (D + 1) / 2;
+    features_projective = zeros(size(Y, 1), n_features);
+    col = 0;
+    for a = 1:D
+        for b = a:D
+            col = col + 1;
+            if a == b
+                scale = 1;
+            else
+                scale = sqrt(2);
+            end
+            features_projective(:, col) = scale * Y(:, a) .* Y(:, b);
+        end
+    end
+
+    features_projective = features_projective - mean(features_projective, 1);
+    sd = std(features_projective, 0, 1);
+    keep = sd > (10 * eps);
+    features_projective = features_projective(:, keep);
+    sd = sd(keep);
+    features_projective = features_projective ./ sd;
+
+    info = struct('mode', 'projective_outer_product', ...
+        'linear_dims', D, ...
+        'projective_dims', size(features_projective, 2), ...
+        'dropped_constant_dims', n_features - size(features_projective, 2));
+end
+
+function info = detect_polarity_duplicate_centers(centers, threshold)
+    if nargin < 2
+        threshold = 0.85;
+    end
+    centers = normalize_rows(centers);
+    signed_corr = centers * centers';
+    pairs = [];
+    for i = 1:(size(centers, 1) - 1)
+        for j = (i + 1):size(centers, 1)
+            if abs(signed_corr(i, j)) >= threshold
+                pairs(end+1, :) = [i, j, signed_corr(i, j), abs(signed_corr(i, j))]; %#ok<AGROW>
+            end
+        end
+    end
+    info = struct('threshold', threshold, 'pairs', pairs, 'signed_corr', signed_corr);
+end
+
+function [labels, centers] = polarity_refine_to_target_k(maps_norm, labels, centers, K, max_iter)
+%POLARITY_REFINE_TO_TARGET_K Koenig-style polarity-invariant refinement.
+
+    if nargin < 5
+        max_iter = 25;
+    end
+    centers = normalize_rows(centers);
+    centers = ensure_target_k_centers(maps_norm, centers, K);
+    labels = assign_by_abs_correlation(maps_norm, centers);
+    [labels, centers] = repair_empty_clusters(maps_norm, labels, centers, K);
+
+    for iter = 1:max_iter
+        old_labels = labels;
+        centers = recover_centers_from_labels(maps_norm, labels, K);
+        labels = assign_by_abs_correlation(maps_norm, centers);
+        [labels, centers] = repair_empty_clusters(maps_norm, labels, centers, K);
+        if isequal(labels, old_labels)
+            break;
+        end
+    end
+end
+
+function centers = ensure_target_k_centers(maps_norm, centers, K)
+    if isempty(centers)
+        centers = maps_norm(randperm(size(maps_norm, 1), min(K, size(maps_norm, 1))), :);
+    end
+    centers = normalize_rows(centers);
+    while size(centers, 1) < K
+        sims = abs(maps_norm * centers');
+        novelty = 1 - max(sims, [], 2);
+        [~, idx] = max(novelty);
+        centers(end+1, :) = maps_norm(idx, :); %#ok<AGROW>
+    end
+    if size(centers, 1) > K
+        centers = centers(1:K, :);
+    end
+    centers = normalize_rows(centers);
+end
+
+function [labels, centers] = repair_empty_clusters(maps_norm, labels, centers, K)
+    counts = accumarray(labels(:), 1, [K, 1], @sum, 0);
+    empty = find(counts == 0)';
+    for k = empty
+        sims = abs(maps_norm * centers');
+        assigned_sim = sims(sub2ind(size(sims), (1:size(maps_norm, 1))', labels));
+        non_singleton = counts(labels) > 1;
+        candidate_score = (1 - assigned_sim) .* non_singleton;
+        [~, idx] = max(candidate_score);
+        if candidate_score(idx) <= 0
+            [~, idx] = min(max(sims, [], 2));
+        end
+        counts(labels(idx)) = counts(labels(idx)) - 1;
+        labels(idx) = k;
+        counts(k) = 1;
+        centers(k, :) = maps_norm(idx, :);
+    end
+    centers = recover_centers_from_labels(maps_norm, labels, K);
+end
+
+function [labels, centers, info] = collapse_polarity_duplicate_states(maps_norm, centers_in, threshold)
+% Collapse centers that are the same topography up to polarity.
+
+    if nargin < 3 || isempty(threshold)
+        threshold = 0.85;
+    end
+    centers_in = normalize_rows(centers_in);
+    K0 = size(centers_in, 1);
+    if K0 <= 1
+        centers = centers_in;
+        labels = ones(size(maps_norm, 1), 1);
+        info = struct('original_K', K0, 'effective_K', K0, 'threshold', threshold, ...
+            'merged_pairs', [], 'abs_corr', 1);
+        return;
+    end
+
+    signed_corr = centers_in * centers_in';
+    abs_corr = abs(signed_corr);
+    parent = 1:K0;
+    merged_pairs = [];
+    for i = 1:(K0 - 1)
+        for j = (i + 1):K0
+            if abs_corr(i, j) >= threshold
+                parent = union_roots(parent, i, j);
+                merged_pairs(end+1, :) = [i, j, signed_corr(i, j), abs_corr(i, j)]; %#ok<AGROW>
+            end
+        end
+    end
+
+    group_id = zeros(1, K0);
+    roots = zeros(1, K0);
+    n_groups = 0;
+    for i = 1:K0
+        r = find_root(parent, i);
+        hit = find(roots(1:n_groups) == r, 1);
+        if isempty(hit)
+            n_groups = n_groups + 1;
+            roots(n_groups) = r;
+            group_id(i) = n_groups;
+        else
+            group_id(i) = hit;
+        end
+    end
+
+    centers = zeros(n_groups, size(centers_in, 2));
+    for g = 1:n_groups
+        members = find(group_id == g);
+        ref = centers_in(members(1), :);
+        aligned = centers_in(members, :);
+        flips = aligned * ref' < 0;
+        aligned(flips, :) = -aligned(flips, :);
+        centers(g, :) = mean(aligned, 1);
+    end
+    centers = normalize_rows(centers);
+
+    labels = assign_by_abs_correlation(maps_norm, centers);
+    for iter = 1:5
+        [labels, centers] = remove_empty_states(labels, centers);
+        centers_new = recover_centers_from_labels(maps_norm, labels, size(centers, 1));
+        labels_new = assign_by_abs_correlation(maps_norm, centers_new);
+        if isequal(labels_new, labels)
+            centers = centers_new;
+            break;
+        end
+        labels = labels_new;
+        centers = centers_new;
+    end
+    [labels, centers] = remove_empty_states(labels, centers);
+    centers = normalize_rows(centers);
+
+    info = struct('original_K', K0, ...
+        'effective_K', size(centers, 1), ...
+        'threshold', threshold, ...
+        'merged_pairs', merged_pairs, ...
+        'abs_corr', abs_corr);
+end
+
+function labels = assign_by_abs_correlation(maps_norm, centers)
+    sims = abs(maps_norm * centers');
+    [~, labels] = max(sims, [], 2);
+end
+
+function [labels_out, centers_out] = remove_empty_states(labels, centers)
+    used = unique(labels(:))';
+    used = used(used >= 1 & used <= size(centers, 1));
+    centers_out = centers(used, :);
+    labels_out = zeros(size(labels));
+    for k = 1:numel(used)
+        labels_out(labels == used(k)) = k;
+    end
+end
+
+function Xn = normalize_rows(X)
+    Xn = X - mean(X, 2);
+    norms = sqrt(sum(Xn.^2, 2));
+    norms(norms < eps) = 1;
+    Xn = Xn ./ norms;
+end
+
+function parent = union_roots(parent, a, b)
+    ra = find_root(parent, a);
+    rb = find_root(parent, b);
+    if ra ~= rb
+        parent(rb) = ra;
+    end
+end
+
+function r = find_root(parent, i)
+    r = i;
+    while parent(r) ~= r
+        r = parent(r);
+    end
+end
+
+function ok = is_valid_spm_mix_result(result)
+%IS_VALID_SPM_MIX_RESULT Guard against SPM returning NaN internals.
+
+    ok = isstruct(result) && isfield(result, 'fm') && isfinite(result.fm) && result.fm ~= 0 && ...
+        isfield(result, 'state') && ~isempty(result.state);
+    if ~ok
+        return;
+    end
+    for k = 1:numel(result.state)
+        if ~isfield(result.state(k), 'm') || any(~isfinite(result.state(k).m(:)))
+            ok = false;
+            return;
+        end
+        if isfield(result.state(k), 'C') && any(~isfinite(result.state(k).C(:)))
+            ok = false;
+            return;
+        end
+    end
+end
+
 function log_p = log_mvnpdf(X, mu, Sigma)
 % Log multivariate normal PDF
     
@@ -388,13 +697,14 @@ function log_p = log_mvnpdf(X, mu, Sigma)
     log_p = -0.5 * (D*log(2*pi) + log_det + maha);
 end
 
-function sil = compute_silhouette_euclidean(X, labels)
-% Compute silhouette score using Euclidean distance (appropriate for PCA space)
+function sil = silhouette_cosine(X, labels, centers)
+    % Silhouette score using polarity-insensitive cosine distance (matching Koenig)
+    % Distance = 1 - |cosine_similarity|
     
-    K = max(labels);
+    K = size(centers, 1);
     N = size(X, 1);
     
-    if K < 2
+    if K < 2 || N < 2
         sil = 0;
         return;
     end
@@ -404,25 +714,34 @@ function sil = compute_silhouette_euclidean(X, labels)
     for i = 1:N
         k = labels(i);
         
+        % Intra-cluster: mean distance to other points in same cluster
         same_cluster = find(labels == k);
         if numel(same_cluster) > 1
-            dists = sqrt(sum((X(same_cluster, :) - X(i, :)).^2, 2));
-            a = mean(dists(dists > 0));
+            % Distance = 1 - |cosine_similarity| (polarity-insensitive)
+            similarities = abs(X(same_cluster, :) * X(i, :)');
+            a = mean(1 - similarities(similarities < 1));  % Exclude self-similarity (=1)
+            if isnan(a) || a < 0, a = 0; end
         else
             a = 0;
         end
         
+        % Inter-cluster: mean distance to nearest other cluster
         b = Inf;
         for kk = 1:K
             if kk == k, continue; end
             other_cluster = find(labels == kk);
             if ~isempty(other_cluster)
-                dists = sqrt(sum((X(other_cluster, :) - X(i, :)).^2, 2));
-                b = min(b, mean(dists));
+                similarities = abs(X(other_cluster, :) * X(i, :)');
+                b_kk = mean(1 - similarities);
+                b = min(b, b_kk);
             end
         end
         
-        if a == 0 && b == Inf
+        if isinf(b) || isnan(b)
+            b = a;
+        end
+        
+        if a == 0 && b == 0
             sil_vals(i) = 0;
         else
             sil_vals(i) = (b - a) / (max(a, b) + eps);
@@ -436,21 +755,23 @@ function sil = compute_silhouette_euclidean(X, labels)
 end
 
 function wss = compute_within_ss(X, labels, K)
-% Compute within-cluster sum of squares
+% Compute within-cluster sum of squares using cosine distance (matching Koenig)
     
     wss = 0;
+    centers = recover_centers_from_labels(X, labels, K);
     for k = 1:K
         cluster_idx = find(labels == k);
         if ~isempty(cluster_idx)
             cluster_data = X(cluster_idx, :);
-            center = mean(cluster_data, 1);
-            wss = wss + sum(sum((cluster_data - center).^2));
+            % Use cosine distance: 1 - |correlation|
+            dists = 1 - abs(cluster_data * centers(k, :)');
+            wss = wss + sum(dists.^2);
         end
     end
 end
 
 function centers = recover_centers_from_labels(maps, labels, K)
-% Recover cluster centers with polarity alignment
+% Recover cluster centers with Koenig-style polarity-invariant update.
     
     [N, D] = size(maps);
     centers = zeros(K, D);
@@ -463,19 +784,16 @@ function centers = recover_centers_from_labels(maps, labels, K)
             continue;
         end
         
-        ref = maps(idx(1), :);
-        
-        aligned = zeros(length(idx), D);
-        for i = 1:length(idx)
-            m = maps(idx(i), :);
-            if (m * ref') < 0
-                aligned(i, :) = -m;
-            else
-                aligned(i, :) = m;
-            end
+        cluster_maps = maps(idx, :);
+        cvm = cluster_maps' * cluster_maps;
+        try
+            [v, ~] = eigs(double(cvm), 1);
+            centers(k, :) = v(:, 1)';
+        catch
+            [v, d] = eig(double(cvm));
+            [~, best] = max(diag(d));
+            centers(k, :) = v(:, best)';
         end
-        
-        centers(k, :) = mean(aligned, 1);
         centers(k, :) = centers(k, :) - mean(centers(k, :));
         centers(k, :) = centers(k, :) / (norm(centers(k, :)) + eps);
     end
@@ -483,24 +801,41 @@ end
 
 function Results = create_empty_results(Sim, K_candidates, n_maps, C_dims, criterion)
 % Create empty results structure for failed fits
+    if isfield(Sim, 'K_true') && isfinite(Sim.K_true) && Sim.K_true > 0
+        maps_true = nan(Sim.K_true, C_dims);
+        K_true_val = Sim.K_true;
+    else
+        maps_true = [];
+        K_true_val = NaN;
+    end
+    if isfield(Sim, 'SNR_dB'), SNR_dB_val = Sim.SNR_dB; else, SNR_dB_val = NaN; end
+    if isfield(Sim, 'duration_s'), duration_s_val = Sim.duration_s; else, duration_s_val = NaN; end
     
     Results = struct(...
         'method', 'spm_vb', ...
         'criterion', criterion, ...
-        'K_true', Sim.K_true, ...
+        'K_true', K_true_val, ...
         'K_estimated', NaN, ...
+        'K_model_selected', NaN, ...
         'K_candidates', K_candidates, ...
-        'SNR_dB', Sim.SNR_dB, ...
-        'duration_s', Sim.duration_s, ...
+        'K_effective_vals', nan(numel(K_candidates), 1), ...
+        'SNR_dB', SNR_dB_val, ...
+        'duration_s', duration_s_val, ...
         'n_maps', n_maps, ...
         'centers', nan(1, C_dims), ...
-        'maps_true', nan(Sim.K_true, C_dims), ...
+        'maps_true', maps_true, ...
         'labels', ones(n_maps, 1), ...
         'free_energy', -Inf(numel(K_candidates), 1), ...
+        'free_energy_vals', -Inf(numel(K_candidates), 1), ...
         'silhouette_vals', -ones(numel(K_candidates), 1), ...
         'within_ss', Inf(numel(K_candidates), 1), ...
-        'recovery_metrics', struct('n_matched', 0, 'mean_recovery_matched', 0, ...
-            'mean_recovery_padded', 0, 'f1_score', 0, 'sensitivity', 0, 'precision', 0), ...
+        'gev_vals', zeros(numel(K_candidates), 1), ...
+        'pca_info', struct(), ...
+        'polarity_feature_info', struct(), ...
+        'polarity_duplicate_info', {cell(numel(K_candidates), 1)}, ...
+        'recovery_metrics', struct('n_matched', 0, 'mean_recovery_matched', NaN, ...
+            'mean_recovery_padded', NaN, 'f1_score', NaN, 'sensitivity', NaN, ...
+            'precision', NaN, 'match_similarities', []), ...
         'mean_recovery', NaN, ...
         'recovery_corr', [], ...
         'avg_recovery_per_state', NaN, ...

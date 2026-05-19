@@ -19,6 +19,7 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
 %   'plot_dir'      - Directory for plots (default: current directory)
 %   'align_template' - Align results to template microstates (default: false)
 %   'template_file'  - Template .set file for alignment (default: 'MetaMaps_2023_06.set')
+%   'use_scalp_channels' - Drop non-scalp/auxiliary channels before fitting (default: true)
 %
 % OUTPUTS:
 %   Results   - Structure containing fitted microstates and metrics
@@ -43,6 +44,7 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
     addParameter(p, 'plot_dir', pwd, @ischar);
     addParameter(p, 'align_template', false, @islogical);
     addParameter(p, 'template_file', 'MetaMaps_2023_06.set', @ischar);
+    addParameter(p, 'use_scalp_channels', true, @islogical);
     parse(p, eeg_file, varargin{:});
     
     CONFIG = p.Results;
@@ -99,6 +101,9 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
     
     % Load based on file extension
     [~, ~, ext] = fileparts(eeg_file);
+    chanlocs = [];
+    channel_labels = {};
+    pos = [];
     
     if strcmp(ext, '.set')
         % EEGLAB .set file
@@ -108,6 +113,9 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
         EEG = pop_loadset(eeg_file);
         eeg_data = EEG.data;  % Channels × Time
         sfreq = EEG.srate;
+        chanlocs = EEG.chanlocs;
+        channel_labels = channel_labels_from_chanlocs(chanlocs, size(eeg_data, 1));
+        pos = pos_from_chanlocs(chanlocs, size(eeg_data, 1));
         
     elseif strcmp(ext, '.mat')
         % MATLAB .mat file
@@ -131,11 +139,51 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
                 fprintf('  ⚠ Sampling frequency not found, using default: %d Hz\n', sfreq);
             end
         end
-        
+        if isfield(data, 'chanlocs')
+            chanlocs = data.chanlocs;
+        elseif isfield(data, 'EEG') && isfield(data.EEG, 'chanlocs')
+            chanlocs = data.EEG.chanlocs;
+        end
+        if isfield(data, 'channel_labels')
+            channel_labels = cellstr(data.channel_labels);
+        elseif isfield(data, 'ch_labels')
+            channel_labels = cellstr(data.ch_labels);
+        else
+            channel_labels = channel_labels_from_chanlocs(chanlocs, size(eeg_data, 1));
+        end
+        if isfield(data, 'pos')
+            pos = data.pos;
+        else
+            pos = pos_from_chanlocs(chanlocs, size(eeg_data, 1));
+        end
+
     else
         error('Unsupported file format: %s. Use .set or .mat files.', ext);
     end
     
+    original_channel_labels = channel_labels;
+    original_chanlocs = chanlocs;
+    original_pos = pos;
+
+    if CONFIG.use_scalp_channels && ~isempty(chanlocs)
+        scalp_mask = scalp_channel_mask(chanlocs, size(eeg_data, 1));
+        if any(scalp_mask) && nnz(scalp_mask) < size(eeg_data, 1)
+            excluded_labels = channel_labels(~scalp_mask);
+            eeg_data = eeg_data(scalp_mask, :);
+            chanlocs = chanlocs(scalp_mask);
+            channel_labels = channel_labels(scalp_mask);
+            if ~isempty(pos)
+                pos = pos(scalp_mask, :);
+            end
+            if CONFIG.verbose
+                fprintf('  Using %d scalp channels; excluded %d auxiliary/non-scalp channels: %s\n', ...
+                    nnz(scalp_mask), numel(excluded_labels), strjoin(excluded_labels(:)', ', '));
+            end
+        elseif ~any(scalp_mask)
+            warning('No scalp channels detected from chanlocs; fitting all channels.');
+        end
+    end
+
     [n_channels, n_samples] = size(eeg_data);
     duration_s = n_samples / sfreq;
     
@@ -152,10 +200,21 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
     Sim.duration_s = duration_s;
     Sim.n_channels = n_channels;
     Sim.n_samples = n_samples;
+    Sim.chanlocs = chanlocs;
+    Sim.channel_labels = channel_labels;
+    Sim.pos = pos;
+    Sim.original_chanlocs = original_chanlocs;
+    Sim.original_channel_labels = original_channel_labels;
+    Sim.original_pos = original_pos;
     
     % Add ground truth if provided
     if ~isempty(CONFIG.true_maps)
-        Sim.maps_true = CONFIG.true_maps;
+        if CONFIG.use_scalp_channels && exist('scalp_mask', 'var') && ...
+                size(CONFIG.true_maps, 2) == numel(scalp_mask)
+            Sim.maps_true = CONFIG.true_maps(:, scalp_mask);
+        else
+            Sim.maps_true = CONFIG.true_maps;
+        end
         Sim.K_true = size(CONFIG.true_maps, 1);
         Sim.SNR_dB = NaN;  % Unknown for real data
     else
@@ -184,6 +243,28 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
         fprintf('\n✗ Analysis failed: %s\n', ME.message);
         fprintf('  Stack trace:\n%s\n', ME.getReport());
         rethrow(ME);
+    end
+
+    if CONFIG.align_template
+        if ~isfile(CONFIG.template_file)
+            warning('Template file not found: %s. Skipping template alignment.', CONFIG.template_file);
+        else
+            try
+                alignment = align_microstates_to_template(Results.centers, CONFIG.template_file, ...
+                    'estimated_channel_labels', Sim.channel_labels);
+                Results.template_alignment = alignment;
+                Results.centers = alignment.aligned_maps;
+                if CONFIG.verbose
+                    fprintf('\nTemplate Alignment:\n');
+                    fprintf('  Mean MetaMaps correlation: %.3f\n', alignment.mean_correlation);
+                    fprintf('  Strong matches (r >= %.2f): %d/%d\n', ...
+                        alignment.strong_threshold, alignment.n_strong_matches, Results.K_estimated);
+                    fprintf('  Labels: %s\n', strjoin(alignment.labels(:)', ', '));
+                end
+            catch ME
+                warning('Template alignment failed: %s', ME.message);
+            end
+        end
     end
     
     % Display results
@@ -235,8 +316,9 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
                 fprintf('Saving JSON: %s\n', json_file);
             end
             
-            % For template alignment: load template maps and use their labels
-            if CONFIG.align_template && isfile(CONFIG.template_file)
+            save_microstate_json(Results, Sim, json_file, META);
+            % Template alignment is already attached to Results above.
+            if exist('never_use_legacy_template_json_path', 'var') && CONFIG.align_template && isfile(CONFIG.template_file)
                 try
                     if exist('pop_loadset', 'file')
                         EEG_template = pop_loadset(CONFIG.template_file);
@@ -262,7 +344,6 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
                     save_microstate_json(Results, Sim, json_file, META);
                 end
             else
-                save_microstate_json(Results, Sim, json_file, META);
             end
             
         catch ME
@@ -283,6 +364,16 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
             if CONFIG.verbose
                 fprintf('\n4. Generating plots...\n');
             end
+            
+            use_topographic_plotter = exist('plot_real_eeg_microstate_topographies', 'file') == 2;
+            if use_topographic_plotter
+                [~, filename, ~] = fileparts(json_file);
+                plot_file = fullfile(CONFIG.plot_dir, sprintf('%s_microstates.png', filename));
+                plot_real_eeg_microstate_topographies(json_file, eeg_file, plot_file);
+                if CONFIG.verbose
+                    fprintf('Topographic plot saved: %s\n', plot_file);
+                end
+            else
             
             % Load the JSON we just created and plot it
             json_data = jsondecode(fileread(json_file));
@@ -350,6 +441,7 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
             if CONFIG.verbose
                 fprintf('✓ Plot saved: %s\n', plot_file);
             end
+            end
         catch ME
             if CONFIG.verbose
                 fprintf('⚠ Warning: Could not generate plots: %s\n', ME.message);
@@ -364,5 +456,69 @@ function out = iif(condition, true_val, false_val)
         out = true_val;
     else
         out = false_val;
+    end
+end
+
+function labels = channel_labels_from_chanlocs(chanlocs, n_channels)
+    labels = cell(n_channels, 1);
+    for i = 1:n_channels
+        if ~isempty(chanlocs) && numel(chanlocs) >= i && ...
+                isfield(chanlocs(i), 'labels') && ~isempty(chanlocs(i).labels)
+            labels{i} = char(chanlocs(i).labels);
+        else
+            labels{i} = sprintf('Ch%03d', i);
+        end
+    end
+end
+
+function pos = pos_from_chanlocs(chanlocs, n_channels)
+    pos = zeros(n_channels, 3);
+    if isempty(chanlocs)
+        return;
+    end
+    for i = 1:min(n_channels, numel(chanlocs))
+        if isfield(chanlocs(i), 'X') && ~isempty(chanlocs(i).X) && ...
+                isfield(chanlocs(i), 'Y') && ~isempty(chanlocs(i).Y) && ...
+                isfield(chanlocs(i), 'Z') && ~isempty(chanlocs(i).Z)
+            pos(i, :) = [chanlocs(i).X, chanlocs(i).Y, chanlocs(i).Z];
+        elseif isfield(chanlocs(i), 'theta') && ~isempty(chanlocs(i).theta) && ...
+                isfield(chanlocs(i), 'radius') && ~isempty(chanlocs(i).radius)
+            [x, y, z] = sph2cart(deg2rad(chanlocs(i).theta), ...
+                deg2rad(90 - chanlocs(i).radius), 1);
+            pos(i, :) = [x, y, z];
+        end
+        r = norm(pos(i, :));
+        if r > 0
+            pos(i, :) = pos(i, :) / r;
+        end
+    end
+end
+
+function mask = scalp_channel_mask(chanlocs, n_channels)
+%SCALP_CHANNEL_MASK Keep channels that look like EEG scalp electrodes.
+
+    mask = false(n_channels, 1);
+    aux_expr = '^(EXG|EOG|HEOG|VEOG|ECG|EKG|EMG|GSR|RESP|TRIG|STATUS|STI|MISC|AUX)';
+    for i = 1:min(n_channels, numel(chanlocs))
+        label = '';
+        if isfield(chanlocs(i), 'labels') && ~isempty(chanlocs(i).labels)
+            label = upper(strtrim(char(chanlocs(i).labels)));
+        end
+        if ~isempty(label) && ~isempty(regexp(label, aux_expr, 'once'))
+            continue;
+        end
+
+        has_xyz = isfield(chanlocs(i), 'X') && ~isempty(chanlocs(i).X) && ...
+            isfield(chanlocs(i), 'Y') && ~isempty(chanlocs(i).Y) && ...
+            isfield(chanlocs(i), 'Z') && ~isempty(chanlocs(i).Z) && ...
+            all(isfinite([chanlocs(i).X chanlocs(i).Y chanlocs(i).Z])) && ...
+            norm([chanlocs(i).X chanlocs(i).Y chanlocs(i).Z]) > eps;
+
+        has_polar = isfield(chanlocs(i), 'theta') && ~isempty(chanlocs(i).theta) && ...
+            isfield(chanlocs(i), 'radius') && ~isempty(chanlocs(i).radius) && ...
+            isfinite(chanlocs(i).theta) && isfinite(chanlocs(i).radius) && ...
+            chanlocs(i).radius <= 0.75;
+
+        mask(i) = has_xyz || has_polar;
     end
 end

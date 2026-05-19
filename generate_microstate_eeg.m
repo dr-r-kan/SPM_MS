@@ -1,4 +1,5 @@
 function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duration_s, sfreq, seed, overlap_opts)
+    % ...existing code...
 % GENERATE_MICROSTATE_EEG: Generate synthetic EEG with REALISTIC amplitudes
 %
 % Microstate amplitudes: 10-50 µV (typical values from literature)
@@ -152,6 +153,7 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         'overlap_strength', overlap_opts.strength, ...
         'overlap_events', overlap_events, ...
         'n_overlap_events', numel(overlap_events));
+
 end
 
 function opts = fill_overlap_defaults(opts, defaults)

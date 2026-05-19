@@ -10,7 +10,7 @@
 function analyze_comparison_results(varargin)
     % ---------- Parse inputs ----------
     default_results_dir = 'Output/results';
-    default_n_boot = 10000;
+    default_n_boot = 2000;
     default_n_boot_lmm = 2000;
     default_n_folds = 20;
 
@@ -210,13 +210,14 @@ function analyze_comparison_results(varargin)
     fprintf('1) METHOD effects\n');    method_results = analyze_factor_effects_with_ci(T, 'method', outcomes_full, fid);
     fprintf('2) CRITERION effects\n'); criterion_results = analyze_factor_effects_with_ci_using_clean(T, 'criterion_clean', outcomes_full, fid);
     fprintf('3) SNR effects\n'); snr_results = analyze_snr_effects(T, outcomes_full, fid);
-    fprintf('4) Interaction METHOD × CRITERION\n'); interaction_results = analyze_interaction(T, outcomes_full, fid);
+    fprintf('4) MONTAGE effects\n'); montage_results = analyze_factor_effects_with_ci(T, 'montage_type', outcomes_full, fid);
+    fprintf('5) Interaction METHOD × CRITERION\n'); interaction_results = analyze_interaction(T, outcomes_full, fid);
 
     % Cross-validation
-    fprintf('5) Cross-validation (adaptive)\n'); cv_results = analyze_cross_validation_adaptive(T, outcomes_full, ANALYSIS_CONFIG.n_folds, fid);
+    fprintf('6) Cross-validation (adaptive)\n'); cv_results = analyze_cross_validation_adaptive(T, outcomes_full, ANALYSIS_CONFIG.n_folds, fid);
 
     % Bootstrapped LMMs (cluster bootstrap by subject) including interaction
-    fprintf('6) Bootstrapped Linear Mixed Models (LMM)\n');
+    fprintf('7) Bootstrapped Linear Mixed Models (LMM)\n');
     fprintf(fid, '\n========================================\nLMM Analysis (cluster bootstrap by subject)\nRandom intercept: subject\nFixed effects: method * criterion_clean + SNR_dB\n========================================\n\n');
     for i = 1:length(outcomes_full)
         out = outcomes_full{i};
@@ -247,12 +248,15 @@ function analyze_comparison_results(varargin)
     
     create_avg_k_error_plot(T, plots_dir);
     create_abs_k_error_plot(T, plots_dir);
+    
+    % Method-Criterion comparison boxplots with significance
+    create_method_criterion_boxplots(T, plots_dir);
 
-    % ---------- Montage Comparison (if montage data available) ----------
+    % ---------- Montage-Criterion Comparison (if montage data available) ----------
     montages = unique(T.montage_type);
     if length(montages) > 1
-        fprintf('Generating montage comparison plots...\n');
-        create_montage_comparison_plots(T, outcomes, outcome_labels, plots_dir);
+        fprintf('Generating criterion-montage comparison boxplots...\n');
+        create_criterion_montage_boxplots(T, plots_dir);
     end
 
     fprintf('All plots saved in %s\n', plots_dir);
@@ -471,10 +475,37 @@ function analyze_lmm_bootstrap(T, outcome_var, n_boot, fid)
     end
     if ~isnumeric(Tsub.SNR_dB), Tsub.SNR_dB = double(Tsub.SNR_dB); end
     formula = sprintf('%s ~ 1 + method*criterion_clean + SNR_dB + (1|subject)', outcome_var);
+    % Treat near-zero residual variance as degenerate to cut down on fitlme warnings
+    base_var = var(Tsub.(outcome_var), 'omitnan');
+    resvar_floor = max(1e-8, 1e-4 * base_var);
+    warn_state = warning('off', 'stats:LinearMixedModel:PerfectFit');
+    cleanup_warn = onCleanup(@() warning(warn_state));
+    lme_opts = statset('Display','off','MaxIter',200,'TolFun',1e-4,'TolX',1e-4);
     try
-        lme0 = fitlme(Tsub, formula, 'FitMethod', 'REML');
+        lme0 = fitlme(Tsub, formula, 'FitMethod', 'REML', 'Optimizer', 'quasinewton', 'Options', lme_opts, 'StartMethod', 'random');
     catch ME
         fprintf(fid, 'Original LME fit failed for %s: %s\n', outcome_var, ME.message); return;
+    end
+    % Normality check on standardized residuals; skip bootstrap if residuals look normal
+    res = residuals(lme0, 'ResidualType', 'Pearson');
+    normal_p = NaN;
+    try
+        [~, normal_p] = lillietest(res); % Lilliefors if available
+    catch
+        try
+            [~, normal_p] = kstest(res);
+        catch
+            normal_p = NaN;
+        end
+    end
+    if ~isnan(normal_p) && normal_p > 0.05
+        fprintf(fid, 'Residuals appear normal (p=%.3f); skipping bootstrap for %s\n\n', normal_p, outcome_var);
+        fprintf('  Residuals normal (p=%.3f); skipped bootstrap for %s\n', normal_p, outcome_var);
+        return;
+    end
+    if lme0.MSE < resvar_floor
+        fprintf(fid, 'Skipping LMM for %s: residual variance ~0 (possible perfect fit)\n', outcome_var);
+        return;
     end
     coefNames = lme0.Coefficients.Name;
     obsEst = fixedEffects(lme0);
@@ -482,15 +513,26 @@ function analyze_lmm_bootstrap(T, outcome_var, n_boot, fid)
     obsP = lme0.Coefficients.pValue;
     nCoefs = numel(obsEst);
     bootEst = nan(n_boot, nCoefs);
+    n_success = 0;
     fprintf(fid, 'Bootstrapping LMM for %s (%d iterations), subjects=%d, observations=%d\n', outcome_var, n_boot, n_subj, height(Tsub));
+    t_start = tic;
+    update_every = max(1, floor(n_boot / 20)); % ~5% updates to console
+    fprintf('    LMM bootstrap %s: starting (update every %d iters)\n', outcome_var, update_every);
     for b = 1:n_boot
         sampled = datasample(subjects, n_subj);
         Tb = Tsub([],:);
         for k = 1:n_subj
             Tb = [Tb; Tsub(Tsub.subject == sampled(k), :)];
         end
+        if var(Tb.(outcome_var), 'omitnan') < resvar_floor
+            continue;
+        end
         try
-            lme_b = fitlme(Tb, formula, 'FitMethod', 'REML');
+            iter_tic = tic;
+            lme_b = fitlme(Tb, formula, 'FitMethod', 'REML', 'Optimizer', 'quasinewton', 'Options', lme_opts, 'StartMethod', 'random');
+            if lme_b.MSE < resvar_floor
+                continue;
+            end
             fe_b = fixedEffects(lme_b);
             if numel(fe_b) == nCoefs
                 bootEst(b,:) = fe_b';
@@ -504,8 +546,14 @@ function analyze_lmm_bootstrap(T, outcome_var, n_boot, fid)
                 end
                 bootEst(b,:) = mapped';
             end
+            n_success = n_success + 1;
         catch
             bootEst(b,:) = nan(1,nCoefs);
+        end
+        if mod(b, update_every) == 0 || b == n_boot
+            elapsed = toc(t_start);
+            eta = (elapsed / b) * (n_boot - b);
+            fprintf('    LMM bootstrap %s: %4d/%4d (%.1f%%%%) elapsed %.1fs ETA %.1fs\n', outcome_var, b, n_boot, 100*b/n_boot, elapsed, eta);
         end
     end
     ciL = prctile(bootEst, 2.5, 1);
@@ -527,9 +575,9 @@ function analyze_lmm_bootstrap(T, outcome_var, n_boot, fid)
     for ii = 1:nCoefs
         fprintf(fid, '%-35s %10.4f %10.4f %10.4f [%6.4f, %6.4f]\n', coefNames{ii}, bootMean(ii), bootStd(ii), bootP(ii), ciL(ii), ciH(ii));
     end
-    fprintf(fid, '\n');
+    fprintf(fid, 'Successful bootstrap fits: %d / %d\n\n', n_success, n_boot);
+    fprintf('    LMM bootstrap %s done. Successful fits: %d/%d. Elapsed %.1fs\n', outcome_var, n_success, n_boot, toc(t_start));
 end
-
 function [nrows, ncols] = choose_subplot_grid(n)
     if n <= 3, nrows = 1; ncols = n;
     elseif n == 4, nrows = 2; ncols = 2;
@@ -951,23 +999,39 @@ function r = ifthenelse(cond, true_val, false_val)
     if cond, r = true_val; else r = false_val; end
 end
 
-function create_montage_comparison_plots(T, outcomes, outcome_labels, plots_dir)
-    % CREATE_MONTAGE_COMPARISON_PLOTS: Generate montage robustness analysis plots
-    %
-    % Creates plots comparing performance across different montages:
-    %   - K estimation accuracy vs lead count
-    %   - Recovery metrics vs lead count
-    %   - Boxplots by montage for key outcomes
+function create_criterion_montage_boxplots(T, plots_dir)
+    % Creates boxplots of F1 and absolute K error for each criterion
+    % at all montage levels, for SPM and k-means methods, with significance brackets
     
-    montages = unique(T.montage_type);
-    methods = unique(T.method);
+    global ANALYSIS_CONFIG;
+    if isempty(ANALYSIS_CONFIG)
+        ANALYSIS_CONFIG.n_boot = 10000;
+    end
     
-    % Get lead counts for each montage
+    % Filter for SPM and k-means methods only
+    method_col = cellstr(string(T.method));
+    method_filter = contains(method_col, 'spm', 'IgnoreCase', true) | ...
+                    contains(method_col, 'kmeans', 'IgnoreCase', true);
+    T_filtered = T(method_filter, :);
+    
+    if height(T_filtered) == 0
+        fprintf('⚠ No SPM or k-means data found\n');
+        return;
+    end
+    
+    % Get unique criteria and montages
+    criteria = unique(cellstr(string(T_filtered.criterion_clean)));
+    montages = unique(T_filtered.montage_type);
+    
+    fprintf('  Found %d criteria: %s\n', length(criteria), strjoin(criteria, ', '));
+    fprintf('  Found %d montages: %s\n', length(montages), strjoin(cellstr(montages), ', '));
+    
+    % Get lead counts for labeling
     lead_counts = zeros(size(montages));
     for i = 1:length(montages)
-        idx = find(strcmp(T.montage_type, montages{i}), 1);
+        idx = find(strcmp(T_filtered.montage_type, montages{i}), 1);
         if ~isempty(idx)
-            lead_counts(i) = T.n_leads(idx);
+            lead_counts(i) = T_filtered.n_leads(idx);
         end
     end
     
@@ -975,198 +1039,601 @@ function create_montage_comparison_plots(T, outcomes, outcome_labels, plots_dir)
     [lead_counts, sort_idx] = sort(lead_counts);
     montages = montages(sort_idx);
     
-    % ===== PLOT 1: K Accuracy vs Lead Count =====
-    fig = figure('Position', [100 100 1200 500]);
-    colors = lines(length(methods));
-    
-    % Subplot 1: Accuracy by method
-    subplot(1, 2, 1);
-    hold on;
-    
-    for m = 1:length(methods)
-        method = methods{m};
-        acc = zeros(size(montages));
-        err = zeros(size(montages));
-        
-        for i = 1:length(montages)
-            idx = strcmp(T.montage_type, montages{i}) & strcmp(T.method, method);
-            if any(idx)
-                acc(i) = mean(T.K_correct(idx));
-                err(i) = std(T.K_correct(idx)) / sqrt(sum(idx));
-            end
-        end
-        
-        errorbar(lead_counts, acc * 100, err * 100, 'o-', ...
-            'LineWidth', 2, 'MarkerSize', 8, 'Color', colors(m, :), ...
-            'DisplayName', strrep(method, '_', ' '));
-    end
-    
-    xlabel('Number of Leads', 'FontSize', 12);
-    ylabel('K Estimation Accuracy (%)', 'FontSize', 12);
-    title('K Estimation Accuracy vs Lead Count', 'FontSize', 14);
-    legend('Location', 'best', 'FontSize', 11);
-    grid on;
-    set(gca, 'FontSize', 11);
-    
-    % Subplot 2: Mean absolute error
-    subplot(1, 2, 2);
-    hold on;
-    
-    for m = 1:length(methods)
-        method = methods{m};
-        mae = zeros(size(montages));
-        err = zeros(size(montages));
-        
-        for i = 1:length(montages)
-            idx = strcmp(T.montage_type, montages{i}) & strcmp(T.method, method);
-            if any(idx) && ismember('K_abs_error', T.Properties.VariableNames)
-                mae(i) = mean(T.K_abs_error(idx));
-                err(i) = std(T.K_abs_error(idx)) / sqrt(sum(idx));
-            elseif any(idx) && ismember('K_error', T.Properties.VariableNames)
-                mae(i) = mean(abs(T.K_error(idx)));
-                err(i) = std(abs(T.K_error(idx))) / sqrt(sum(idx));
-            end
-        end
-        
-        errorbar(lead_counts, mae, err, 'o-', ...
-            'LineWidth', 2, 'MarkerSize', 8, 'Color', colors(m, :), ...
-            'DisplayName', strrep(method, '_', ' '));
-    end
-    
-    xlabel('Number of Leads', 'FontSize', 12);
-    ylabel('Mean Absolute K Error', 'FontSize', 12);
-    title('K Error vs Lead Count', 'FontSize', 14);
-    legend('Location', 'best', 'FontSize', 11);
-    grid on;
-    set(gca, 'FontSize', 11);
-    
-    saveas(fig, fullfile(plots_dir, 'montage_k_accuracy_vs_leads.png'));
-    close(fig);
-    
-    % ===== PLOT 2: Recovery vs Lead Count =====
-    if ismember('mean_recovery_matched', T.Properties.VariableNames)
-        fig = figure('Position', [100 100 1200 500]);
-        
-        % Subplot 1: Mean Recovery (Matched)
-        subplot(1, 2, 1);
-        hold on;
-        
-        for m = 1:length(methods)
-            method = methods{m};
-            rec = zeros(size(montages));
-            err = zeros(size(montages));
-            
-            for i = 1:length(montages)
-                idx = strcmp(T.montage_type, montages{i}) & strcmp(T.method, method);
-                if any(idx)
-                    rec(i) = mean(T.mean_recovery_matched(idx));
-                    err(i) = std(T.mean_recovery_matched(idx)) / sqrt(sum(idx));
-                end
-            end
-            
-            errorbar(lead_counts, rec, err, 'o-', ...
-                'LineWidth', 2, 'MarkerSize', 8, 'Color', colors(m, :), ...
-                'DisplayName', strrep(method, '_', ' '));
-        end
-        
-        xlabel('Number of Leads', 'FontSize', 12);
-        ylabel('Mean Recovery (Matched)', 'FontSize', 12);
-        title('Recovery vs Lead Count', 'FontSize', 14);
-        legend('Location', 'best', 'FontSize', 11);
-        grid on;
-        set(gca, 'FontSize', 11);
-        
-        % Subplot 2: Sensitivity
-        subplot(1, 2, 2);
-        hold on;
-        
-        if ismember('sensitivity', T.Properties.VariableNames)
-            for m = 1:length(methods)
-                method = methods{m};
-                sen = zeros(size(montages));
-                err = zeros(size(montages));
-                
-                for i = 1:length(montages)
-                    idx = strcmp(T.montage_type, montages{i}) & strcmp(T.method, method);
-                    if any(idx)
-                        sen(i) = mean(T.sensitivity(idx));
-                        err(i) = std(T.sensitivity(idx)) / sqrt(sum(idx));
-                    end
-                end
-                
-                errorbar(lead_counts, sen, err, 'o-', ...
-                    'LineWidth', 2, 'MarkerSize', 8, 'Color', colors(m, :), ...
-                    'DisplayName', strrep(method, '_', ' '));
-            end
-            
-            xlabel('Number of Leads', 'FontSize', 12);
-            ylabel('Sensitivity', 'FontSize', 12);
-            title('Sensitivity vs Lead Count', 'FontSize', 14);
-            legend('Location', 'best', 'FontSize', 11);
-            grid on;
-            set(gca, 'FontSize', 11);
-        end
-        
-        saveas(fig, fullfile(plots_dir, 'montage_recovery_vs_leads.png'));
-        close(fig);
-    end
-    
-    % ===== PLOT 3: Boxplots by Montage =====
     % Create montage labels with lead counts
     montage_labels = cell(size(montages));
     for i = 1:length(montages)
-        montage_labels{i} = sprintf('%s (%d)', montages{i}, lead_counts(i));
+        montage_labels{i} = sprintf('%s(%dch)', montages{i}, lead_counts(i));
     end
     
-    % K Accuracy boxplot
-    fig = figure('Position', [100 100 800 600]);
+    % Identify methods
+    unique_methods = unique(cellstr(string(T_filtered.method)));
     
-    data_groups = [];
-    group_labels = {};
+    % Look for spm-k-means (combined method)
+    spm_kmeans_idx = find(contains(unique_methods, 'spm', 'IgnoreCase', true) & contains(unique_methods, 'kmeans', 'IgnoreCase', true), 1);
     
-    for i = 1:length(montages)
-        idx = strcmp(T.montage_type, montages{i});
-        if any(idx)
-            data_groups = [data_groups; T.K_correct(idx) * 100]; %#ok<AGROW>
-            group_labels = [group_labels; repmat(montage_labels(i), sum(idx), 1)]; %#ok<AGROW>
+    % Look for standard kmeans
+    kmeans_idx = find(contains(unique_methods, 'kmeans', 'IgnoreCase', true) & ~contains(unique_methods, 'spm', 'IgnoreCase', true), 1);
+    
+    if isempty(spm_kmeans_idx) || isempty(kmeans_idx)
+        fprintf('⚠ Need both SPM-K-Means and K-Means data\n');
+        fprintf('   Available methods: %s\n', strjoin(unique_methods, ', '));
+        return;
+    end
+    
+    spm_kmeans_method = unique_methods{spm_kmeans_idx};
+    kmeans_method = unique_methods{kmeans_idx};
+    
+    fprintf('  Using methods: %s vs %s\n', spm_kmeans_method, kmeans_method);
+    
+    % ========== FIGURE 1: Absolute K Error by Criterion and Montage ==========
+    for method_idx = 1:2
+        if method_idx == 1
+            method = spm_kmeans_method;
+            method_label = 'SPM-K-Means';
+        else
+            method = kmeans_method;
+            method_label = 'K-Means Standard';
         end
-    end
-    
-    boxplot(data_groups, group_labels);
-    ylabel('K Estimation Accuracy (%)', 'FontSize', 12);
-    xlabel('Montage', 'FontSize', 12);
-    title('K Estimation Accuracy by Montage', 'FontSize', 14);
-    grid on;
-    set(gca, 'FontSize', 11);
-    
-    saveas(fig, fullfile(plots_dir, 'montage_k_accuracy_boxplot.png'));
-    close(fig);
-    
-    % Recovery boxplot (if available)
-    if ismember('mean_recovery_matched', T.Properties.VariableNames)
-        fig = figure('Position', [100 100 800 600]);
         
-        data_groups = [];
-        group_labels = {};
+        fig = figure('Position', [100 100 1400 600]);
+        sgtitle(sprintf('Absolute K Error by Criterion and Montage - %s', method_label), ...
+                'FontSize', 16, 'FontWeight', 'bold');
         
-        for i = 1:length(montages)
-            idx = strcmp(T.montage_type, montages{i});
-            if any(idx)
-                data_groups = [data_groups; T.mean_recovery_matched(idx)]; %#ok<AGROW>
-                group_labels = [group_labels; repmat(montage_labels(i), sum(idx), 1)]; %#ok<AGROW>
+        for c = 1:length(criteria)
+            crit = criteria{c};
+            
+            subplot(2, ceil(length(criteria)/2), c);
+            hold on;
+            box on;
+            
+            % Set title first so it appears even if no data
+            crit_display = strrep(crit, '_', ' ');
+            title(crit_display, 'FontSize', 13, 'FontWeight', 'bold', 'Interpreter', 'none');
+            
+            % Prepare data for this criterion
+            data_groups = [];
+            group_labels = {};
+            montage_data = cell(length(montages), 1);
+            
+            for m = 1:length(montages)
+                mont = montages{m};
+                idx = strcmp(cellstr(string(T_filtered.method)), method) & ...
+                      strcmp(cellstr(string(T_filtered.criterion_clean)), crit) & ...
+                      strcmp(T_filtered.montage_type, mont);
+                
+                if any(idx)
+                    vals = T_filtered.K_abs_error(idx);
+                    vals = vals(~isnan(vals));
+                    montage_data{m} = vals;
+                    
+                    if ~isempty(vals)
+                        data_groups = [data_groups; vals]; %#ok<AGROW>
+                        group_labels = [group_labels; repmat(montage_labels(m), length(vals), 1)]; %#ok<AGROW>
+                    end
+                end
+            end
+            
+            if ~isempty(data_groups)
+                h = boxplot(data_groups, group_labels, 'Colors', [0.2 0.4 0.8], 'LabelOrientation', 'inline');
+                ylabel('Absolute K Error', 'FontSize', 11, 'FontWeight', 'bold');
+                xlabel('');
+                grid on;
+                ylim_curr = ylim;
+                ylim([0, ylim_curr(2)]);
+                set(gca, 'XTickLabelRotation', 0);
+                
+                % Add significance brackets (compare adjacent montages)
+                if length(montages) > 1
+                    y_max = max(data_groups);
+                    bracket_height = y_max * 0.05;
+                    current_y = y_max * 1.05;
+                    
+                    for m = 1:(length(montages)-1)
+                        data1 = montage_data{m};
+                        data2 = montage_data{m+1};
+                        
+                        if ~isempty(data1) && ~isempty(data2) && length(data1) > 1 && length(data2) > 1
+                            % Bootstrap test
+                            n_boot = ANALYSIS_CONFIG.n_boot;
+                            diff_boot = zeros(n_boot, 1);
+                            for b = 1:n_boot
+                                boot1 = mean(datasample(data1, length(data1)));
+                                boot2 = mean(datasample(data2, length(data2)));
+                                diff_boot(b) = boot1 - boot2;
+                            end
+                            
+                            % Two-tailed test
+                            p_val = 2 * min(mean(diff_boot >= 0), mean(diff_boot <= 0));
+                            
+                            % Determine significance
+                            if p_val < 0.001
+                                sig_label = '***';
+                            elseif p_val < 0.01
+                                sig_label = '**';
+                            elseif p_val < 0.05
+                                sig_label = '*';
+                            else
+                                sig_label = '';
+                            end
+                            
+                            % Draw bracket if significant
+                            if ~isempty(sig_label)
+                                pos1 = m;
+                                pos2 = m + 1;
+                                
+                                plot([pos1, pos1], [current_y, current_y + bracket_height], 'k-', 'LineWidth', 1);
+                                plot([pos1, pos2], [current_y + bracket_height, current_y + bracket_height], 'k-', 'LineWidth', 1);
+                                plot([pos2, pos2], [current_y, current_y + bracket_height], 'k-', 'LineWidth', 1);
+                                text((pos1 + pos2)/2, current_y + bracket_height * 1.3, sig_label, ...
+                                     'HorizontalAlignment', 'center', 'FontSize', 10, 'FontWeight', 'bold');
+                                
+                                current_y = current_y + bracket_height * 3;
+                            end
+                        end
+                    end
+                    
+                    % Adjust y-axis to fit brackets
+                    ylim_new = ylim;
+                    if current_y > ylim_new(2)
+                        ylim([ylim_new(1), current_y + bracket_height]);
+                    end
+                end
+            else
+                text(0.5, 0.5, 'No data', 'HorizontalAlignment', 'center', ...
+                     'FontSize', 14, 'Color', [0.5 0.5 0.5]);
+                axis off;
             end
         end
         
-        boxplot(data_groups, group_labels);
-        ylabel('Mean Recovery (Matched)', 'FontSize', 12);
-        xlabel('Montage', 'FontSize', 12);
-        title('Mean Recovery by Montage', 'FontSize', 14);
-        grid on;
-        set(gca, 'FontSize', 11);
-        
-        saveas(fig, fullfile(plots_dir, 'montage_recovery_boxplot.png'));
+        saveas(fig, fullfile(plots_dir, sprintf('abs_k_error_criterion_montage_%s.png', ...
+               strrep(lower(method_label), ' ', '_'))));
         close(fig);
     end
     
-    fprintf('✓ Montage comparison plots saved\n');
+    % ========== FIGURE 2: F1 Score by Criterion and Montage ==========
+    for method_idx = 1:2
+        if method_idx == 1
+            method = spm_kmeans_method;
+            method_label = 'SPM-K-Means';
+        else
+            method = kmeans_method;
+            method_label = 'K-Means Standard';
+        end
+        
+        fig = figure('Position', [100 100 1400 600]);
+        sgtitle(sprintf('F1 Score by Criterion and Montage - %s', method_label), ...
+                'FontSize', 16, 'FontWeight', 'bold');
+        
+        for c = 1:length(criteria)
+            crit = criteria{c};
+            
+            subplot(2, ceil(length(criteria)/2), c);
+            hold on;
+            box on;
+            
+            % Set title first so it appears even if no data
+            crit_display = strrep(crit, '_', ' ');
+            title(crit_display, 'FontSize', 13, 'FontWeight', 'bold', 'Interpreter', 'none');
+            
+            % Prepare data for this criterion
+            data_groups = [];
+            group_labels = {};
+            montage_data = cell(length(montages), 1);
+            
+            for m = 1:length(montages)
+                mont = montages{m};
+                idx = strcmp(cellstr(string(T_filtered.method)), method) & ...
+                      strcmp(cellstr(string(T_filtered.criterion_clean)), crit) & ...
+                      strcmp(T_filtered.montage_type, mont);
+                
+                if any(idx)
+                    vals = T_filtered.f1_score(idx);
+                    vals = vals(~isnan(vals));
+                    montage_data{m} = vals;
+                    
+                    if ~isempty(vals)
+                        data_groups = [data_groups; vals]; %#ok<AGROW>
+                        group_labels = [group_labels; repmat(montage_labels(m), length(vals), 1)]; %#ok<AGROW>
+                    end
+                end
+            end
+            
+            if ~isempty(data_groups)
+                h = boxplot(data_groups, group_labels, 'Colors', [0.8 0.4 0.2], 'LabelOrientation', 'inline');
+                ylabel('F1 Score', 'FontSize', 11, 'FontWeight', 'bold');
+                xlabel('');
+                grid on;
+                ylim([0, 1]);
+                set(gca, 'XTickLabelRotation', 0);
+                
+                % Add significance brackets (compare adjacent montages)
+                if length(montages) > 1
+                    bracket_height = 0.04;
+                    current_y = 0.85;
+                    
+                    for m = 1:(length(montages)-1)
+                        data1 = montage_data{m};
+                        data2 = montage_data{m+1};
+                        
+                        if ~isempty(data1) && ~isempty(data2) && length(data1) > 1 && length(data2) > 1
+                            % Bootstrap test
+                            n_boot = ANALYSIS_CONFIG.n_boot;
+                            diff_boot = zeros(n_boot, 1);
+                            for b = 1:n_boot
+                                boot1 = mean(datasample(data1, length(data1)));
+                                boot2 = mean(datasample(data2, length(data2)));
+                                diff_boot(b) = boot1 - boot2;
+                            end
+                            
+                            % Two-tailed test
+                            p_val = 2 * min(mean(diff_boot >= 0), mean(diff_boot <= 0));
+                            
+                            % Determine significance
+                            if p_val < 0.001
+                                sig_label = '***';
+                            elseif p_val < 0.01
+                                sig_label = '**';
+                            elseif p_val < 0.05
+                                sig_label = '*';
+                            else
+                                sig_label = '';
+                            end
+                            
+                            % Draw bracket if significant
+                            if ~isempty(sig_label)
+                                pos1 = m;
+                                pos2 = m + 1;
+                                
+                                plot([pos1, pos1], [current_y, current_y + bracket_height], 'k-', 'LineWidth', 1);
+                                plot([pos1, pos2], [current_y + bracket_height, current_y + bracket_height], 'k-', 'LineWidth', 1);
+                                plot([pos2, pos2], [current_y, current_y + bracket_height], 'k-', 'LineWidth', 1);
+                                text((pos1 + pos2)/2, current_y + bracket_height * 1.3, sig_label, ...
+                                     'HorizontalAlignment', 'center', 'FontSize', 10, 'FontWeight', 'bold');
+                                
+                                current_y = current_y + bracket_height * 2.5;
+                            end
+                        end
+                    end
+                    
+                    % Adjust y-axis to fit brackets
+                    if current_y > 0.9
+                        ylim([0, min(1.0, current_y + bracket_height * 1.5)]);
+                    end
+                end
+            else
+                text(0.5, 0.5, 'No data', 'HorizontalAlignment', 'center', ...
+                     'FontSize', 14, 'Color', [0.5 0.5 0.5]);
+                axis off;
+            end
+        end
+        
+        saveas(fig, fullfile(plots_dir, sprintf('f1_score_criterion_montage_%s.png', ...
+               strrep(lower(method_label), ' ', '_'))));
+        close(fig);
+    end
+    
+    fprintf('✓ Criterion-montage boxplots saved\n');
+end
+
+
+function create_method_criterion_boxplots(T, plots_dir)
+    % Creates box-and-whisker plots comparing absolute K error and F1 score
+    % across different criteria for SPM and k-means methods, with significance brackets
+    
+    global ANALYSIS_CONFIG;
+    if isempty(ANALYSIS_CONFIG)
+        ANALYSIS_CONFIG.n_boot = 10000;
+    end
+    
+    % Filter for SPM and k-means methods only
+    method_col = cellstr(string(T.method));
+    method_filter = contains(method_col, 'spm', 'IgnoreCase', true) | ...
+                    contains(method_col, 'kmeans', 'IgnoreCase', true);
+    T_filtered = T(method_filter, :);
+    
+    if height(T_filtered) == 0
+        fprintf('⚠ No SPM or k-means data found for method-criterion boxplots\n');
+        fprintf('   Available methods: %s\n', strjoin(unique(method_col), ', '));
+        return;
+    end
+    
+    fprintf('Creating method-criterion comparison boxplots...\n');
+    
+    % Get unique criteria
+    criteria = unique(cellstr(string(T_filtered.criterion_clean)));
+    
+    % Identify actual method names in data (defensive in case one is missing)
+    unique_methods = unique(cellstr(string(T_filtered.method)));
+    spm_idx = find(contains(unique_methods, 'spm', 'IgnoreCase', true), 1);
+    kmeans_idx = find(contains(unique_methods, 'kmeans', 'IgnoreCase', true), 1);
+    if isempty(spm_idx) || isempty(kmeans_idx)
+        fprintf('ƒsÿ Expected both SPM and k-means methods, found: %s\n', strjoin(unique_methods, ', '));
+        return;
+    end
+    spm_method = unique_methods{spm_idx};
+    kmeans_method = unique_methods{kmeans_idx};
+    
+    methods = {spm_method, kmeans_method};
+    method_labels = {'SPM VB', 'K-Means'};
+    
+    % Create figure with two subplots
+    fig = figure('Position', [100 100 1400 600]);
+    
+    % ========== SUBPLOT 1: Absolute K Error ==========
+    subplot(1, 2, 1);
+    hold on;
+    
+    % Prepare data and group labels
+    data_k_error = [];
+    group_labels_k = {};
+    group_positions = [];
+    tick_labels = {};
+    pos = 0;
+    
+    % Organize data by criterion, then method within each criterion
+    for c = 1:length(criteria)
+        crit = criteria{c};
+        for m = 1:length(methods)
+            meth = methods{m};
+            idx = strcmp(cellstr(string(T_filtered.method)), meth) & ...
+                  strcmp(cellstr(string(T_filtered.criterion_clean)), crit);
+            
+            if any(idx)
+                pos = pos + 1;
+                vals = T_filtered.K_abs_error(idx);
+                vals = vals(~isnan(vals));
+                
+                data_k_error = [data_k_error; vals]; %#ok<AGROW>
+                group_labels_k = [group_labels_k; repmat({sprintf('%s_%s', crit, meth)}, length(vals), 1)]; %#ok<AGROW>
+                group_positions(end+1) = pos; %#ok<AGROW>
+                
+                if m == 1
+                    tick_labels{end+1} = sprintf('%s\n%s', crit, method_labels{m}); %#ok<AGROW>
+                else
+                    tick_labels{end+1} = method_labels{m}; %#ok<AGROW>
+                end
+            end
+        end
+        % Add gap between criteria
+        pos = pos + 0.5;
+    end
+    
+    % Create boxplot
+    positions = group_positions;
+    boxplot(data_k_error, group_labels_k, 'Positions', positions, ...
+            'Colors', repmat([0.2 0.4 0.8; 0.8 0.4 0.2], ceil(length(positions)/2), 1), ...
+            'Widths', 0.6);
+    
+    % Customize appearance
+    set(gca, 'XTick', positions, 'XTickLabel', tick_labels, 'FontSize', 10);
+    ylabel('Absolute K Error', 'FontSize', 13, 'FontWeight', 'bold');
+    xlabel('Criterion and Method', 'FontSize', 13, 'FontWeight', 'bold');
+    title('Absolute K Error by Criterion and Method', 'FontSize', 14, 'FontWeight', 'bold');
+    grid on;
+    ylim_curr = ylim;
+    ylim([0, ylim_curr(2)]);
+    
+    % Add significance brackets (compare methods within each criterion)
+    y_max = max(data_k_error);
+    bracket_height = y_max * 0.05;
+    current_y = y_max * 1.1;
+    
+    sig_comparisons = {};
+    pos_idx = 1;
+    for c = 1:length(criteria)
+        crit = criteria{c};
+        
+        % Get data for both methods
+        data_spm = [];
+        data_kmeans = [];
+        
+        idx_spm = strcmp(cellstr(string(T_filtered.method)), 'spm vb') & ...
+                  strcmp(cellstr(string(T_filtered.criterion_clean)), crit);
+        idx_kmeans = strcmp(cellstr(string(T_filtered.method)), 'kmeans standard') & ...
+                     strcmp(cellstr(string(T_filtered.criterion_clean)), crit);
+        
+        if any(idx_spm)
+            data_spm = T_filtered.K_abs_error(idx_spm);
+            data_spm = data_spm(~isnan(data_spm));
+        end
+        if any(idx_kmeans)
+            data_kmeans = T_filtered.K_abs_error(idx_kmeans);
+            data_kmeans = data_kmeans(~isnan(data_kmeans));
+        end
+        
+        % Perform bootstrap test if both methods have data
+        if ~isempty(data_spm) && ~isempty(data_kmeans)
+            % Bootstrap test
+            n_boot = ANALYSIS_CONFIG.n_boot;
+            diff_boot = zeros(n_boot, 1);
+            for b = 1:n_boot
+                boot_spm = mean(datasample(data_spm, length(data_spm)));
+                boot_kmeans = mean(datasample(data_kmeans, length(data_kmeans)));
+                diff_boot(b) = boot_spm - boot_kmeans;
+            end
+            
+            % Two-tailed test
+            p_val = 2 * min(mean(diff_boot >= 0), mean(diff_boot <= 0));
+            
+            % Determine significance
+            if p_val < 0.001
+                sig_label = '***';
+            elseif p_val < 0.01
+                sig_label = '**';
+            elseif p_val < 0.05
+                sig_label = '*';
+            else
+                sig_label = 'ns';
+            end
+            
+            % Draw bracket if significant
+            if ~strcmp(sig_label, 'ns')
+                pos1 = positions(pos_idx);
+                pos2 = positions(pos_idx + 1);
+                
+                plot([pos1, pos1], [current_y, current_y + bracket_height], 'k-', 'LineWidth', 1.5);
+                plot([pos1, pos2], [current_y + bracket_height, current_y + bracket_height], 'k-', 'LineWidth', 1.5);
+                plot([pos2, pos2], [current_y, current_y + bracket_height], 'k-', 'LineWidth', 1.5);
+                text((pos1 + pos2)/2, current_y + bracket_height * 1.5, sig_label, ...
+                     'HorizontalAlignment', 'center', 'FontSize', 12, 'FontWeight', 'bold');
+                
+                current_y = current_y + bracket_height * 4;
+            end
+            
+            sig_comparisons{end+1} = sprintf('%s: p=%.4f (%s)', crit, p_val, sig_label); %#ok<AGROW>
+            pos_idx = pos_idx + 2;
+        else
+            pos_idx = pos_idx + sum([any(idx_spm), any(idx_kmeans)]);
+        end
+    end
+    
+    % Adjust y-axis to fit brackets
+    ylim_new = ylim;
+    ylim([ylim_new(1), current_y + bracket_height]);
+    
+    % ========== SUBPLOT 2: F1 Score ==========
+    subplot(1, 2, 2);
+    hold on;
+    
+    % Prepare data and group labels
+    data_f1 = [];
+    group_labels_f1 = {};
+    group_positions = [];
+    tick_labels = {};
+    pos = 0;
+    
+    % Organize data by criterion, then method within each criterion
+    for c = 1:length(criteria)
+        crit = criteria{c};
+        for m = 1:length(methods)
+            meth = methods{m};
+            idx = strcmp(cellstr(string(T_filtered.method)), meth) & ...
+                  strcmp(cellstr(string(T_filtered.criterion_clean)), crit);
+            
+            if any(idx)
+                pos = pos + 1;
+                vals = T_filtered.f1_score(idx);
+                vals = vals(~isnan(vals));
+                
+                data_f1 = [data_f1; vals]; %#ok<AGROW>
+                group_labels_f1 = [group_labels_f1; repmat({sprintf('%s_%s', crit, meth)}, length(vals), 1)]; %#ok<AGROW>
+                group_positions(end+1) = pos; %#ok<AGROW>
+                
+                if m == 1
+                    tick_labels{end+1} = sprintf('%s\n%s', crit, method_labels{m}); %#ok<AGROW>
+                else
+                    tick_labels{end+1} = method_labels{m}; %#ok<AGROW>
+                end
+            end
+        end
+        % Add gap between criteria
+        pos = pos + 0.5;
+    end
+    
+    % Create boxplot
+    positions = group_positions;
+    boxplot(data_f1, group_labels_f1, 'Positions', positions, ...
+            'Colors', repmat([0.2 0.4 0.8; 0.8 0.4 0.2], ceil(length(positions)/2), 1), ...
+            'Widths', 0.6);
+    
+    % Customize appearance
+    set(gca, 'XTick', positions, 'XTickLabel', tick_labels, 'FontSize', 10);
+    ylabel('F1 Score', 'FontSize', 13, 'FontWeight', 'bold');
+    xlabel('Criterion and Method', 'FontSize', 13, 'FontWeight', 'bold');
+    title('F1 Score by Criterion and Method', 'FontSize', 14, 'FontWeight', 'bold');
+    grid on;
+    ylim([0, 1]);
+    
+    % Add significance brackets (compare methods within each criterion)
+    y_max = 1.0;
+    bracket_height = 0.03;
+    current_y = 0.85;
+    
+    sig_comparisons_f1 = {};
+    pos_idx = 1;
+    for c = 1:length(criteria)
+        crit = criteria{c};
+        
+        % Get data for both methods
+        data_spm = [];
+        data_kmeans = [];
+        
+        idx_spm = strcmp(cellstr(string(T_filtered.method)), 'spm vb') & ...
+                  strcmp(cellstr(string(T_filtered.criterion_clean)), crit);
+        idx_kmeans = strcmp(cellstr(string(T_filtered.method)), 'kmeans standard') & ...
+                     strcmp(cellstr(string(T_filtered.criterion_clean)), crit);
+        
+        if any(idx_spm)
+            data_spm = T_filtered.f1_score(idx_spm);
+            data_spm = data_spm(~isnan(data_spm));
+        end
+        if any(idx_kmeans)
+            data_kmeans = T_filtered.f1_score(idx_kmeans);
+            data_kmeans = data_kmeans(~isnan(data_kmeans));
+        end
+        
+        % Perform bootstrap test if both methods have data
+        if ~isempty(data_spm) && ~isempty(data_kmeans)
+            % Bootstrap test
+            n_boot = ANALYSIS_CONFIG.n_boot;
+            diff_boot = zeros(n_boot, 1);
+            for b = 1:n_boot
+                boot_spm = mean(datasample(data_spm, length(data_spm)));
+                boot_kmeans = mean(datasample(data_kmeans, length(data_kmeans)));
+                diff_boot(b) = boot_spm - boot_kmeans;
+            end
+            
+            % Two-tailed test
+            p_val = 2 * min(mean(diff_boot >= 0), mean(diff_boot <= 0));
+            
+            % Determine significance
+            if p_val < 0.001
+                sig_label = '***';
+            elseif p_val < 0.01
+                sig_label = '**';
+            elseif p_val < 0.05
+                sig_label = '*';
+            else
+                sig_label = 'ns';
+            end
+            
+            % Draw bracket if significant
+            if ~strcmp(sig_label, 'ns')
+                pos1 = positions(pos_idx);
+                pos2 = positions(pos_idx + 1);
+                
+                plot([pos1, pos1], [current_y, current_y + bracket_height], 'k-', 'LineWidth', 1.5);
+                plot([pos1, pos2], [current_y + bracket_height, current_y + bracket_height], 'k-', 'LineWidth', 1.5);
+                plot([pos2, pos2], [current_y, current_y + bracket_height], 'k-', 'LineWidth', 1.5);
+                text((pos1 + pos2)/2, current_y + bracket_height * 1.5, sig_label, ...
+                     'HorizontalAlignment', 'center', 'FontSize', 12, 'FontWeight', 'bold');
+                
+                current_y = current_y + bracket_height * 4;
+            end
+            
+            sig_comparisons_f1{end+1} = sprintf('%s: p=%.4f (%s)', crit, p_val, sig_label); %#ok<AGROW>
+            pos_idx = pos_idx + 2;
+        else
+            pos_idx = pos_idx + sum([any(idx_spm), any(idx_kmeans)]);
+        end
+    end
+    
+    % Adjust y-axis to fit brackets
+    if current_y > 0.85
+        ylim([0, min(1.0, current_y + bracket_height * 2)]);
+    end
+    
+    % Save figure
+    saveas(fig, fullfile(plots_dir, 'method_criterion_comparison_boxplots.png'));
+    close(fig);
+    
+    fprintf('✓ Method-criterion comparison boxplots saved\n');
+    fprintf('  Absolute K Error significance tests:\n');
+    for i = 1:length(sig_comparisons)
+        fprintf('    %s\n', sig_comparisons{i});
+    end
+    fprintf('  F1 Score significance tests:\n');
+    for i = 1:length(sig_comparisons_f1)
+        fprintf('    %s\n', sig_comparisons_f1{i});
+    end
 end

@@ -22,7 +22,10 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     % All from the "microstates" repository
 
     % we also need to make sure the spm toolbox is to hand:
-    addpath("/home/rohan/spm/toolbox/mixture/"); % modify to the correct path on your system if needed
+    % set via CONFIG.spm_path (see below); the old hard-coded path is left as a fallback.
+    if exist("/home/rohan/spm/toolbox/mixture/", "dir")
+        addpath("/home/rohan/spm/toolbox/mixture/"); % modify to the correct path on your system if needed
+    end
     
     test = false;
 
@@ -32,7 +35,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
         addParameter(p, 'reps', 1, @isnumeric);
         addParameter(p, 'K_true_vals', [4], @isnumeric);
         addParameter(p, 'SNR_dbs', [10], @isnumeric);
-        addParameter(p, 'K_candidates', 5:6, @isnumeric);
+        addParameter(p, 'K_candidates', 4:5, @isnumeric);
     else
         addParameter(p, 'out_dir', 'Output', @ischar);
         addParameter(p, 'reps', 8, @isnumeric);
@@ -45,11 +48,13 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     addParameter(p, 'set_file', 'MetaMaps_2023_06.set', @ischar);
     addParameter(p, 'n_workers', 12, @isnumeric);
     addParameter(p, 'cleanup', true, @islogical);
+    addParameter(p, 'spm_path', '', @ischar); % optional: point to SPM toolbox/mixture if not obvious
     addParameter(p, 'verbose', true, @islogical);
     addParameter(p, 'montages', {'full', '10-20-20', '10-20-12'}, @iscell);  % montage robustness analysis
     addParameter(p, 'overlap_probs', [0 0.5 1.0], @isnumeric); % run with and without overlap
     addParameter(p, 'overlap_ms_range', [10 40], @isnumeric);
     addParameter(p, 'overlap_strength', 0.5, @isnumeric);
+    addParameter(p, 'validate_simulation', true, @islogical);
     parse(p, varargin{:});
     
     CONFIG = p.Results;
@@ -90,7 +95,24 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     % ===== ALL CRITERIA (universal) =====
     all_criteria = {'silhouette', 'free_energy', 'elbow', 'elbow_sil_combined', 'gev'};
     
+    % Allow the user to restrict methods; default list includes SPM variants
     method_names = {'kmeans_koenig', 'spm_vb', 'spm_kmeans'};
+    
+    % Inject SPM path if provided
+    if ~isempty(CONFIG.spm_path) && exist(CONFIG.spm_path, 'dir')
+        addpath(genpath(CONFIG.spm_path));
+        if CONFIG.verbose
+            fprintf('Added SPM path: %s\n', CONFIG.spm_path);
+        end
+    end
+    
+    % Guard: if SPM methods requested but SPM not available, stop early with a clear message
+    needs_spm = any(contains(method_names, 'spm'));
+    if needs_spm && ~exist('spm_mix', 'file')
+        error(['SPM mixture toolbox not found on MATLAB path. ', ...
+               'Please set ''spm_path'' to your SPM installation (toolbox/mixture) ', ...
+               'or remove spm_vb/spm_kmeans from method_names.']);
+    end
     
     % Montages to test
     n_montages = length(CONFIG.montages);
@@ -180,6 +202,9 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                     'prob', overlap_prob, ...
                     'ms_range', CONFIG.overlap_ms_range, ...
                     'strength', CONFIG.overlap_strength));
+            if CONFIG.validate_simulation
+                Sim.sim_qc = validate_simulated_eeg_representativeness(Sim, 'verbose', false);
+            end
         catch ME
             if CONFIG.verbose
                 fprintf('\n✗ EEG Generation Error (Rep %d, K=%d, SNR=%+.1f): %s\n', ...
@@ -253,7 +278,14 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                         Results = [];
                     end
                     
-                    if ~isempty(Results) && Results.valid_fit
+                    if ~isempty(Results) && isfield(Results, 'valid_fit') && Results.valid_fit
+                        nan_centers = isfield(Results, 'centers') && any(isnan(Results.centers(:)));
+                        nan_scores = (isfield(Results, 'free_energy_vals') && any(isnan(Results.free_energy_vals(:)))) || ...
+                                     (isfield(Results, 'silhouette_vals') && any(isnan(Results.silhouette_vals(:))));
+                        if nan_centers || nan_scores
+                            fprintf('Fit Warning (%s, montage %s): NaNs detected (centers=%d, scores=%d)\n', ...
+                                method_str, montage_type, nan_centers, nan_scores);
+                        end
                         % Store ONLY essential metadata, NOT full Results or Sim
                         % (Sim will be accessible in the save step, Results is available above)
                         fit_results_for_montage{m_idx} = struct(...
@@ -267,11 +299,12 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                             'Results', Results);
                     else
                         fit_results_for_montage{m_idx} = [];
+                        fprintf('Fit Warning (%s, montage %s): invalid or failed fit (valid_fit missing/false)\n', method_str, montage_type);
                     end
                     
                 catch ME
                     fit_results_for_montage{m_idx} = [];
-                    fprintf('Fit Error (%s): %s\n', method_str, ME.message);
+                    fprintf('Fit Error (%s, montage %s): %s\n', method_str, montage_type, ME.message);
                 end
             end
             
@@ -304,6 +337,18 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                     subj_name = sprintf('fit_E%d_M%d_K%d_SNR%+d_%s_%s_%s_%s', ...
                         eeg_idx, m_idx, fit_result.K_true, round(fit_result.SNR_dB), ...
                         montage_type, overlap_tag, method_str, criterion_str);
+                    sim_qc_status = 'NOT_RUN';
+                    sim_qc_psd_slope = NaN;
+                    sim_qc_mean_dwell_ms = NaN;
+                    sim_qc_gfp_median_uv = NaN;
+                    if isfield(Sim, 'sim_qc') && ~isempty(Sim.sim_qc)
+                        sim_qc_status = Sim.sim_qc.overall_status;
+                        sim_qc_psd_slope = Sim.sim_qc.spectrum.power_slope_2_40hz;
+                        sim_qc_gfp_median_uv = Sim.sim_qc.amplitude.gfp_median_uv;
+                        if isfield(Sim.sim_qc.microstate_dynamics, 'mean_dwell_ms')
+                            sim_qc_mean_dwell_ms = Sim.sim_qc.microstate_dynamics.mean_dwell_ms;
+                        end
+                    end
                     
                     result_row = struct( ...
                         'fit_id', 0, ... % Placeholder
@@ -319,6 +364,10 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                         'overlap_ms_max', Sim.overlap_ms_range(end), ...
                         'montage_type', montage_type, ...
                         'n_leads', fit_result.n_leads, ...
+                        'sim_qc_status', sim_qc_status, ...
+                        'sim_qc_psd_slope_2_40hz', sim_qc_psd_slope, ...
+                        'sim_qc_gfp_median_uv', sim_qc_gfp_median_uv, ...
+                        'sim_qc_mean_dwell_ms', sim_qc_mean_dwell_ms, ...
                         'K_estimated', K_selected, ...
                         'K_correct', fit_result.K_true == K_selected, ...
                         'K_error', abs(fit_result.K_true - K_selected), ...
@@ -354,6 +403,10 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                         META.overlap_ms_range = Sim.overlap_ms_range;
                         META.overlap_strength = Sim.overlap_strength;
                         META.n_overlap_events = Sim.n_overlap_events;
+                        META.sim_qc_status = sim_qc_status;
+                        META.sim_qc_psd_slope_2_40hz = sim_qc_psd_slope;
+                        META.sim_qc_gfp_median_uv = sim_qc_gfp_median_uv;
+                        META.sim_qc_mean_dwell_ms = sim_qc_mean_dwell_ms;
                         META.runtime_s = Results.runtime;
                         META.channel_labels = Sim.channel_labels;  % Use Sim.channel_labels (montage-specific)
                         save_microstate_json(Results, Sim, json_file, META);
