@@ -4,10 +4,11 @@ function save_microstate_json(Results, Sim, output_file, META)
     if nargin < 4
         META = struct();
     end
+    util = microstate_utilities();
 
     C = infer_channel_count(Results, Sim);
-    ch_labels_raw = infer_channel_labels(Sim, META, C);
-    ch_labels = sanitize_channel_labels_json(ch_labels_raw(1:C));
+    ch_labels_raw = infer_channel_labels(Sim, META, C, util);
+    ch_labels = util.sanitize_channel_labels(ch_labels_raw(1:C));
 
     json_data = struct();
 
@@ -139,7 +140,7 @@ function save_microstate_json(Results, Sim, output_file, META)
         json_data.matches = struct();
     end
 
-    json_data = clean_complex_values(json_data);
+    json_data = util.clean_complex_values(json_data);
 
     try
         json_str = jsonencode(json_data);
@@ -174,20 +175,12 @@ function C = infer_channel_count(Results, Sim)
     end
 end
 
-function ch_labels_raw = infer_channel_labels(Sim, META, C)
+function ch_labels_raw = infer_channel_labels(Sim, META, C, util)
     ch_labels_raw = {};
     if isfield(Sim, 'channel_labels') && ~isempty(Sim.channel_labels)
         ch_labels_raw = cellstr(Sim.channel_labels);
     elseif isfield(Sim, 'chanlocs') && ~isempty(Sim.chanlocs)
-        ncl = length(Sim.chanlocs);
-        ch_labels_raw = cell(ncl, 1);
-        for i = 1:ncl
-            if isfield(Sim.chanlocs(i), 'labels') && ~isempty(Sim.chanlocs(i).labels)
-                ch_labels_raw{i} = char(Sim.chanlocs(i).labels);
-            else
-                ch_labels_raw{i} = sprintf('Ch%03d', i);
-            end
-        end
+        ch_labels_raw = util.channel_labels_from_chanlocs(Sim.chanlocs, numel(Sim.chanlocs));
     elseif isfield(META, 'channel_labels') && ~isempty(META.channel_labels)
         ch_labels_raw = cellstr(META.channel_labels);
     end
@@ -241,54 +234,4 @@ function metrics = empty_recovery_metrics()
         'mean_recovery_matched', NaN, ...
         'mean_recovery_padded', NaN, ...
         'match_similarities', []);
-end
-
-function s = clean_complex_values(s)
-    if isstruct(s)
-        fields = fieldnames(s);
-        for f = 1:length(fields)
-            field_name = fields{f};
-            field_val = s.(field_name);
-            if isstruct(field_val)
-                s.(field_name) = clean_complex_values(field_val);
-            elseif iscell(field_val)
-                for c = 1:numel(field_val)
-                    if isstruct(field_val{c})
-                        field_val{c} = clean_complex_values(field_val{c});
-                    elseif isnumeric(field_val{c})
-                        field_val{c} = double(real(field_val{c}));
-                    end
-                end
-                s.(field_name) = field_val;
-            elseif isnumeric(field_val)
-                s.(field_name) = double(real(field_val));
-            end
-        end
-    elseif iscell(s)
-        for c = 1:numel(s)
-            if isstruct(s{c})
-                s{c} = clean_complex_values(s{c});
-            elseif isnumeric(s{c})
-                s{c} = double(real(s{c}));
-            end
-        end
-    end
-end
-
-function sanitized = sanitize_channel_labels_json(ch_labels)
-% SANITIZE_CHANNEL_LABELS_JSON Convert channel labels to valid struct fields.
-
-    sanitized = cell(size(ch_labels));
-    for i = 1:length(ch_labels)
-        label = ch_labels{i};
-        if ~ischar(label)
-            label = char(label);
-        end
-        label = regexprep(label, '[-/\\\s\.\,\(\)\[\]\{\}]', '_');
-        label = regexprep(label, '^_+|_+$', '');
-        if isempty(label) || isempty(regexp(label(1), '[A-Za-z]', 'once'))
-            label = ['Ch' label];
-        end
-        sanitized{i} = matlab.lang.makeValidName(label);
-    end
 end

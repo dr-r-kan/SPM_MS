@@ -13,7 +13,7 @@ function alignment = align_microstates_to_template(estimated_maps, template_file
     addParameter(p, 'strong_threshold', 0.5, @isnumeric);
     parse(p, estimated_maps, template_file, varargin{:});
 
-    util = microstate_utilities_SHARED();
+    util = microstate_utilities();
     estimated_maps = util.normalize_maps(double(estimated_maps));
     [template_maps, template_labels, template_channel_labels] = ...
         load_metamaps_templates(template_file, 'K', p.Results.template_K);
@@ -49,21 +49,13 @@ function alignment = align_microstates_to_template(estimated_maps, template_file
 
     n_est = size(estimated_common, 1);
     n_template = size(template_common, 1);
-    template_idx = nan(n_est, 1);
+    template_idx = optimal_template_assignment(corr_matrix);
     template_corr = zeros(n_est, 1);
     polarity = ones(n_est, 1);
-    used_templates = false(n_template, 1);
-
-    [~, order] = sort(max(corr_matrix, [], 2), 'descend');
-    for oi = 1:numel(order)
-        e = order(oi);
-        available = corr_matrix(e, :);
-        available(used_templates) = -Inf;
-        [best_corr, t] = max(available);
-        if isfinite(best_corr)
-            template_idx(e) = t;
-            template_corr(e) = best_corr;
-            used_templates(t) = true;
+    for e = 1:n_est
+        t = template_idx(e);
+        if ~isnan(t)
+            template_corr(e) = corr_matrix(e, t);
             if signed_corr(e, t) < 0
                 polarity(e) = -1;
             end
@@ -112,4 +104,51 @@ function [estimated_common, template_common, mode, idx_est, idx_template] = use_
     estimated_common = estimated_maps(:, idx_est);
     template_common = template_maps(:, idx_template);
     mode = 'first_common_channels';
+end
+
+function template_idx = optimal_template_assignment(corr_matrix)
+%OPTIMAL_TEMPLATE_ASSIGNMENT Maximise total absolute correlation.
+% K is small for MetaMaps, so exact permutation search is simpler and more
+% reliable than relying on toolbox-specific Hungarian implementations.
+
+    [n_est, n_template] = size(corr_matrix);
+    template_idx = nan(n_est, 1);
+
+    if n_est <= n_template
+        combos = nchoosek(1:n_template, n_est);
+        best_score = -Inf;
+        best_assignment = [];
+        for ci = 1:size(combos, 1)
+            perms_this = perms(combos(ci, :));
+            for pi = 1:size(perms_this, 1)
+                assignment = perms_this(pi, :);
+                score = sum(corr_matrix(sub2ind(size(corr_matrix), 1:n_est, assignment)));
+                if score > best_score
+                    best_score = score;
+                    best_assignment = assignment;
+                end
+            end
+        end
+        template_idx(:) = best_assignment(:);
+        return;
+    end
+
+    combos = nchoosek(1:n_est, n_template);
+    best_score = -Inf;
+    best_est = [];
+    best_assignment = [];
+    for ci = 1:size(combos, 1)
+        est_idx = combos(ci, :);
+        perms_this = perms(1:n_template);
+        for pi = 1:size(perms_this, 1)
+            assignment = perms_this(pi, :);
+            score = sum(corr_matrix(sub2ind(size(corr_matrix), est_idx, assignment)));
+            if score > best_score
+                best_score = score;
+                best_est = est_idx;
+                best_assignment = assignment;
+            end
+        end
+    end
+    template_idx(best_est) = best_assignment;
 end

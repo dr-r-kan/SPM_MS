@@ -1,10 +1,15 @@
 function [template_maps, template_labels, channel_labels, chanlocs] = load_metamaps_templates(template_file, varargin)
 % LOAD_METAMAPS_TEMPLATES Load MetaMaps microstate templates from an EEGLAB .set file.
 %
-% Returns maps as K x channels, zero-mean/unit-norm per map.  The
-% MetaMaps_2023_06.set file stores K=4,5,6,7 solutions concatenated as
-% 4+5+6+7=22 maps; for K=7 we use the final seven maps and their documented
-% order D,A,C,F,B,G,E.
+% Returns maps as K x channels, zero-mean/unit-norm per map.
+%
+% The MetaMaps_2023_06.set file stores concatenated solutions:
+%   indices  1:4   -> K=4
+%   indices  5:9   -> K=5
+%   indices 10:15  -> K=6
+%   indices 16:22  -> K=7
+%
+% For K=7 the documented label order is D,A,C,F,B,G,E.
 
     p = inputParser;
     addRequired(p, 'template_file', @(x) ischar(x) || isstring(x));
@@ -36,9 +41,14 @@ function [template_maps, template_labels, channel_labels, chanlocs] = load_metam
     end
 
     n_maps_total = size(all_maps, 1);
-    if K == 7 && n_maps_total >= 22
-        idx = (n_maps_total - 6):n_maps_total;
-        template_labels = {'D', 'A', 'C', 'F', 'B', 'G', 'E'};
+    if n_maps_total >= 22 && K >= 4 && K <= 7
+        idx_start = 1 + sum(4:(K - 1));
+        idx = idx_start:(idx_start + K - 1);
+        if K == 7
+            template_labels = {'D', 'A', 'C', 'F', 'B', 'G', 'E'};
+        else
+            template_labels = arrayfun(@(i) char('A' + i - 1), 1:K, 'UniformOutput', false);
+        end
     elseif K <= n_maps_total
         idx = (n_maps_total - K + 1):n_maps_total;
         template_labels = arrayfun(@(i) char('A' + i - 1), 1:K, 'UniformOutput', false);
@@ -47,7 +57,7 @@ function [template_maps, template_labels, channel_labels, chanlocs] = load_metam
     end
 
     template_maps = all_maps(idx, :);
-    util = microstate_utilities_SHARED();
+    util = microstate_utilities();
     template_maps = util.normalize_maps(template_maps);
 
     chanlocs = [];

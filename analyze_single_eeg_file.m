@@ -15,11 +15,19 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
 %   'sfreq'          - Sampling frequency (default: 250)
 %   'verbose'        - Show progress messages (default: true)
 %   'save_json'      - Save results to JSON file (default: true)
-%   'json_dir'       - Directory for JSON output (default: current directory)
-%   'plot_dir'      - Directory for plots (default: current directory)
+%   'json_dir'       - Directory for JSON output (default: config path)
+%   'plot_dir'       - Directory for plots (default: config path)
 %   'align_template' - Align results to template microstates (default: false)
 %   'template_file'  - Template .set file for alignment (default: 'MetaMaps_2023_06.set')
 %   'use_scalp_channels' - Drop non-scalp/auxiliary channels before fitting (default: true)
+%   'apply_average_reference' - Apply common average reference before GFP extraction (default: true)
+%   'spatial_filter' - Optional spatial filter before GFP extraction: 'none', 'smoothing', or 'laplacian' (default: 'none')
+%   'spatial_filter_matrix' - Optional custom n_channels x n_channels spatial filter matrix (default: [])
+%   'spatial_filter_neighbours' - Neighbour count for laplacian filter (default: 6)
+%   'spatial_filter_strength' - Blend strength for smoothing/laplacian filter (default: 1)
+%   'filter_band' - Temporal bandpass before GFP extraction (default: [2 20])
+%   'reject_gfp_peak_outliers' - Reject extreme GFP peaks within the file (default: true)
+%   'gfp_outlier_mad_multiplier' - MAD multiplier for GFP outlier rejection (default: 6)
 %
 % OUTPUTS:
 %   Results   - Structure containing fitted microstates and metrics
@@ -31,23 +39,40 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
 %       'method', 'spm_vb', 'save_json', true, 'align_template', true);
 
     % Parse inputs
+    util = microstate_utilities();
+    repo_cfg = util.load_config();
+    single_defaults = repo_cfg.single_file;
+    pre_defaults = repo_cfg.preprocessing;
+    path_defaults = repo_cfg.paths;
+
     p = inputParser;
     addRequired(p, 'eeg_file', @ischar);
-    addParameter(p, 'method', 'spm_vb', @ischar);
-    addParameter(p, 'criterion', '', @ischar);
-    addParameter(p, 'K_candidates', 2:10, @isnumeric);
+    addParameter(p, 'method', char(single_defaults.method), @ischar);
+    addParameter(p, 'criterion', char(single_defaults.criterion), @ischar);
+    addParameter(p, 'K_candidates', double(single_defaults.K_candidates(:)'), @isnumeric);
     addParameter(p, 'true_maps', [], @isnumeric);
     addParameter(p, 'sfreq', 250, @isnumeric);
     addParameter(p, 'verbose', true, @islogical);
-    addParameter(p, 'save_json', true, @islogical);
-    addParameter(p, 'json_dir', pwd, @ischar);
-    addParameter(p, 'plot_dir', pwd, @ischar);
-    addParameter(p, 'align_template', false, @islogical);
-    addParameter(p, 'template_file', 'MetaMaps_2023_06.set', @ischar);
-    addParameter(p, 'use_scalp_channels', true, @islogical);
+    addParameter(p, 'save_json', logical(single_defaults.save_json), @islogical);
+    addParameter(p, 'json_dir', char(path_defaults.single_json_dir), @ischar);
+    addParameter(p, 'plot_dir', char(path_defaults.single_plot_dir), @ischar);
+    addParameter(p, 'align_template', logical(single_defaults.align_template), @islogical);
+    addParameter(p, 'template_file', char(path_defaults.template_file), @ischar);
+    addParameter(p, 'use_scalp_channels', logical(single_defaults.use_scalp_channels), @islogical);
+    addParameter(p, 'apply_average_reference', logical(pre_defaults.apply_average_reference), @islogical);
+    addParameter(p, 'spatial_filter', char(pre_defaults.spatial_filter), @(x) ischar(x) || isstring(x));
+    addParameter(p, 'spatial_filter_matrix', [], @isnumeric);
+    addParameter(p, 'spatial_filter_neighbours', double(pre_defaults.spatial_filter_neighbours), @(x) isnumeric(x) && isscalar(x) && x >= 1);
+    addParameter(p, 'spatial_filter_strength', double(pre_defaults.spatial_filter_strength), @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    addParameter(p, 'filter_band', double(pre_defaults.filter_band(:)'), @(x) isempty(x) || (isnumeric(x) && numel(x) == 2));
+    addParameter(p, 'reject_gfp_peak_outliers', logical(pre_defaults.reject_gfp_peak_outliers), @islogical);
+    addParameter(p, 'gfp_outlier_mad_multiplier', double(pre_defaults.gfp_outlier_mad_multiplier), @(x) isnumeric(x) && isscalar(x) && x > 0);
     parse(p, eeg_file, varargin{:});
     
     CONFIG = p.Results;
+    CONFIG.json_dir = util.resolve_path(CONFIG.json_dir, util.project_root());
+    CONFIG.plot_dir = util.resolve_path(CONFIG.plot_dir, util.project_root());
+    CONFIG.template_file = util.resolve_path(CONFIG.template_file, util.project_root());
     json_file = '';
     
     % Auto-select criterion if not specified
@@ -74,11 +99,18 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
         fprintf('Single EEG File Analysis\n');
         fprintf('========================================\n');
         fprintf('File: %s\n', eeg_file);
-        method_display = microstate_utilities_SHARED().format_method_name(CONFIG.method);
-        criterion_display = microstate_utilities_SHARED().format_criterion_name(CONFIG.criterion);
+        method_display = util.format_method_name(CONFIG.method);
+        criterion_display = util.format_criterion_name(CONFIG.criterion);
         fprintf('Method: %s\n', method_display);
         fprintf('Criterion: %s\n', criterion_display);
         fprintf('K candidates: %s\n', mat2str(CONFIG.K_candidates));
+        fprintf('Average reference: %s\n', iif(CONFIG.apply_average_reference, 'YES', 'NO'));
+        fprintf('Spatial filter: %s\n', char(string(CONFIG.spatial_filter)));
+        if CONFIG.reject_gfp_peak_outliers
+            fprintf('GFP outlier rejection: YES (MAD x %.2f)\n', CONFIG.gfp_outlier_mad_multiplier);
+        else
+            fprintf('GFP outlier rejection: NO\n');
+        end
         if CONFIG.align_template
             fprintf('Template alignment: YES\n');
         end
@@ -114,8 +146,8 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
         eeg_data = EEG.data;  % Channels × Time
         sfreq = EEG.srate;
         chanlocs = EEG.chanlocs;
-        channel_labels = channel_labels_from_chanlocs(chanlocs, size(eeg_data, 1));
-        pos = pos_from_chanlocs(chanlocs, size(eeg_data, 1));
+        channel_labels = util.channel_labels_from_chanlocs(chanlocs, size(eeg_data, 1));
+        pos = util.positions_from_chanlocs(chanlocs, size(eeg_data, 1));
         
     elseif strcmp(ext, '.mat')
         % MATLAB .mat file
@@ -149,12 +181,12 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
         elseif isfield(data, 'ch_labels')
             channel_labels = cellstr(data.ch_labels);
         else
-            channel_labels = channel_labels_from_chanlocs(chanlocs, size(eeg_data, 1));
+            channel_labels = util.channel_labels_from_chanlocs(chanlocs, size(eeg_data, 1));
         end
         if isfield(data, 'pos')
             pos = data.pos;
         else
-            pos = pos_from_chanlocs(chanlocs, size(eeg_data, 1));
+            pos = util.positions_from_chanlocs(chanlocs, size(eeg_data, 1));
         end
 
     else
@@ -166,7 +198,7 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
     original_pos = pos;
 
     if CONFIG.use_scalp_channels && ~isempty(chanlocs)
-        scalp_mask = scalp_channel_mask(chanlocs, size(eeg_data, 1));
+        scalp_mask = util.scalp_channel_mask(chanlocs, size(eeg_data, 1));
         if any(scalp_mask) && nnz(scalp_mask) < size(eeg_data, 1)
             excluded_labels = channel_labels(~scalp_mask);
             eeg_data = eeg_data(scalp_mask, :);
@@ -206,6 +238,7 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
     Sim.original_chanlocs = original_chanlocs;
     Sim.original_channel_labels = original_channel_labels;
     Sim.original_pos = original_pos;
+    Sim.preprocessing = build_preprocessing_config(CONFIG);
     
     % Add ground truth if provided
     if ~isempty(CONFIG.true_maps)
@@ -223,7 +256,7 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
         Sim.K_true = NaN;
         Sim.SNR_dB = NaN;
     end
-    
+
     % Run analysis
     if CONFIG.verbose
         fprintf('\n2. Running microstate analysis...\n');
@@ -244,6 +277,8 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
         fprintf('  Stack trace:\n%s\n', ME.getReport());
         rethrow(ME);
     end
+
+    Results.preprocessing = Sim.preprocessing;
 
     if CONFIG.align_template
         if ~isfile(CONFIG.template_file)
@@ -268,7 +303,7 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
     end
     
     % Display results
-    util = microstate_utilities_SHARED();
+    util = microstate_utilities();
     if CONFIG.verbose
         fprintf('\n========================================\n');
         fprintf('ANALYSIS RESULTS\n');
@@ -459,66 +494,18 @@ function out = iif(condition, true_val, false_val)
     end
 end
 
-function labels = channel_labels_from_chanlocs(chanlocs, n_channels)
-    labels = cell(n_channels, 1);
-    for i = 1:n_channels
-        if ~isempty(chanlocs) && numel(chanlocs) >= i && ...
-                isfield(chanlocs(i), 'labels') && ~isempty(chanlocs(i).labels)
-            labels{i} = char(chanlocs(i).labels);
-        else
-            labels{i} = sprintf('Ch%03d', i);
-        end
-    end
-end
-
-function pos = pos_from_chanlocs(chanlocs, n_channels)
-    pos = zeros(n_channels, 3);
-    if isempty(chanlocs)
-        return;
-    end
-    for i = 1:min(n_channels, numel(chanlocs))
-        if isfield(chanlocs(i), 'X') && ~isempty(chanlocs(i).X) && ...
-                isfield(chanlocs(i), 'Y') && ~isempty(chanlocs(i).Y) && ...
-                isfield(chanlocs(i), 'Z') && ~isempty(chanlocs(i).Z)
-            pos(i, :) = [chanlocs(i).X, chanlocs(i).Y, chanlocs(i).Z];
-        elseif isfield(chanlocs(i), 'theta') && ~isempty(chanlocs(i).theta) && ...
-                isfield(chanlocs(i), 'radius') && ~isempty(chanlocs(i).radius)
-            [x, y, z] = sph2cart(deg2rad(chanlocs(i).theta), ...
-                deg2rad(90 - chanlocs(i).radius), 1);
-            pos(i, :) = [x, y, z];
-        end
-        r = norm(pos(i, :));
-        if r > 0
-            pos(i, :) = pos(i, :) / r;
-        end
-    end
-end
-
-function mask = scalp_channel_mask(chanlocs, n_channels)
-%SCALP_CHANNEL_MASK Keep channels that look like EEG scalp electrodes.
-
-    mask = false(n_channels, 1);
-    aux_expr = '^(EXG|EOG|HEOG|VEOG|ECG|EKG|EMG|GSR|RESP|TRIG|STATUS|STI|MISC|AUX)';
-    for i = 1:min(n_channels, numel(chanlocs))
-        label = '';
-        if isfield(chanlocs(i), 'labels') && ~isempty(chanlocs(i).labels)
-            label = upper(strtrim(char(chanlocs(i).labels)));
-        end
-        if ~isempty(label) && ~isempty(regexp(label, aux_expr, 'once'))
-            continue;
-        end
-
-        has_xyz = isfield(chanlocs(i), 'X') && ~isempty(chanlocs(i).X) && ...
-            isfield(chanlocs(i), 'Y') && ~isempty(chanlocs(i).Y) && ...
-            isfield(chanlocs(i), 'Z') && ~isempty(chanlocs(i).Z) && ...
-            all(isfinite([chanlocs(i).X chanlocs(i).Y chanlocs(i).Z])) && ...
-            norm([chanlocs(i).X chanlocs(i).Y chanlocs(i).Z]) > eps;
-
-        has_polar = isfield(chanlocs(i), 'theta') && ~isempty(chanlocs(i).theta) && ...
-            isfield(chanlocs(i), 'radius') && ~isempty(chanlocs(i).radius) && ...
-            isfinite(chanlocs(i).theta) && isfinite(chanlocs(i).radius) && ...
-            chanlocs(i).radius <= 0.75;
-
-        mask(i) = has_xyz || has_polar;
-    end
+function pre_cfg = build_preprocessing_config(CONFIG)
+    pre_cfg = struct();
+    pre_cfg.apply_average_reference = CONFIG.apply_average_reference;
+    pre_cfg.filter_band = CONFIG.filter_band;
+    pre_cfg.spatial_filter = char(string(CONFIG.spatial_filter));
+    pre_cfg.spatial_filter_matrix = CONFIG.spatial_filter_matrix;
+    pre_cfg.spatial_filter_neighbours = CONFIG.spatial_filter_neighbours;
+    pre_cfg.spatial_filter_strength = CONFIG.spatial_filter_strength;
+    pre_cfg.gfp_peak_min_distance = 3;
+    pre_cfg.gfp_peak_threshold_schedule = [0.50, 0.60, 0.70, 0.80, 0.90];
+    pre_cfg.reject_gfp_peak_outliers = CONFIG.reject_gfp_peak_outliers;
+    pre_cfg.gfp_outlier_mad_multiplier = CONFIG.gfp_outlier_mad_multiplier;
+    pre_cfg.gfp_outlier_upper_quantile = 0.995;
+    pre_cfg.min_peak_count_after_gfp_rejection = 3;
 end

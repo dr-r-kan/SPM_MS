@@ -6,7 +6,7 @@ function [Segmentation, Stats] = backfit_microstates_json(json_file, eeg_file, v
 %   eeg_file    - Path to the EEG file (.set or .mat)
 %   varargin    - Optional parameters:
 %                 'use_weights' - true/false (default: true) to use confidence weights
-%                 'smooth_window' - Window size for temporal smoothing (default: 0)
+%                 'smooth_window' - Window size for temporal smoothing (default: 10)
 %                 'ignore_polarity' - true/false (default: true)
 %
 % OUTPUTS:
@@ -20,7 +20,7 @@ function [Segmentation, Stats] = backfit_microstates_json(json_file, eeg_file, v
     % Parse inputs
     p = inputParser;
     addParameter(p, 'use_weights', true, @islogical);
-    addParameter(p, 'smooth_window', 0, @isnumeric);
+    addParameter(p, 'smooth_window', 10, @isnumeric);
     addParameter(p, 'ignore_polarity', true, @islogical);
     parse(p, varargin{:});
     

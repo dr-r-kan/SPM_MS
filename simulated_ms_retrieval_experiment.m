@@ -1,4 +1,4 @@
-function T = Bayesian_MS_Comparison_Pipeline(varargin)
+function T = simulated_ms_retrieval_experiment(varargin)
 % BAYESIAN_MS_COMPARISON_PIPELINE: ALL method-criterion combinations
 %
 % Each method is tested with EVERY criterion (where applicable)
@@ -13,7 +13,14 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
 % Using code from Thomas Koenig (MICROSTATELAB group)
 % (the "microstates" repository at: ThomasKoenigBern/microstates on github)
 
-    addpath("Koenig_code");
+    util = microstate_utilities();
+    repo_cfg = util.load_config();
+    sim_defaults = repo_cfg.simulation;
+    path_defaults = repo_cfg.paths;
+
+    if exist(path_defaults.koenig_code_dir, "dir")
+        addpath(path_defaults.koenig_code_dir);
+    end
     % This is a folder which should contain:
     %  - eeg_kMeans.m
     %  - L2NormDim.m
@@ -21,45 +28,50 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
     %  - popFitMSMaps.m
     % All from the "microstates" repository
 
-    % we also need to make sure the spm toolbox is to hand:
-    % set via CONFIG.spm_path (see below); the old hard-coded path is left as a fallback.
-    if exist("/home/rohan/spm/toolbox/mixture/", "dir")
-        addpath("/home/rohan/spm/toolbox/mixture/"); % modify to the correct path on your system if needed
+    % We also need to make sure the SPM mixture toolbox is available.
+    configured_spm_paths = cellstr(string(path_defaults.spm_mixture_paths));
+    for pi = 1:numel(configured_spm_paths)
+        if exist(configured_spm_paths{pi}, "dir")
+            addpath(configured_spm_paths{pi});
+        end
     end
     
     test = false;
 
     p = inputParser;
     if test
-        addParameter(p, 'out_dir', 'Output', @ischar);
+        addParameter(p, 'out_dir', char(sim_defaults.out_dir), @ischar);
         addParameter(p, 'reps', 1, @isnumeric);
+        addParameter(p, 'rep_vals', [], @isnumeric);
         addParameter(p, 'K_true_vals', [4], @isnumeric);
         addParameter(p, 'SNR_dbs', [10], @isnumeric);
         addParameter(p, 'K_candidates', 4:5, @isnumeric);
     else
-        addParameter(p, 'out_dir', 'Output', @ischar);
-        addParameter(p, 'reps', 8, @isnumeric);
+        addParameter(p, 'out_dir', char(sim_defaults.out_dir), @ischar);
+        addParameter(p, 'reps', double(sim_defaults.reps), @isnumeric);
         addParameter(p, 'rep_vals', [], @isnumeric);
-        addParameter(p, 'K_true_vals', [4 5 6 7], @isnumeric);
-        addParameter(p, 'SNR_dbs', [-9 -3  1 0 1 3], @isnumeric);
-        addParameter(p, 'K_candidates', 2:10, @isnumeric);
+        addParameter(p, 'K_true_vals', double(sim_defaults.K_true_vals(:)'), @isnumeric);
+        addParameter(p, 'SNR_dbs', double(sim_defaults.SNR_dbs(:)'), @isnumeric);
+        addParameter(p, 'K_candidates', double(sim_defaults.K_candidates(:)'), @isnumeric);
     end;
-    addParameter(p, 'duration_s', 300, @isnumeric);
-    addParameter(p, 'sfreq', 250, @isnumeric);
-    addParameter(p, 'set_file', 'MetaMaps_2023_06.set', @ischar);
-    addParameter(p, 'n_workers', 12, @isnumeric);
+    addParameter(p, 'duration_s', double(sim_defaults.duration_s), @isnumeric);
+    addParameter(p, 'sfreq', double(sim_defaults.sfreq), @isnumeric);
+    addParameter(p, 'set_file', char(path_defaults.template_file), @ischar);
+    addParameter(p, 'n_workers', double(sim_defaults.n_workers), @isnumeric);
     addParameter(p, 'cleanup', true, @islogical);
     addParameter(p, 'spm_path', '', @ischar); % optional: point to SPM toolbox/mixture if not obvious
     addParameter(p, 'verbose', true, @islogical);
-    addParameter(p, 'montages', {'full', '10-20-20', '10-20-12'}, @iscell);  % montage robustness analysis
-    addParameter(p, 'overlap_probs', [0 0.5 1.0], @isnumeric); % run with and without overlap
-    addParameter(p, 'overlap_ms_range', [10 40], @isnumeric);
-    addParameter(p, 'overlap_strength', 0.5, @isnumeric);
-    addParameter(p, 'validate_simulation', true, @islogical);
+    addParameter(p, 'montages', cellstr(string(sim_defaults.montages)), @iscell);  % montage robustness analysis
+    addParameter(p, 'overlap_probs', double(sim_defaults.overlap_probs(:)'), @isnumeric); % run with and without overlap
+    addParameter(p, 'overlap_ms_range', double(sim_defaults.overlap_ms_range(:)'), @isnumeric);
+    addParameter(p, 'overlap_strength', double(sim_defaults.overlap_strength), @isnumeric);
+    addParameter(p, 'validate_simulation', logical(sim_defaults.validate_simulation), @islogical);
+    addParameter(p, 'preprocessing', sim_defaults.preprocessing, @isstruct);
     parse(p, varargin{:});
     
     CONFIG = p.Results;
-    util = microstate_utilities_SHARED();
+    CONFIG.out_dir = util.resolve_path(CONFIG.out_dir, util.project_root());
+    CONFIG.set_file = util.resolve_path(CONFIG.set_file, util.project_root());
     if isempty(CONFIG.rep_vals)
         rep_vals = 1:CONFIG.reps;
     else
@@ -209,8 +221,10 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
                     'prob', overlap_prob, ...
                     'ms_range', CONFIG.overlap_ms_range, ...
                     'strength', CONFIG.overlap_strength));
-            if CONFIG.validate_simulation
+            if CONFIG.validate_simulation && exist('validate_simulated_eeg_representativeness', 'file') == 2
                 Sim.sim_qc = validate_simulated_eeg_representativeness(Sim, 'verbose', false);
+            elseif CONFIG.validate_simulation && CONFIG.verbose
+                fprintf('\nSimulation QC requested but validate_simulated_eeg_representativeness.m is not on the path; skipping QC.\n');
             end
         catch ME
             if CONFIG.verbose
@@ -261,6 +275,7 @@ function T = Bayesian_MS_Comparison_Pipeline(varargin)
             % Add montage info to Sim
             Sim.montage_type = montage_type;
             Sim.n_leads = Sim.n_channels;
+            Sim.preprocessing = CONFIG.preprocessing;
             
             % ===== STEP 3: FIT all methods to this montage =====
             fit_results_for_montage = cell(n_methods, 1);
@@ -630,7 +645,7 @@ function print_summary(T)
     fprintf('COMPARISON SUMMARY\n');
     fprintf('========================================\n');
     
-    util = microstate_utilities_SHARED();
+    util = microstate_utilities();
     methods = unique(T.method);
     if istable(methods), methods = table2cell(methods); end
     
