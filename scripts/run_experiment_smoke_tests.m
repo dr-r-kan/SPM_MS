@@ -14,15 +14,54 @@ function run_experiment_smoke_tests(varargin)
 
     output_root = char(cfg.output_root);
     util.ensure_dir(output_root);
+    log_dir = fullfile(output_root, 'logs');
+    util.ensure_dir(log_dir);
+    success_marker = fullfile(output_root, 'SMOKE_TEST_PASSED.txt');
+    failure_marker = fullfile(output_root, 'SMOKE_TEST_FAILED.txt');
+    if isfile(success_marker), delete(success_marker); end
+    if isfile(failure_marker), delete(failure_marker); end
     try
         maxNumCompThreads(1);
     catch
     end
 
+    diary_file = fullfile(log_dir, ['smoke_test_matlab_' datestr(now, 'yyyymmdd_HHMMSS') '.log']);
+    diary(diary_file);
+    cleanup_diary = onCleanup(@() diary('off')); %#ok<NASGU>
+
     fprintf('\n========================================\n');
     fprintf('Smoke tests for both experiment parts\n');
     fprintf('========================================\n');
+    fprintf('Output root: %s\n', output_root);
+    fprintf('MATLAB diary: %s\n', diary_file);
+    fprintf('Manifest CSV: %s\n', char(cfg.manifest_csv));
+    fprintf('========================================\n');
 
+    try
+        run_smoke_tests_inner(cfg, output_root);
+        fid = fopen(success_marker, 'w');
+        if fid >= 0
+            fprintf(fid, 'Smoke test passed at %s\n', datestr(now, 'yyyy-mm-dd HH:MM:SS'));
+            fprintf(fid, 'MATLAB diary: %s\n', diary_file);
+            fclose(fid);
+        end
+        fprintf('Wrote success marker: %s\n', success_marker);
+    catch ME
+        fid = fopen(failure_marker, 'w');
+        if fid >= 0
+            fprintf(fid, 'Smoke test failed at %s\n', datestr(now, 'yyyy-mm-dd HH:MM:SS'));
+            fprintf(fid, 'Message: %s\n', ME.message);
+            fprintf(fid, 'Identifier: %s\n', ME.identifier);
+            fprintf(fid, 'MATLAB diary: %s\n', diary_file);
+            fclose(fid);
+        end
+        fprintf(2, 'Smoke test failed. Wrote failure marker: %s\n', failure_marker);
+        rethrow(ME);
+    end
+end
+
+function run_smoke_tests_inner(cfg, output_root)
+    util = microstate_utilities();
     part1_dir = fullfile(output_root, 'part1_simulated');
     run_part1_simulated_cluster( ...
         'output_dir', part1_dir, ...
