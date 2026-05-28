@@ -91,7 +91,12 @@ function cfg = default_config_internal()
         'criterion', 'elbow_sil_combined', ...
         'use_template_initialisation', true, ...
         'canonical_reporting_template_K', [], ...
-        'canonical_prior_weight_global', 100, ...
+        'canonical_prior_weight_global', 50, ...
+        'prior_weight_group', 12.5, ...
+        'prior_weight_condition', 17.5, ...
+        'prior_weight_participant', 25, ...
+        'prior_weight_file', 37.5, ...
+        'spm_prior_pseudocount', 4, ...
         'reject_template_misaligned_peaks', true, ...
         'template_peak_min_abs_corr', 0.65, ...
         'template_peak_template_K', 7, ...
@@ -136,7 +141,7 @@ function cfg = normalise_config_paths_internal(cfg)
             end
         end
         if isfield(cfg.paths, 'spm_mixture_paths') && ~isempty(cfg.paths.spm_mixture_paths)
-            cfg.paths.spm_mixture_paths = cellstr(string(cfg.paths.spm_mixture_paths));
+            cfg.paths.spm_mixture_paths = resolve_path_internal(cellstr(string(cfg.paths.spm_mixture_paths)), root_dir);
         end
     end
     if isfield(cfg, 'simulation') && isfield(cfg.simulation, 'out_dir')
@@ -165,10 +170,33 @@ function pth = resolve_path_internal(pth, base_dir)
     if isstruct(pth)
         return;
     end
+    pth = expand_path_tokens_internal(pth);
     if is_absolute_path_internal(pth)
         return;
     end
     pth = fullfile(base_dir, pth);
+end
+
+function pth = expand_path_tokens_internal(pth)
+    pth = char(pth);
+    if startsWith(pth, '~/') || startsWith(pth, ['~' filesep]) || strcmp(pth, '~')
+        home_dir = getenv('HOME');
+        if ~isempty(home_dir)
+            if strcmp(pth, '~')
+                pth = home_dir;
+            else
+                pth = fullfile(home_dir, pth(3:end));
+            end
+        end
+    end
+    [tokens, matches] = regexp(pth, '\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?', 'tokens', 'match');
+    for i = 1:numel(tokens)
+        token = tokens{i}{1};
+        value = getenv(token);
+        if ~isempty(value)
+            pth = strrep(pth, matches{i}, value);
+        end
+    end
 end
 
 function ensure_dir_internal(pth)

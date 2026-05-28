@@ -61,6 +61,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
     addParameter(p, 'cleanup', true, @islogical);
     addParameter(p, 'spm_path', '', @ischar); % optional: point to SPM toolbox/mixture if not obvious
     addParameter(p, 'verbose', true, @islogical);
+    addParameter(p, 'save_json', true, @islogical);
     addParameter(p, 'montages', cellstr(string(sim_defaults.montages)), @iscell);  % montage robustness analysis
     addParameter(p, 'overlap_probs', double(sim_defaults.overlap_probs(:)'), @isnumeric); % run with and without overlap
     addParameter(p, 'overlap_ms_range', double(sim_defaults.overlap_ms_range(:)'), @isnumeric);
@@ -93,7 +94,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
     res_dir = fullfile(CONFIG.out_dir, 'results');
     if ~exist(res_dir, 'dir'), mkdir(res_dir); end
     json_dir = fullfile(CONFIG.out_dir, 'microstates_json');
-    if ~exist(json_dir, 'dir'), mkdir(json_dir); end
+    if CONFIG.save_json && ~exist(json_dir, 'dir'), mkdir(json_dir); end
     plots_dir = fullfile(CONFIG.out_dir, 'plots');
     if ~exist(plots_dir, 'dir'), mkdir(plots_dir); end
 
@@ -409,32 +410,34 @@ function T = simulated_ms_retrieval_experiment(varargin)
                     local_rows = [local_rows; result_row]; 
                     
                     % Save JSON with metadata for plotting & downstream use
-                    json_file = fullfile(json_dir, [subj_name '.json']);
-                    try
-                        META = struct();
-                        META.subject = subj_name;
-                        META.method = method_str;
-                        META.criterion = criterion_str;
-                        META.K_true = fit_result.K_true;
-                        META.K_estimated = K_selected;
-                        META.SNR_dB = fit_result.SNR_dB;
-                        META.rep = fit_result.rep;
-                        META.montage_type = montage_type;
-                        META.n_leads = fit_result.n_leads;
-                        META.overlap_prob = Sim.overlap_prob;
-                        META.overlap_ms_range = Sim.overlap_ms_range;
-                        META.overlap_strength = Sim.overlap_strength;
-                        META.n_overlap_events = Sim.n_overlap_events;
-                        META.sim_qc_status = sim_qc_status;
-                        META.sim_qc_psd_slope_2_40hz = sim_qc_psd_slope;
-                        META.sim_qc_gfp_median_uv = sim_qc_gfp_median_uv;
-                        META.sim_qc_mean_dwell_ms = sim_qc_mean_dwell_ms;
-                        META.runtime_s = Results.runtime;
-                        META.channel_labels = Sim.channel_labels;  % Use Sim.channel_labels (montage-specific)
-                        save_microstate_json(Results, Sim, json_file, META);
-                    catch ME
-                        if CONFIG.verbose
-                            fprintf('⚠ Warning: Could not save JSON for %s: %s\n', subj_name, ME.message);
+                    if CONFIG.save_json
+                        json_file = fullfile(json_dir, [subj_name '.json']);
+                        try
+                            META = struct();
+                            META.subject = subj_name;
+                            META.method = method_str;
+                            META.criterion = criterion_str;
+                            META.K_true = fit_result.K_true;
+                            META.K_estimated = K_selected;
+                            META.SNR_dB = fit_result.SNR_dB;
+                            META.rep = fit_result.rep;
+                            META.montage_type = montage_type;
+                            META.n_leads = fit_result.n_leads;
+                            META.overlap_prob = Sim.overlap_prob;
+                            META.overlap_ms_range = Sim.overlap_ms_range;
+                            META.overlap_strength = Sim.overlap_strength;
+                            META.n_overlap_events = Sim.n_overlap_events;
+                            META.sim_qc_status = sim_qc_status;
+                            META.sim_qc_psd_slope_2_40hz = sim_qc_psd_slope;
+                            META.sim_qc_gfp_median_uv = sim_qc_gfp_median_uv;
+                            META.sim_qc_mean_dwell_ms = sim_qc_mean_dwell_ms;
+                            META.runtime_s = Results.runtime;
+                            META.channel_labels = Sim.channel_labels;  % Use Sim.channel_labels (montage-specific)
+                            save_microstate_json(Results, Sim, json_file, META);
+                        catch ME
+                            if CONFIG.verbose
+                                fprintf('⚠ Warning: Could not save JSON for %s: %s\n', subj_name, ME.message);
+                            end
                         end
                     end
                 end
@@ -498,7 +501,11 @@ function T = simulated_ms_retrieval_experiment(varargin)
     fprintf('Criteria (universal): %d\n', n_criteria);
     fprintf('Total Fits: %d (EEG conditions × montages × methods)\n', n_eeg_conditions * n_montages * n_methods);
     fprintf('Total Results: %d (one per method×criterion per montage per EEG)\n', height(T));
-    fprintf('JSON Microstates: %s\n', json_dir);
+    if CONFIG.save_json
+        fprintf('JSON Microstates: %s\n', json_dir);
+    else
+        fprintf('JSON Microstates: disabled\n');
+    end
     fprintf('Results CSV: %s\n', res_dir);
     fprintf('========================================\n');
 end

@@ -8,16 +8,16 @@
     "diagnostic_output_dir": "outputs/diagnostics",
     "koenig_code_dir": "Koenig_code",
     "spm_mixture_paths": [
-      "/path/to/spm/toolbox/mixture",
-      "/path/to/spm/toolbox/mixture"
+      "~/spm/toolbox/mixture",
+      "~/Downloads/spm/toolbox/mixture"
     ]
   },
   "preprocessing": {
     "apply_average_reference": true,
     "filter_band": [2, 20],
-    "spatial_filter": "none",
-    "spatial_filter_neighbours": 6,
-    "spatial_filter_strength": 1.0,
+    "spatial_filter": "smoothing",
+    "spatial_filter_neighbours": 12,
+    "spatial_filter_strength": 0.75,
     "reject_gfp_peak_outliers": true,
     "gfp_outlier_mad_multiplier": 6
   },
@@ -34,13 +34,18 @@
     "criterion": "elbow_sil_combined",
     "use_template_initialisation": true,
     "canonical_reporting_template_K": [],
-    "canonical_prior_weight_global": 100,
+    "canonical_prior_weight_global": 75,
+    "prior_weight_group": 25,
+    "prior_weight_condition": 25,
+    "prior_weight_participant": 25,
+    "prior_weight_file": 50,
+    "spm_prior_pseudocount": 4,
     "reject_template_misaligned_peaks": true,
     "template_peak_min_abs_corr": 0.65,
     "template_peak_template_K": 7,
     "min_peak_count_after_template_rejection": 50,
     "max_maps_per_file": 1500,
-    "max_global_maps": 30000,
+    "max_global_maps": 50000,
     "require_spm_initialisation": true
   },
   "simulation": {

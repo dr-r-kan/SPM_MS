@@ -9,8 +9,10 @@ conditioned_sets.csv
 # Generated outputs
 outputs/
 Output/
+examples/
 hierarchical_microstates/
 hierarchical_alignment_diagnostic*/
+meta_microstate_output/
 *.json
 *.mat
 *.csv
@@ -30,6 +32,11 @@ hierarchical_alignment_diagnostic*/
 .DS_Store
 .vscode/
 /.idea/
+.agents/
+.codex/
+.idea/
+.venv/
+venv/
 
 # Legacy scratch folders
 NotNeeded/
