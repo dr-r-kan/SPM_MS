@@ -4,9 +4,8 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
 % A dataset-level EEG microstate pipeline modelled on the EEG-Meta-
 % Microstates idea: estimate microstate templates per recording, then
 % cluster those templates again to obtain dataset-level meta-microstates.
-%
-% This file is deliberately named differently from the previous hierarchical
-% fit. It does NOT call the old hierarchical_permuted_fit code path.
+% The pipeline also caches the GFP peaks from each recording using a common
+% channel set, then fits a pooled GFP-peak solution at the end. 
 %
 % Required input CSV columns:
 %   file_path
@@ -87,6 +86,10 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     addParameter(p, 'filter_band', [2 20], @(x) isempty(x) || (isnumeric(x) && numel(x) == 2));
     addParameter(p, 'use_scalp_channels', true, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'channel_policy', 'intersect', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'interpolate_missing_peak_channels', true, @(x) islogical(x) && isscalar(x));
+    addParameter(p, 'peak_interpolation_method', 'idw', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'peak_interpolation_neighbours', 6, @(x) isnumeric(x) && isscalar(x) && x >= 1);
+    addParameter(p, 'peak_interpolation_min_source_channels', 8, @(x) isnumeric(x) && isscalar(x) && x >= 3);
     addParameter(p, 'sfreq', 250, @(x) isnumeric(x) && isscalar(x) && x > 0);
 
     addParameter(p, 'gfp_peak_min_distance_samples', 3, @(x) isnumeric(x) && isscalar(x) && x >= 1);
@@ -105,6 +108,8 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     addParameter(p, 'tol', 1e-7, @(x) isnumeric(x) && isscalar(x) && x > 0);
     addParameter(p, 'random_seed', 1, @(x) isnumeric(x) && isscalar(x));
     addParameter(p, 'force_recompute', false, @(x) islogical(x) && isscalar(x));
+    addParameter(p, 'force_recompute_peaks', false, @(x) islogical(x) && isscalar(x));
+    addParameter(p, 'force_recompute_clusters', false, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'infer_participant_from_path', true, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'verbose', true, @(x) islogical(x) && isscalar(x));
     parse(p, manifest_csv, varargin{:});
@@ -116,8 +121,14 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     cfg.criterion = lower(char(cfg.criterion));
     cfg.template_file = char(cfg.template_file);
     cfg.channel_policy = lower(char(cfg.channel_policy));
+    cfg.peak_interpolation_method = lower(char(cfg.peak_interpolation_method));
     cfg.json_dir = char(cfg.json_dir);
     cfg.plot_dir = char(cfg.plot_dir);
+    cfg.force_recompute_peaks = cfg.force_recompute || cfg.force_recompute_peaks;
+    cfg.force_recompute_clusters = cfg.force_recompute || cfg.force_recompute_clusters;
+    if ~strcmp(cfg.peak_interpolation_method, 'idw')
+        error('peak_interpolation_method must currently be ''idw''.');
+    end
     cfg.K_candidates = unique(round(cfg.K_candidates(:)'));
     cfg.K_candidates = cfg.K_candidates(cfg.K_candidates >= 2);
     if isempty(cfg.K_candidates)
@@ -166,6 +177,7 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
         fprintf('Criterion:    %s\n', cfg.criterion);
         fprintf('K candidates: %s\n', mat2str(cfg.K_candidates));
         fprintf('Old hierarchy: not used\n');
+        fprintf('Peak interpolation: %s\n', ternary_string(cfg.interpolate_missing_peak_channels, 'enabled', 'disabled'));
         fprintf('========================================\n\n');
     end
 
@@ -182,13 +194,14 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     writetable(channel_table, fullfile(cfg.output_dir, 'common_channels.csv'));
 
     if cfg.verbose
-        fprintf('   Common scalp/channel set: %d channels\n', numel(common_labels));
+        fprintf('   Target scalp/channel set: %d channels\n', numel(common_labels));
     end
 
     output_rows = initialise_output_rows(height(manifest));
     file_fits = cell(height(manifest), 1);
     record_refs = cell(height(manifest), 1);
     template_bank = [];
+    template_bank_weights = [];
     template_bank_rows = table();
 
     for i = 1:height(manifest)
@@ -240,44 +253,54 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
                 end
             end
 
-            if cfg.force_recompute || ~isfile(cache_file)
+            rec = [];
+            need_peak_refresh = cfg.force_recompute_peaks || ~isfile(cache_file);
+            if ~need_peak_refresh
+                S = load(cache_file, 'rec');
+                rec = S.rec;
+                need_peak_refresh = peak_cache_needs_refresh(rec, common_labels, cfg);
+            end
+            if need_peak_refresh
                 if cfg.verbose
                     fprintf('   Extracting and caching GFP peaks...\n');
                 end
                 rec = extract_file_gfp_maps(row.file_path{1}, common_index_by_file{i}, common_labels, common_chanlocs, common_pos, cfg);
                 rec.cache_file = cache_file;
                 save(cache_file, 'rec', 'row', 'cfg', '-v7.3');
-            else
-                S = load(cache_file, 'rec');
-                rec = S.rec;
             end
             record_refs{i} = rec;
 
-            if cfg.force_recompute || ~isfile(solution_file)
+            FileFit = [];
+            need_cluster_refresh = cfg.force_recompute_clusters || ~isfile(solution_file);
+            if ~need_cluster_refresh
+                S = load(solution_file, 'FileFit');
+                FileFit = S.FileFit;
+                need_cluster_refresh = cluster_solution_needs_refresh(FileFit, rec, common_labels);
+            end
+            if need_cluster_refresh
                 if cfg.verbose
                     fprintf('   Fitting common-channel per-file best-K solution...\n');
                 end
-                FileFit = fit_microstate_map_set(rec.maps_norm, rec.gfp, cfg.K_candidates, cfg, sprintf('file_%03d', i));
+                FileFit = fit_microstate_map_set(rec.maps_norm, rec.gfp_effective, cfg.K_candidates, cfg, sprintf('file_%03d', i));
                 if cfg.align_to_template
                     FileFit = attach_template_alignment(FileFit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
                 end
                 ManifestRow = row;
                 save(solution_file, 'FileFit', 'ManifestRow', 'AnalysisResults', 'json_file', 'cache_file', 'cfg', '-v7.3');
-            else
-                S = load(solution_file, 'FileFit');
-                FileFit = S.FileFit;
             end
             file_fits{i} = FileFit;
 
             centres = normalize_maps(FileFit.centers);
             n_centres = size(centres, 1);
             template_bank = [template_bank; centres]; %#ok<AGROW>
+            template_bank_weights = [template_bank_weights; repmat(sqrt(rec.interpolation_weight_scale), n_centres, 1)]; %#ok<AGROW>
             local_rows = table();
             local_rows.file_index = repmat(i, n_centres, 1);
             local_rows.participant = repmat(row.participant, n_centres, 1);
             local_rows.condition = repmat(row.condition, n_centres, 1);
             local_rows.group = repmat(row.group, n_centres, 1);
             local_rows.local_state = (1:n_centres)';
+            local_rows.fit_weight_proxy = repmat(sqrt(rec.interpolation_weight_scale), n_centres, 1);
             if isfield(FileFit, 'template_alignment') && isfield(FileFit.template_alignment, 'assigned_labels')
                 local_rows.template_label = FileFit.template_alignment.assigned_labels(:);
                 local_rows.template_abs_corr = FileFit.template_alignment.assigned_abs_corr(:);
@@ -298,6 +321,10 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
             output_rows.local_K(i) = FileFit.K_estimated;
             output_rows.n_gfp_peaks(i) = rec.n_peaks_raw;
             output_rows.n_gfp_peaks_used(i) = size(rec.maps_norm, 1);
+            output_rows.n_target_channels(i) = rec.n_target_channels;
+            output_rows.n_observed_channels(i) = rec.n_observed_channels;
+            output_rows.n_interpolated_channels(i) = rec.n_interpolated_channels;
+            output_rows.interpolated_channel_fraction(i) = rec.interpolated_fraction;
             output_rows.status{i} = char(status);
             output_rows.error_message{i} = char(error_message);
 
@@ -318,6 +345,10 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
             output_rows.local_K(i) = NaN;
             output_rows.n_gfp_peaks(i) = NaN;
             output_rows.n_gfp_peaks_used(i) = NaN;
+            output_rows.n_target_channels(i) = NaN;
+            output_rows.n_observed_channels(i) = NaN;
+            output_rows.n_interpolated_channels(i) = NaN;
+            output_rows.interpolated_channel_fraction(i) = NaN;
             output_rows.status{i} = char(status);
             output_rows.error_message{i} = char(error_message);
         end
@@ -332,7 +363,7 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     if isempty(template_bank)
         error('No per-file templates were available for meta-clustering. Check failed rows in %s.', output_csv);
     end
-    meta_fit = fit_microstate_map_set(template_bank, ones(size(template_bank, 1), 1), cfg.meta_K_candidates, cfg, 'meta_templates');
+    meta_fit = fit_microstate_map_set(template_bank, template_bank_weights, cfg.meta_K_candidates, cfg, 'meta_templates');
     if cfg.align_to_template
         meta_fit = attach_template_alignment(meta_fit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
     end
@@ -584,7 +615,9 @@ function vals = unique_nonempty_strings(x)
 end
 
 function gfp = get_subset_gfp(rows_table, mask)
-    if any(strcmpi(rows_table.Properties.VariableNames, 'gfp'))
+    if any(strcmpi(rows_table.Properties.VariableNames, 'gfp_effective'))
+        gfp = double(rows_table.gfp_effective(mask));
+    elseif any(strcmpi(rows_table.Properties.VariableNames, 'gfp'))
         gfp = double(rows_table.gfp(mask));
     else
         gfp = ones(sum(mask), 1);
@@ -889,6 +922,10 @@ function output_rows = initialise_output_rows(n)
     output_rows.local_K = nan(n, 1);
     output_rows.n_gfp_peaks = nan(n, 1);
     output_rows.n_gfp_peaks_used = nan(n, 1);
+    output_rows.n_target_channels = nan(n, 1);
+    output_rows.n_observed_channels = nan(n, 1);
+    output_rows.n_interpolated_channels = nan(n, 1);
+    output_rows.interpolated_channel_fraction = nan(n, 1);
     output_rows.status = repmat({'pending'}, n, 1);
     output_rows.error_message = repmat({''}, n, 1);
 end
@@ -900,12 +937,48 @@ function write_checkpoint_manifest(T, fn)
     end
 end
 
+function tf = peak_cache_needs_refresh(rec, common_labels, cfg)
+    tf = isempty(rec) || ~isstruct(rec) || ~isfield(rec, 'maps_norm') || ~isfield(rec, 'gfp') || ...
+        size(rec.maps_norm, 2) ~= numel(common_labels);
+    if tf
+        return;
+    end
+    needed_fields = {'gfp_effective', 'n_target_channels', 'n_observed_channels', ...
+        'n_interpolated_channels', 'interpolated_fraction', 'interpolation_enabled'};
+    for i = 1:numel(needed_fields)
+        if ~isfield(rec, needed_fields{i})
+            tf = true;
+            return;
+        end
+    end
+    tf = false;
+end
+
+function tf = cluster_solution_needs_refresh(FileFit, rec, common_labels)
+    tf = isempty(FileFit) || ~isstruct(FileFit) || ~isfield(FileFit, 'centers') || ...
+        size(FileFit.centers, 2) ~= numel(common_labels);
+    if tf
+        return;
+    end
+    tf = isfield(rec, 'maps_norm') && size(rec.maps_norm, 2) ~= size(FileFit.centers, 2);
+end
+
+function out = ternary_string(cond, true_str, false_str)
+    if cond
+        out = true_str;
+    else
+        out = false_str;
+    end
+end
+
 % -------------------------------------------------------------------------
 % Channel inspection/loading
 % -------------------------------------------------------------------------
 function file_meta = inspect_channel_sets(manifest, cfg)
     n = height(manifest);
-    file_meta = repmat(struct('file_path', '', 'sfreq', NaN, 'n_channels', NaN, 'labels', {{}}, 'chanlocs', [], 'pos', []), n, 1);
+    file_meta = repmat(struct('file_path', '', 'sfreq', NaN, 'n_channels', NaN, 'labels', {{}}, ...
+        'chanlocs', [], 'pos', [], 'original_index', [], 'canonical_labels', {{}}, ...
+        'n_channels_after_filter', NaN), n, 1);
     for i = 1:n
         fp = manifest.file_path{i};
         if ~isfile(fp)
@@ -1068,75 +1141,181 @@ end
 
 function [common_labels, common_index_by_file, common_chanlocs, common_pos] = define_common_channels(file_meta, cfg)
     n_files = numel(file_meta);
-    canon_sets = cell(n_files, 1);
     for i = 1:n_files
-        canon_sets{i} = canonical_channel_labels(file_meta(i).labels);
+        file_meta(i) = preprocess_file_meta_channels(file_meta(i), cfg);
     end
 
-    common_can = canon_sets{1};
-    for i = 2:n_files
-        common_can = intersect(common_can, canon_sets{i}, 'stable');
-    end
-    if isempty(common_can)
-        error('No common channels across files.');
-    end
-    if strcmp(cfg.channel_policy, 'strict')
-        base = canon_sets{1};
-        for i = 2:n_files
-            if numel(base) ~= numel(canon_sets{i}) || any(~strcmp(base(:), canon_sets{i}(:)))
-                error('channel_policy=strict, but file %d has a non-identical channel set.', i);
-            end
+    if cfg.interpolate_missing_peak_channels
+        ref_idx = select_target_channel_reference(file_meta);
+        common_labels = file_meta(ref_idx).labels(:);
+        common_chanlocs = file_meta(ref_idx).chanlocs;
+        common_pos = file_meta(ref_idx).pos;
+        common_can = file_meta(ref_idx).canonical_labels(:);
+        if isempty(common_can)
+            error('Reference channel set is empty after scalp-channel filtering.');
         end
-        common_can = base;
-    elseif ~strcmp(cfg.channel_policy, 'intersect')
-        error('channel_policy must be intersect or strict.');
-    end
-
-    first_labels = file_meta(1).labels;
-    first_can = canon_sets{1};
-    common_labels = cell(numel(common_can), 1);
-    common_index_by_file = cell(n_files, 1);
-    for c = 1:numel(common_can)
-        idx = find(strcmp(first_can, common_can{c}), 1, 'first');
-        common_labels{c} = first_labels{idx};
-    end
-
-    for i = 1:n_files
-        idxs = zeros(numel(common_can), 1);
-        for c = 1:numel(common_can)
-            idx = find(strcmp(canon_sets{i}, common_can{c}), 1, 'first');
-            if isempty(idx)
-                error('Internal channel matching failure for file %d, channel %s.', i, common_can{c});
-            end
-            idxs(c) = idx;
-        end
-        common_index_by_file{i} = idxs;
-    end
-
-    if ~isempty(file_meta(1).chanlocs)
-        common_chanlocs = file_meta(1).chanlocs(common_index_by_file{1});
-    else
-        common_chanlocs = [];
-    end
-    if ~isempty(file_meta(1).pos)
-        common_pos = file_meta(1).pos(common_index_by_file{1}, :);
-    else
-        common_pos = [];
-    end
-
-    if cfg.use_scalp_channels
-        keep = scalp_channel_mask(common_labels, common_chanlocs, common_pos);
-        common_labels = common_labels(keep);
+        common_index_by_file = cell(n_files, 1);
         for i = 1:n_files
-            idxs = common_index_by_file{i};
-            common_index_by_file{i} = idxs(keep);
+            common_index_by_file{i} = build_channel_remap_spec(file_meta(i), common_can, common_pos, cfg);
         end
-        if ~isempty(common_chanlocs)
-            common_chanlocs = common_chanlocs(keep);
+    else
+        canon_sets = cell(n_files, 1);
+        for i = 1:n_files
+            canon_sets{i} = file_meta(i).canonical_labels(:);
         end
-        if ~isempty(common_pos)
-            common_pos = common_pos(keep, :);
+
+        common_can = canon_sets{1};
+        for i = 2:n_files
+            common_can = intersect(common_can, canon_sets{i}, 'stable');
         end
+        if isempty(common_can)
+            error('No common channels across files.');
+        end
+        if strcmp(cfg.channel_policy, 'strict')
+            base = canon_sets{1};
+            for i = 2:n_files
+                if numel(base) ~= numel(canon_sets{i}) || any(~strcmp(base(:), canon_sets{i}(:)))
+                    error('channel_policy=strict, but file %d has a non-identical channel set.', i);
+                end
+            end
+            common_can = base;
+        elseif ~strcmp(cfg.channel_policy, 'intersect')
+            error('channel_policy must be intersect or strict when interpolation is disabled.');
+        end
+
+        first_labels = file_meta(1).labels;
+        first_can = file_meta(1).canonical_labels;
+        common_labels = cell(numel(common_can), 1);
+        for c = 1:numel(common_can)
+            idx = find(strcmp(first_can, common_can{c}), 1, 'first');
+            common_labels{c} = first_labels{idx};
+        end
+        if ~isempty(file_meta(1).chanlocs)
+            common_chanlocs = file_meta(1).chanlocs(match_labels_or_die(first_can, common_can));
+        else
+            common_chanlocs = [];
+        end
+        if ~isempty(file_meta(1).pos)
+            common_pos = file_meta(1).pos(match_labels_or_die(first_can, common_can), :);
+        else
+            common_pos = [];
+        end
+        common_index_by_file = cell(n_files, 1);
+        for i = 1:n_files
+            common_index_by_file{i} = build_channel_remap_spec(file_meta(i), common_can, common_pos, cfg);
+            if common_index_by_file{i}.n_interpolated_channels > 0
+                error('Interpolation was disabled, but file %d is missing target channels after filtering.', i);
+            end
+        end
+    end
+end
+
+function meta = preprocess_file_meta_channels(meta, cfg)
+    labels = meta.labels(:);
+    chanlocs = meta.chanlocs;
+    pos = meta.pos;
+    keep = true(numel(labels), 1);
+    if cfg.use_scalp_channels
+        keep = scalp_channel_mask(labels, chanlocs, pos);
+    end
+    meta.original_index = find(keep);
+    meta.labels = labels(keep);
+    if ~isempty(chanlocs)
+        meta.chanlocs = chanlocs(keep);
+    else
+        meta.chanlocs = [];
+    end
+    if ~isempty(pos)
+        meta.pos = pos(keep, :);
+    else
+        meta.pos = [];
+    end
+    meta.canonical_labels = canonical_channel_labels(meta.labels);
+    meta.n_channels_after_filter = numel(meta.labels);
+end
+
+function ref_idx = select_target_channel_reference(file_meta)
+    n_files = numel(file_meta);
+    score = -inf(n_files, 1);
+    for i = 1:n_files
+        n_channels = numel(file_meta(i).labels);
+        if isempty(file_meta(i).pos)
+            n_pos = 0;
+        else
+            n_pos = nnz(all(isfinite(file_meta(i).pos), 2) & sqrt(sum(file_meta(i).pos.^2, 2)) > 0);
+        end
+        score(i) = 10000 * n_channels + n_pos;
+    end
+    [~, ref_idx] = max(score);
+end
+
+function spec = build_channel_remap_spec(file_meta, target_can, target_pos, cfg)
+    source_can = file_meta.canonical_labels(:);
+    source_idx = file_meta.original_index(:);
+    n_target = numel(target_can);
+    direct_local_index = nan(n_target, 1);
+    for c = 1:n_target
+        hit = find(strcmp(source_can, target_can{c}), 1, 'first');
+        if ~isempty(hit)
+            direct_local_index(c) = hit;
+        end
+    end
+
+    spec = struct();
+    spec.source_data_index = source_idx;
+    spec.direct_local_index = direct_local_index;
+    spec.target_labels = target_can(:);
+    spec.n_target_channels = n_target;
+    spec.n_observed_channels = nnz(isfinite(direct_local_index));
+    spec.n_interpolated_channels = n_target - spec.n_observed_channels;
+    spec.observed_fraction = spec.n_observed_channels / max(1, n_target);
+    spec.interpolated_fraction = 1 - spec.observed_fraction;
+    spec.interpolation_enabled = cfg.interpolate_missing_peak_channels && spec.n_interpolated_channels > 0;
+    spec.interpolation_weights = cell(n_target, 1);
+    spec.interpolation_source_local_index = cell(n_target, 1);
+
+    if spec.n_interpolated_channels == 0
+        return;
+    end
+    if ~cfg.interpolate_missing_peak_channels
+        return;
+    end
+    if isempty(target_pos) || size(target_pos, 1) ~= n_target
+        error('Target channel positions are required for peak interpolation.');
+    end
+    source_pos = file_meta.pos;
+    if isempty(source_pos) || size(source_pos, 1) ~= numel(source_idx)
+        error('Source channel positions are required for peak interpolation: %s', file_meta.file_path);
+    end
+    valid_source = all(isfinite(source_pos), 2) & sqrt(sum(source_pos.^2, 2)) > 0;
+    if nnz(valid_source) < cfg.peak_interpolation_min_source_channels
+        error('Only %d source scalp channels with valid positions are available for interpolation in %s.', ...
+            nnz(valid_source), file_meta.file_path);
+    end
+
+    source_pos_valid = source_pos(valid_source, :);
+    valid_local_index = find(valid_source);
+    missing = find(~isfinite(direct_local_index));
+    for j = 1:numel(missing)
+        t = missing(j);
+        target_xyz = target_pos(t, :);
+        if ~all(isfinite(target_xyz)) || sqrt(sum(target_xyz.^2)) <= 0
+            error('Target channel %d lacks a valid 3D position required for interpolation.', t);
+        end
+        [local_idx, weights] = build_interpolation_weights(source_pos_valid, target_xyz, cfg);
+        spec.interpolation_source_local_index{t} = valid_local_index(local_idx);
+        spec.interpolation_weights{t} = weights;
+    end
+end
+
+function idx = match_labels_or_die(source_can, target_can)
+    idx = zeros(numel(target_can), 1);
+    for c = 1:numel(target_can)
+        hit = find(strcmp(source_can, target_can{c}), 1, 'first');
+        if isempty(hit)
+            error('Internal channel matching failure for channel %s.', target_can{c});
+        end
+        idx(c) = hit;
     end
 end
 
@@ -1181,9 +1360,9 @@ end
 % -------------------------------------------------------------------------
 % GFP peak extraction
 % -------------------------------------------------------------------------
-function rec = extract_file_gfp_maps(eeg_file, chan_idx, common_labels, common_chanlocs, common_pos, cfg)
+function rec = extract_file_gfp_maps(eeg_file, chan_spec, common_labels, common_chanlocs, common_pos, cfg)
     [eeg_data, sfreq, ~, ~, ~] = load_eeg_matrix(eeg_file, cfg.sfreq);
-    eeg_data = eeg_data(chan_idx, :);
+    eeg_data = eeg_data(chan_spec.source_data_index, :);
     eeg_data = double(eeg_data);
     good_t = all(isfinite(eeg_data), 1);
     eeg_data = eeg_data(:, good_t);
@@ -1203,7 +1382,8 @@ function rec = extract_file_gfp_maps(eeg_file, chan_idx, common_labels, common_c
     if isempty(peak_idx)
         error('No GFP peaks found.');
     end
-    maps = eeg_data(:, peak_idx)';
+    source_maps = eeg_data(:, peak_idx)';
+    maps = remap_peak_maps_to_target(source_maps, chan_spec);
     gfp_peak = gfp(peak_idx)';
     n_raw = size(maps, 1);
 
@@ -1227,6 +1407,7 @@ function rec = extract_file_gfp_maps(eeg_file, chan_idx, common_labels, common_c
     end
 
     maps_norm = normalize_maps(maps);
+    interpolation_weight_scale = max(0, chan_spec.observed_fraction);
     rec = struct();
     rec.eeg_file = eeg_file;
     rec.sfreq = sfreq;
@@ -1235,10 +1416,61 @@ function rec = extract_file_gfp_maps(eeg_file, chan_idx, common_labels, common_c
     rec.common_pos = common_pos;
     rec.peak_sample = peak_idx(:);
     rec.gfp = gfp_peak(:);
+    rec.gfp_effective = gfp_peak(:) * sqrt(interpolation_weight_scale);
     rec.maps = single(maps);
     rec.maps_norm = single(maps_norm);
     rec.n_peaks_raw = n_raw;
     rec.n_peaks_used = size(maps_norm, 1);
+    rec.n_target_channels = chan_spec.n_target_channels;
+    rec.n_observed_channels = chan_spec.n_observed_channels;
+    rec.n_interpolated_channels = chan_spec.n_interpolated_channels;
+    rec.observed_fraction = chan_spec.observed_fraction;
+    rec.interpolated_fraction = chan_spec.interpolated_fraction;
+    rec.interpolation_weight_scale = interpolation_weight_scale;
+    rec.interpolation_enabled = chan_spec.interpolation_enabled;
+end
+
+function maps = remap_peak_maps_to_target(source_maps, chan_spec)
+    n_peaks = size(source_maps, 1);
+    n_target = chan_spec.n_target_channels;
+    maps = nan(n_peaks, n_target);
+    direct = chan_spec.direct_local_index;
+    observed = isfinite(direct);
+    if any(observed)
+        maps(:, observed) = source_maps(:, direct(observed));
+    end
+    missing = find(~observed);
+    for j = 1:numel(missing)
+        t = missing(j);
+        local_idx = chan_spec.interpolation_source_local_index{t};
+        weights = chan_spec.interpolation_weights{t};
+        if isempty(local_idx) || isempty(weights)
+            continue;
+        end
+        maps(:, t) = source_maps(:, local_idx) * weights;
+    end
+end
+
+function [local_idx, weights] = build_interpolation_weights(source_pos, target_xyz, cfg)
+    d = sqrt(sum((source_pos - target_xyz).^2, 2));
+    [ds, ord] = sort(d, 'ascend');
+    m = min(cfg.peak_interpolation_neighbours, numel(ord));
+    ord = ord(1:m);
+    ds = ds(1:m);
+    if isempty(ds)
+        local_idx = [];
+        weights = [];
+        return;
+    end
+    if ds(1) <= eps
+        weights = zeros(m, 1);
+        weights(1) = 1;
+    else
+        weights = 1 ./ (ds.^2 + eps);
+        weights = weights ./ sum(weights);
+    end
+    local_idx = ord(:);
+    weights = weights(:);
 end
 
 function data = apply_temporal_filter(data, sfreq, band)
@@ -1893,7 +2125,11 @@ function [pooled_maps, pooled_gfp, pooled_rows, population_filter] = pool_cached
         end
         n = size(rec.maps_norm, 1);
         pooled_maps = [pooled_maps; double(rec.maps_norm)]; %#ok<AGROW>
-        pooled_gfp = [pooled_gfp; double(rec.gfp(:))]; %#ok<AGROW>
+        if isfield(rec, 'gfp_effective')
+            pooled_gfp = [pooled_gfp; double(rec.gfp_effective(:))]; %#ok<AGROW>
+        else
+            pooled_gfp = [pooled_gfp; double(rec.gfp(:))]; %#ok<AGROW>
+        end
         rows = table();
         rows.file_index = repmat(i, n, 1);
         rows.participant = repmat(manifest.participant(i), n, 1);
@@ -1901,6 +2137,15 @@ function [pooled_maps, pooled_gfp, pooled_rows, population_filter] = pool_cached
         rows.group = repmat(manifest.group(i), n, 1);
         rows.peak_sample = rec.peak_sample(:);
         rows.gfp = double(rec.gfp(:));
+        if isfield(rec, 'gfp_effective')
+            rows.gfp_effective = double(rec.gfp_effective(:));
+        else
+            rows.gfp_effective = double(rec.gfp(:));
+        end
+        rows.n_target_channels = repmat(double(rec.n_target_channels), n, 1);
+        rows.n_observed_channels = repmat(double(rec.n_observed_channels), n, 1);
+        rows.n_interpolated_channels = repmat(double(rec.n_interpolated_channels), n, 1);
+        rows.interpolated_channel_fraction = repmat(double(rec.interpolated_fraction), n, 1);
         pooled_rows = [pooled_rows; rows]; %#ok<AGROW>
     end
     population_filter = struct();

@@ -26,6 +26,7 @@ function utils = microstate_utilities()
     utils.duration_string = @dur_str_internal;
     utils.on_off_string = @onoff_internal;
     utils.fibonacci_sphere = @fibonacci_sphere_internal;
+    utils.ensure_spm_mix = @ensure_spm_mix_internal;
 end
 
 % ======================== CONFIGURATION ========================
@@ -206,6 +207,125 @@ function ensure_dir_internal(pth)
     end
     if ~exist(pth, 'dir')
         mkdir(pth);
+    end
+end
+
+function [ok, info] = ensure_spm_mix_internal(explicit_spm_path, configured_paths, verbose)
+%ENSURE_SPM_MIX_INTERNAL Try to make spm_mix visible from common hints.
+
+    if nargin < 1 || isempty(explicit_spm_path)
+        explicit_spm_path = '';
+    end
+    if nargin < 2 || isempty(configured_paths)
+        configured_paths = {};
+    end
+    if nargin < 3 || isempty(verbose)
+        verbose = false;
+    end
+
+    info = struct();
+    info.spm_before = which('spm');
+    info.spm_mix_before = which('spm_mix');
+    info.attempted = {};
+    info.added = {};
+    info.spmmix_path = info.spm_mix_before;
+
+    if exist('spm_mix', 'file') == 2
+        ok = true;
+        return;
+    end
+
+    candidates = {};
+    candidates = append_candidate_local(candidates, explicit_spm_path);
+    candidates = append_candidate_local(candidates, getenv('SPM_MIXTURE_PATH'));
+    candidates = append_candidate_local(candidates, getenv('SPM_PATH'));
+    candidates = append_candidate_local(candidates, configured_paths);
+
+    spm_file = which('spm');
+    if ~isempty(spm_file)
+        spm_root = fileparts(spm_file);
+        candidates = append_candidate_local(candidates, spm_root);
+        candidates = append_candidate_local(candidates, fullfile(spm_root, 'toolbox', 'mixture'));
+    end
+
+    if ~isempty(candidates)
+        [~, ia] = unique(cellfun(@char, candidates, 'UniformOutput', false), 'stable');
+        candidates = candidates(sort(ia));
+    end
+
+    for i = 1:numel(candidates)
+        cand = char(candidates{i});
+        if isempty(cand)
+            continue;
+        end
+        info.attempted{end+1} = cand; %#ok<AGROW>
+        added_now = add_spm_candidate_local(cand, verbose);
+        if ~isempty(added_now)
+            info.added = [info.added, added_now]; %#ok<AGROW>
+        end
+        if exist('spm_mix', 'file') == 2
+            ok = true;
+            info.spmmix_path = which('spm_mix');
+            return;
+        end
+    end
+
+    ok = exist('spm_mix', 'file') == 2;
+    info.spmmix_path = which('spm_mix');
+end
+
+function candidates = append_candidate_local(candidates, value)
+    if isempty(value)
+        return;
+    end
+    if isstring(value)
+        value = cellstr(value);
+    elseif ischar(value)
+        value = {value};
+    elseif ~iscell(value)
+        return;
+    end
+    for i = 1:numel(value)
+        v = value{i};
+        if isempty(v)
+            continue;
+        end
+        v = resolve_path_internal(v, project_root_internal());
+        candidates{end+1} = char(v); %#ok<AGROW>
+    end
+end
+
+function added = add_spm_candidate_local(candidate_dir, verbose)
+    added = {};
+    if ~exist(candidate_dir, 'dir')
+        return;
+    end
+
+    candidate_dir = char(candidate_dir);
+    mix_dir = candidate_dir;
+
+    if exist(fullfile(candidate_dir, 'spm_mix.m'), 'file') == 2
+        addpath(candidate_dir);
+        added{end+1} = candidate_dir; %#ok<AGROW>
+    end
+
+    if exist(fullfile(candidate_dir, 'spm.m'), 'file') == 2
+        addpath(candidate_dir);
+        added{end+1} = candidate_dir; %#ok<AGROW>
+        mix_dir = fullfile(candidate_dir, 'toolbox', 'mixture');
+    elseif exist(fullfile(candidate_dir, 'toolbox', 'mixture', 'spm_mix.m'), 'file') == 2
+        mix_dir = fullfile(candidate_dir, 'toolbox', 'mixture');
+    end
+
+    if exist(fullfile(mix_dir, 'spm_mix.m'), 'file') == 2
+        addpath(mix_dir);
+        added{end+1} = mix_dir; %#ok<AGROW>
+    end
+
+    if verbose && ~isempty(added)
+        for i = 1:numel(added)
+            fprintf('Added SPM path candidate: %s\n', added{i});
+        end
     end
 end
 

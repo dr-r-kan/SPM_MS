@@ -28,14 +28,6 @@ function T = simulated_ms_retrieval_experiment(varargin)
     %  - popFitMSMaps.m
     % All from the "microstates" repository
 
-    % We also need to make sure the SPM mixture toolbox is available.
-    configured_spm_paths = cellstr(string(path_defaults.spm_mixture_paths));
-    for pi = 1:numel(configured_spm_paths)
-        if exist(configured_spm_paths{pi}, "dir")
-            addpath(configured_spm_paths{pi});
-        end
-    end
-    
     test = false;
 
     p = inputParser;
@@ -118,20 +110,18 @@ function T = simulated_ms_retrieval_experiment(varargin)
     % First-line validation is focused on the VB method.
     method_names = {'spm_vb', 'kmeans_koenig', 'spm_kmeans'};
     
-    % Inject SPM path if provided
-    if ~isempty(CONFIG.spm_path) && exist(CONFIG.spm_path, 'dir')
-        addpath(genpath(CONFIG.spm_path));
-        if CONFIG.verbose
-            fprintf('Added SPM path: %s\n', CONFIG.spm_path);
-        end
-    end
-    
     % Guard: if SPM methods requested but SPM not available, stop early with a clear message
     needs_spm = any(contains(method_names, 'spm'));
-    if needs_spm && ~exist('spm_mix', 'file')
+    [spm_ok, spm_info] = util.ensure_spm_mix(CONFIG.spm_path, path_defaults.spm_mixture_paths, CONFIG.verbose);
+    if CONFIG.verbose
+        fprintf('SPM root detected: %s\n', local_which_text('spm'));
+        fprintf('SPM mixture detected: %s\n', local_which_text('spm_mix'));
+    end
+    if needs_spm && ~spm_ok
         error(['SPM mixture toolbox not found on MATLAB path. ', ...
-               'Please set ''spm_path'' to your SPM installation (toolbox/mixture) ', ...
-               'or remove spm_vb/spm_kmeans from method_names.']);
+               'Checked explicit spm_path, SPM_PATH/SPM_MIXTURE_PATH, configured paths, and the folder inferred from spm.m. ', ...
+               'spm.m=''%s''; spm_mix=''%s''; attempted={%s}.'], ...
+               local_which_text('spm'), local_which_text('spm_mix'), strjoin(spm_info.attempted, ', '));
     end
     
     % Montages to test
@@ -829,4 +819,11 @@ function montage_pos = get_standard_10_20_positions()
         0.274, -0.942,  0.195;
         -0.274, -0.942,  0.195;
     ];
+end
+
+function txt = local_which_text(name)
+    txt = which(name);
+    if isempty(txt)
+        txt = '<not found>';
+    end
 end
