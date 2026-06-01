@@ -58,6 +58,9 @@ function T = simulated_ms_retrieval_experiment(varargin)
     addParameter(p, 'overlap_probs', double(sim_defaults.overlap_probs(:)'), @isnumeric); % run with and without overlap
     addParameter(p, 'overlap_ms_range', double(sim_defaults.overlap_ms_range(:)'), @isnumeric);
     addParameter(p, 'overlap_strength', double(sim_defaults.overlap_strength), @isnumeric);
+    addParameter(p, 'compute_backfit_diagnostics', logical(util.get_field(sim_defaults, 'compute_backfit_diagnostics', true)), @islogical);
+    addParameter(p, 'save_backfit_details', logical(util.get_field(sim_defaults, 'save_backfit_details', true)), @islogical);
+    addParameter(p, 'template_alignment_strong_threshold', double(util.get_field(sim_defaults, 'template_alignment_strong_threshold', 0.5)), @isnumeric);
     addParameter(p, 'validate_simulation', logical(sim_defaults.validate_simulation), @islogical);
     addParameter(p, 'preprocessing', sim_defaults.preprocessing, @isstruct);
     parse(p, varargin{:});
@@ -87,6 +90,9 @@ function T = simulated_ms_retrieval_experiment(varargin)
     if ~exist(res_dir, 'dir'), mkdir(res_dir); end
     json_dir = fullfile(CONFIG.out_dir, 'microstates_json');
     if CONFIG.save_json && ~exist(json_dir, 'dir'), mkdir(json_dir); end
+    backfit_dir = fullfile(res_dir, 'backfit_diagnostics');
+    if CONFIG.compute_backfit_diagnostics && CONFIG.save_backfit_details && ~exist(backfit_dir, 'dir'), mkdir(backfit_dir); end
+    confusion_dir = fullfile(res_dir, 'backfit_confusions');
     plots_dir = fullfile(CONFIG.out_dir, 'plots');
     if ~exist(plots_dir, 'dir'), mkdir(plots_dir); end
 
@@ -108,7 +114,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
     all_criteria = {'silhouette', 'free_energy', 'elbow', 'elbow_sil_combined', 'gev'};
     
     % First-line validation is focused on the VB method.
-    method_names = {'spm_vb', 'kmeans_koenig', 'spm_kmeans'};
+    method_names = {'spm_vb', 'kmeans_koenig'};
     
     % Guard: if SPM methods requested but SPM not available, stop early with a clear message
     needs_spm = any(contains(method_names, 'spm'));
@@ -267,6 +273,15 @@ function T = simulated_ms_retrieval_experiment(varargin)
             Sim.montage_type = montage_type;
             Sim.n_leads = Sim.n_channels;
             Sim.preprocessing = CONFIG.preprocessing;
+            if CONFIG.compute_backfit_diagnostics
+                try
+                    Sim.true_template_alignment = align_microstates_to_template(Sim.maps_true, CONFIG.set_file, ...
+                        'estimated_channel_labels', Sim.channel_labels, ...
+                        'strong_threshold', CONFIG.template_alignment_strong_threshold);
+                catch
+                    Sim.true_template_alignment = [];
+                end
+            end
             
             % ===== STEP 3: FIT all methods to this montage =====
             fit_results_for_montage = cell(n_methods, 1);
@@ -329,11 +344,12 @@ function T = simulated_ms_retrieval_experiment(varargin)
                 
                 fit_result = fit_results_for_montage{m_idx};
                 Results = fit_result.Results;
-                method_str = fit_result.method;
+                method_str = char(string(fit_result.method));
+                selected_solution_cache = struct();
                 
                 % Apply ALL criteria to this ONE fit
                 for c_idx = 1:n_criteria
-                    criterion_str = all_criteria{c_idx};
+                    criterion_str = char(string(all_criteria{c_idx}));
                     
                     % Extract K using this criterion
                     K_selected = select_K_by_criterion(Results, criterion_str);
@@ -342,14 +358,80 @@ function T = simulated_ms_retrieval_experiment(varargin)
                         continue;
                     end
                     
-                    rec_metrics = Results.recovery_metrics;
+                    cache_key = sprintf('K_%d', K_selected);
+                    if isfield(selected_solution_cache, cache_key)
+                        SelectedResults = selected_solution_cache.(cache_key);
+                    else
+                        SelectedResults = extract_microstate_solution_for_k(Results, K_selected, ...
+                            'Sim', Sim, ...
+                            'criterion', criterion_str, ...
+                            'template_file', CONFIG.set_file, ...
+                            'estimated_channel_labels', Sim.channel_labels, ...
+                            'strong_threshold', CONFIG.template_alignment_strong_threshold);
+                        if CONFIG.compute_backfit_diagnostics
+                            try
+                                BackfitDiagnostics = compute_simulation_backfit_diagnostics(Sim, SelectedResults, CONFIG.set_file, ...
+                                    'strong_threshold', CONFIG.template_alignment_strong_threshold);
+                                SelectedResults.backfit_diagnostics = BackfitDiagnostics;
+                            catch
+                            end
+                        end
+                        selected_solution_cache.(cache_key) = SelectedResults;
+                    end
+                    SelectedResults.criterion = criterion_str;
+                    SelectedResults.best_criterion_value = criterion_specific_best_score(Results, K_selected, criterion_str);
+                    rec_metrics = SelectedResults.recovery_metrics;
                     recovery_corr = util.padded_vector(rec_metrics.match_similarities, 10);
+                    json_file = '';
+                    backfit_diagnostic_file = '';
+                    backfit_coverage_corr = NaN;
+                    backfit_coverage_spearman = NaN;
+                    backfit_coverage_mae = NaN;
+                    backfit_coverage_rmse = NaN;
+                    backfit_coverage_l1 = NaN;
+                    selected_cov_trace_mean = NaN;
+                    selected_cov_trace_median = NaN;
+                    selected_cov_logdet_mean = NaN;
+                    selected_spm_feature_dim = NaN;
+                    if isfield(SelectedResults, 'selected_spm_mix_model') && ~isempty(SelectedResults.selected_spm_mix_model)
+                        spm_model = SelectedResults.selected_spm_mix_model;
+                        if isfield(spm_model, 'covariance_traces') && ~isempty(spm_model.covariance_traces)
+                            selected_cov_trace_mean = mean(spm_model.covariance_traces, 'omitnan');
+                            selected_cov_trace_median = median(spm_model.covariance_traces, 'omitnan');
+                        end
+                        if isfield(spm_model, 'covariance_logdets') && ~isempty(spm_model.covariance_logdets)
+                            selected_cov_logdet_mean = mean(spm_model.covariance_logdets, 'omitnan');
+                        end
+                        if isfield(spm_model, 'feature_dim') && ~isempty(spm_model.feature_dim)
+                            selected_spm_feature_dim = spm_model.feature_dim;
+                        end
+                    end
                     
                     % Generate a temporary subject name (IDs will be fixed later)
+                    montage_name = char(string(montage_type));
                     overlap_tag = sprintf('ovl%02d', round(100 * Sim.overlap_prob));
                     subj_name = sprintf('fit_E%d_M%d_K%d_SNR%+d_%s_%s_%s_%s', ...
                         eeg_idx, m_idx, fit_result.K_true, round(fit_result.SNR_dB), ...
-                        montage_type, overlap_tag, method_str, criterion_str);
+                        montage_name, overlap_tag, method_str, criterion_str);
+                    if CONFIG.compute_backfit_diagnostics && isfield(SelectedResults, 'backfit_diagnostics')
+                        BackfitDiagnostics = SelectedResults.backfit_diagnostics;
+                        if isfield(BackfitDiagnostics, 'ok') && BackfitDiagnostics.ok
+                            backfit_coverage_corr = BackfitDiagnostics.coverage_corr;
+                            backfit_coverage_spearman = BackfitDiagnostics.coverage_spearman;
+                            backfit_coverage_mae = BackfitDiagnostics.coverage_mae;
+                            backfit_coverage_rmse = BackfitDiagnostics.coverage_rmse;
+                            backfit_coverage_l1 = BackfitDiagnostics.coverage_l1;
+                            if CONFIG.save_backfit_details
+                                backfit_diagnostic_file = fullfile(backfit_dir, [subj_name '_backfit.mat']);
+                                backfit_payload = struct('BackfitDiagnostics', BackfitDiagnostics, ...
+                                    'method_str', method_str, ...
+                                    'criterion_str', criterion_str, ...
+                                    'K_selected', K_selected, ...
+                                    'subj_name', subj_name);
+                                save(backfit_diagnostic_file, '-fromstruct', backfit_payload, '-v7.3');
+                            end
+                        end
+                    end
                     sim_qc_status = 'NOT_RUN';
                     sim_qc_psd_slope = NaN;
                     sim_qc_mean_dwell_ms = NaN;
@@ -375,7 +457,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
                         'overlap_strength', Sim.overlap_strength, ...
                         'overlap_ms_min', Sim.overlap_ms_range(1), ...
                         'overlap_ms_max', Sim.overlap_ms_range(end), ...
-                        'montage_type', montage_type, ...
+                        'montage_type', montage_name, ...
                         'n_leads', fit_result.n_leads, ...
                         'sim_qc_status', sim_qc_status, ...
                         'sim_qc_psd_slope_2_40hz', sim_qc_psd_slope, ...
@@ -394,8 +476,19 @@ function T = simulated_ms_retrieval_experiment(varargin)
                         'recovery_01', recovery_corr(1), ...
                         'recovery_02', recovery_corr(2), ...
                         'recovery_03', recovery_corr(3), ...
-                        'best_score', Results.best_criterion_value, ...
-                        'runtime_s', Results.runtime);
+                        'selected_spm_cov_trace_mean', selected_cov_trace_mean, ...
+                        'selected_spm_cov_trace_median', selected_cov_trace_median, ...
+                        'selected_spm_cov_logdet_mean', selected_cov_logdet_mean, ...
+                        'selected_spm_feature_dim', selected_spm_feature_dim, ...
+                        'backfit_coverage_corr', backfit_coverage_corr, ...
+                        'backfit_coverage_spearman', backfit_coverage_spearman, ...
+                        'backfit_coverage_mae', backfit_coverage_mae, ...
+                        'backfit_coverage_rmse', backfit_coverage_rmse, ...
+                        'backfit_coverage_l1', backfit_coverage_l1, ...
+                        'backfit_diagnostic_file', backfit_diagnostic_file, ...
+                        'best_score', SelectedResults.best_criterion_value, ...
+                        'json_file', json_file, ...
+                        'runtime_s', SelectedResults.runtime);
                     
                     local_rows = [local_rows; result_row]; 
                     
@@ -411,7 +504,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
                             META.K_estimated = K_selected;
                             META.SNR_dB = fit_result.SNR_dB;
                             META.rep = fit_result.rep;
-                            META.montage_type = montage_type;
+                            META.montage_type = montage_name;
                             META.n_leads = fit_result.n_leads;
                             META.overlap_prob = Sim.overlap_prob;
                             META.overlap_ms_range = Sim.overlap_ms_range;
@@ -421,9 +514,10 @@ function T = simulated_ms_retrieval_experiment(varargin)
                             META.sim_qc_psd_slope_2_40hz = sim_qc_psd_slope;
                             META.sim_qc_gfp_median_uv = sim_qc_gfp_median_uv;
                             META.sim_qc_mean_dwell_ms = sim_qc_mean_dwell_ms;
-                            META.runtime_s = Results.runtime;
+                            META.runtime_s = SelectedResults.runtime;
                             META.channel_labels = Sim.channel_labels;  % Use Sim.channel_labels (montage-specific)
-                            save_microstate_json(Results, Sim, json_file, META);
+                            save_microstate_json(SelectedResults, Sim, json_file, META);
+                            local_rows(end).json_file = json_file;
                         catch ME
                             if CONFIG.verbose
                                 fprintf('⚠ Warning: Could not save JSON for %s: %s\n', subj_name, ME.message);
@@ -473,6 +567,10 @@ function T = simulated_ms_retrieval_experiment(varargin)
     criterion_summary_csv = fullfile(res_dir, 'k_selection_summary_by_method_criterion.csv');
     Tcrit = k_selection_summary_by_method_criterion(T);
     writetable(Tcrit, criterion_summary_csv);
+    if CONFIG.compute_backfit_diagnostics
+        if ~exist(confusion_dir, 'dir'), mkdir(confusion_dir); end
+        write_simulation_backfit_reports(T, confusion_dir);
+    end
     
     if CONFIG.verbose
         fprintf('✓ Saved: %s\n', summary_csv);
@@ -584,6 +682,39 @@ function K_selected = select_K_by_criterion(Results, criterion)
             
         otherwise
             K_selected = NaN;
+    end
+end
+
+function score = criterion_specific_best_score(Results, K_selected, criterion)
+    score = NaN;
+    idx = find(double(Results.K_candidates(:)) == double(K_selected), 1, 'first');
+    if isempty(idx)
+        if isfield(Results, 'best_criterion_value')
+            score = Results.best_criterion_value;
+        end
+        return;
+    end
+    switch criterion
+        case 'silhouette'
+            if isfield(Results, 'silhouette_vals') && numel(Results.silhouette_vals) >= idx
+                score = Results.silhouette_vals(idx);
+            end
+        case 'free_energy'
+            if isfield(Results, 'free_energy_vals') && numel(Results.free_energy_vals) >= idx
+                score = Results.free_energy_vals(idx);
+            end
+        case 'gev'
+            if isfield(Results, 'gev_vals') && numel(Results.gev_vals) >= idx
+                score = Results.gev_vals(idx);
+            end
+        case 'elbow'
+            if isfield(Results, 'within_ss') && numel(Results.within_ss) >= idx
+                score = Results.within_ss(idx);
+            end
+        otherwise
+            if isfield(Results, 'best_criterion_value')
+                score = Results.best_criterion_value;
+            end
     end
 end
 

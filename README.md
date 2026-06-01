@@ -2,6 +2,8 @@
 
 MATLAB tools for EEG microstate fitting, template alignment, meta-microstate dataset modelling, and simulation-based method comparison.
 
+We are using spm's micture toolbox to do microstate analysis. We compare this with traditional methods.
+
 The repository is organised around a small number of public entry points and a shared utility layer. Defaults for paths, preprocessing, hierarchical fitting, simulation, and plotting are kept in `config/microstate_config.json`.
 
 ## Main Workflows
@@ -50,6 +52,8 @@ Important keys:
 ## Experiment Scripts
 
 - `scripts/download_lemon_preprocessed.sh`: clone/download the OpenNeuro `ds000221` dataset via DataLad, materialise preprocessed EEG derivatives, and build a manifest CSV.
+- `scripts/run_weekend_pipeline.m`: unattended sequential runner for simulation, simulation analysis, real-data pipeline, and optional TANOVA.
+- `scripts/run_weekend_pipeline.sh`: batch launcher for `run_weekend_pipeline.m` with a single log file.
 - `scripts/build_lemon_manifest.py`: generate a LEMON manifest from a directory of `.set` files.
 - `scripts/run_part1_simulated_cluster.m`: extensive Part 1 simulation entry point for cluster runs.
 - `scripts/run_part2_lemon_cluster.m`: Part 2 LEMON pipeline entry point, with optional TANOVA.

@@ -64,6 +64,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     within_ss = zeros(nK, 1);
     gev_vals = zeros(nK, 1);
     vbmix = cell(nK, 1);
+    spm_mix_model_summaries = repmat(empty_spm_mix_summary(size(features, 2)), nK, 1);
     centers_all = cell(nK, 1);
     labels_all = cell(nK, 1);
     K_effective = K_candidates(:);
@@ -87,6 +88,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
             else
                 free_energy(iK) = result.fm;
                 vbmix{iK} = result;
+                spm_mix_model_summaries(iK) = summarise_spm_mix_result(result, K, size(features, 2), result.fm);
                 
                 labels = assign_samples(features, result);
                 
@@ -127,6 +129,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
             within_ss(iK) = Inf;
             gev_vals(iK) = 0;
             within_ss(iK) = Inf;
+            spm_mix_model_summaries(iK) = empty_spm_mix_summary(size(features, 2), K);
         end
     end
 
@@ -263,14 +266,21 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     'duration_s', duration_s_val, ...
     'n_maps', n_maps, ...
     'centers', centers, ...
+    'centers_by_K', {centers_all}, ...
     'cluster_weights', cluster_weights, ...  % ✅ Added confidence measure
     'maps_true', true_maps_norm, ...
     'labels', labels, ...
+    'labels_by_K', {labels_all}, ...
     'free_energy', free_energy, ...
     'silhouette_vals', silhouette_score, ...  
     'free_energy_vals', free_energy, ...      
     'within_ss', within_ss, ...            
     'gev_vals', gev_vals, ...             
+    'spm_mix_model_summaries', spm_mix_model_summaries, ...
+    'selected_spm_mix_model', spm_mix_model_summaries(best_idx), ...
+    'selected_spm_covariances', spm_mix_model_summaries(best_idx).covariances, ...
+    'selected_spm_means', spm_mix_model_summaries(best_idx).means, ...
+    'selected_spm_priors', spm_mix_model_summaries(best_idx).priors, ...
     'best_criterion_value', best_score, ...
     'maps_nc', maps_norm, ...
     'idx_peaks', idx_peaks, ...
@@ -285,6 +295,105 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     'avg_recovery_per_state', recovery_metrics.mean_recovery_padded, ...
     'valid_fit', true, ...
     'runtime', runtime);
+end
+
+function summary = summarise_spm_mix_result(result, K_candidate, feature_dim, free_energy_val)
+    if nargin < 4
+        free_energy_val = NaN;
+    end
+    summary = empty_spm_mix_summary(feature_dim, K_candidate);
+    summary.free_energy = double(real(free_energy_val));
+    if ~isstruct(result) || ~isfield(result, 'state') || isempty(result.state)
+        return;
+    end
+
+    n_components = numel(result.state);
+    summary.n_components = n_components;
+    summary.means = nan(n_components, feature_dim);
+    summary.priors = nan(n_components, 1);
+    summary.covariances = nan(feature_dim, feature_dim, n_components);
+    summary.covariance_traces = nan(n_components, 1);
+    summary.covariance_logdets = nan(n_components, 1);
+
+    for k = 1:n_components
+        if isfield(result.state(k), 'm') && ~isempty(result.state(k).m)
+            m = double(real(result.state(k).m(:)));
+            summary.means(k, 1:min(feature_dim, numel(m))) = m(1:min(feature_dim, numel(m)));
+        end
+        if isfield(result.state(k), 'C') && ~isempty(result.state(k).C)
+            C = coerce_covariance_matrix(result.state(k).C, feature_dim);
+            summary.covariances(:, :, k) = C;
+            summary.covariance_traces(k) = trace(C);
+            summary.covariance_logdets(k) = safe_logdet(C);
+        end
+        summary.priors(k) = extract_state_prior(result, k);
+    end
+end
+
+function summary = empty_spm_mix_summary(feature_dim, K_candidate)
+    if nargin < 2
+        K_candidate = NaN;
+    end
+    summary = struct( ...
+        'K_candidate', double(real(K_candidate)), ...
+        'feature_dim', double(real(feature_dim)), ...
+        'n_components', 0, ...
+        'free_energy', NaN, ...
+        'means', nan(0, feature_dim), ...
+        'priors', nan(0, 1), ...
+        'covariances', nan(feature_dim, feature_dim, 0), ...
+        'covariance_traces', nan(0, 1), ...
+        'covariance_logdets', nan(0, 1));
+end
+
+function C = coerce_covariance_matrix(C_in, feature_dim)
+    C = double(real(C_in));
+    if isscalar(C)
+        C = C * eye(feature_dim);
+    elseif isvector(C)
+        C = diag(C(1:min(feature_dim, numel(C))));
+    end
+    if size(C, 1) ~= feature_dim || size(C, 2) ~= feature_dim
+        n = min([size(C, 1), size(C, 2), feature_dim]);
+        C_fixed = nan(feature_dim, feature_dim);
+        C_fixed(1:n, 1:n) = C(1:n, 1:n);
+        C = C_fixed;
+    end
+end
+
+function prior = extract_state_prior(result, k)
+    prior = NaN;
+    if isfield(result.state(k), 'prior') && ~isempty(result.state(k).prior)
+        prior = double(real(result.state(k).prior));
+    elseif isfield(result, 'priors') && numel(result.priors) >= k && ~isempty(result.priors(k))
+        prior = double(real(result.priors(k)));
+    end
+end
+
+function val = safe_logdet(C)
+    val = NaN;
+    if isempty(C) || any(~isfinite(C(:)))
+        return;
+    end
+    C = (C + C') / 2;
+    try
+        rc = rcond(C);
+        if ~isfinite(rc) || rc <= eps
+            return;
+        end
+        u = chol(C);
+        val = 2 * sum(log(diag(u)));
+    catch
+        try
+            e = eig(C);
+            if any(~isfinite(e) | e <= eps)
+                return;
+            end
+            val = sum(log(e));
+        catch
+            val = NaN;
+        end
+    end
 end
 
 % ======================== K SELECTION HELPERS ========================
@@ -824,13 +933,20 @@ function Results = create_empty_results(Sim, K_candidates, n_maps, C_dims, crite
         'duration_s', duration_s_val, ...
         'n_maps', n_maps, ...
         'centers', nan(1, C_dims), ...
+        'centers_by_K', {cell(numel(K_candidates), 1)}, ...
         'maps_true', maps_true, ...
         'labels', ones(n_maps, 1), ...
+        'labels_by_K', {cell(numel(K_candidates), 1)}, ...
         'free_energy', -Inf(numel(K_candidates), 1), ...
         'free_energy_vals', -Inf(numel(K_candidates), 1), ...
         'silhouette_vals', -ones(numel(K_candidates), 1), ...
         'within_ss', Inf(numel(K_candidates), 1), ...
         'gev_vals', zeros(numel(K_candidates), 1), ...
+        'spm_mix_model_summaries', repmat(empty_spm_mix_summary(C_dims), numel(K_candidates), 1), ...
+        'selected_spm_mix_model', empty_spm_mix_summary(C_dims), ...
+        'selected_spm_covariances', nan(C_dims, C_dims, 0), ...
+        'selected_spm_means', nan(0, C_dims), ...
+        'selected_spm_priors', nan(0, 1), ...
         'pca_info', struct(), ...
         'polarity_feature_info', struct(), ...
         'polarity_duplicate_info', {cell(numel(K_candidates), 1)}, ...

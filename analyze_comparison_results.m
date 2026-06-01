@@ -230,6 +230,11 @@ function analyze_comparison_results(varargin)
         end
     end
 
+    vb_covariance_outcomes = {'f1_score', 'sensitivity', 'precision'};
+    vb_covariance_labels = {'F1 Score', 'Sensitivity', 'Precision'};
+    fprintf('8) VB covariance relationships\n');
+    vb_covariance_results = analyze_vb_covariance_relationships(T, vb_covariance_outcomes, vb_covariance_labels, fid);
+
     fclose(fid);
     fprintf('Analysis saved to %s and plots under %s\n', stats_file, plots_dir);
 
@@ -248,9 +253,12 @@ function analyze_comparison_results(varargin)
     
     create_avg_k_error_plot(T, plots_dir);
     create_abs_k_error_plot(T, plots_dir);
+    create_backfit_confusion_comparison_plots(T, results_dir, plots_dir);
     
     % Method-Criterion comparison boxplots with significance
     create_method_criterion_boxplots(T, plots_dir);
+    create_vb_covariance_relationship_plots(T, vb_covariance_outcomes, vb_covariance_labels, vb_covariance_results, plots_dir);
+    create_vb_covariance_kcorrect_barplots(vb_covariance_results, plots_dir);
 
     % ---------- Montage-Criterion Comparison (if montage data available) ----------
     montages = unique(T.montage_type);
@@ -578,6 +586,228 @@ function analyze_lmm_bootstrap(T, outcome_var, n_boot, fid)
     fprintf(fid, 'Successful bootstrap fits: %d / %d\n\n', n_success, n_boot);
     fprintf('    LMM bootstrap %s done. Successful fits: %d/%d. Elapsed %.1fs\n', outcome_var, n_success, n_boot, toc(t_start));
 end
+
+function results = analyze_vb_covariance_relationships(T, outcomes, outcome_labels, fid)
+    global ANALYSIS_CONFIG;
+    results = struct();
+    cov_specs = get_available_covariance_specs(T);
+    if isempty(cov_specs)
+        fprintf(fid, '\n========================================\n');
+        fprintf(fid, 'VB Covariance Relationships\n');
+        fprintf(fid, 'Skipped: no covariance summary columns found in comparison_results.csv\n');
+        fprintf(fid, 'Expected one or more of: selected_spm_cov_trace_mean, selected_spm_cov_trace_median, selected_spm_cov_logdet_mean\n');
+        fprintf(fid, '========================================\n\n');
+        return;
+    end
+
+    vb_mask = is_vb_method(T.method);
+    T_vb = T(vb_mask, :);
+    if height(T_vb) == 0
+        fprintf(fid, '\n========================================\n');
+        fprintf(fid, 'VB Covariance Relationships\n');
+        fprintf(fid, 'Skipped: no VB rows found in method column.\n');
+        fprintf(fid, '========================================\n\n');
+        return;
+    end
+
+    n_boot = ANALYSIS_CONFIG.n_boot;
+    results.covariates = cov_specs;
+    results.n_rows_vb = height(T_vb);
+    results.outcomes = outcomes;
+    results.outcome_labels = outcome_labels;
+
+    fprintf(fid, '\n========================================\n');
+    fprintf(fid, 'VB Covariance Relationships\n');
+    fprintf(fid, 'Method subset: VB only\n');
+    fprintf(fid, 'Rows in VB subset: %d\n', height(T_vb));
+    fprintf(fid, 'Bootstrap iterations for correlation CI: %d\n', n_boot);
+    fprintf(fid, '========================================\n\n');
+
+    for i = 1:numel(cov_specs)
+        spec = cov_specs(i);
+        covariance_vals = coerce_numeric_column(T_vb.(spec.name));
+        metric_result = struct();
+        metric_result.name = spec.name;
+        metric_result.label = spec.label;
+        metric_result.n_nonmissing = sum(~isnan(covariance_vals));
+        fprintf(fid, 'Covariance summary: %s (%s)\n', spec.label, spec.name);
+        fprintf(fid, '  Non-missing VB rows: %d / %d\n', metric_result.n_nonmissing, height(T_vb));
+
+        for j = 1:numel(outcomes)
+            outcome = outcomes{j};
+            outcome_vals = coerce_numeric_column(T_vb.(outcome));
+            valid_mask = ~isnan(covariance_vals) & ~isnan(outcome_vals);
+            xv = outcome_vals(valid_mask);
+            yv = covariance_vals(valid_mask);
+
+            outcome_result = struct( ...
+                'label', outcome_labels{j}, ...
+                'n', numel(xv), ...
+                'spearman_rho', NaN, ...
+                'spearman_p', NaN, ...
+                'ci_lower', NaN, ...
+                'ci_upper', NaN, ...
+                'pearson_r', NaN, ...
+                'pearson_p', NaN, ...
+                'slope', NaN, ...
+                'intercept', NaN);
+
+            if numel(xv) >= 3 && numel(unique(xv)) > 1 && numel(unique(yv)) > 1
+                [rho_s, p_s] = corr(xv, yv, 'Type', 'Spearman', 'Rows', 'complete');
+                [rho_p, p_p] = corr(xv, yv, 'Type', 'Pearson', 'Rows', 'complete');
+                pfit = polyfit(xv, yv, 1);
+                boot_rho = nan(n_boot, 1);
+                for b = 1:n_boot
+                    idx = randi(numel(xv), numel(xv), 1);
+                    xb = xv(idx);
+                    yb = yv(idx);
+                    if numel(unique(xb)) > 1 && numel(unique(yb)) > 1
+                        boot_rho(b) = corr(xb, yb, 'Type', 'Spearman', 'Rows', 'complete');
+                    end
+                end
+                outcome_result.spearman_rho = rho_s;
+                outcome_result.spearman_p = p_s;
+                outcome_result.ci_lower = prctile(boot_rho, 2.5);
+                outcome_result.ci_upper = prctile(boot_rho, 97.5);
+                outcome_result.pearson_r = rho_p;
+                outcome_result.pearson_p = p_p;
+                outcome_result.slope = pfit(1);
+                outcome_result.intercept = pfit(2);
+            end
+
+            metric_result.(outcome) = outcome_result;
+            fprintf(fid, '  %-24s n=%4d  Spearman rho=%7.4f [%7.4f, %7.4f] p=%8.4g  Pearson r=%7.4f p=%8.4g\n', ...
+                outcome, outcome_result.n, outcome_result.spearman_rho, outcome_result.ci_lower, ...
+                outcome_result.ci_upper, outcome_result.spearman_p, outcome_result.pearson_r, outcome_result.pearson_p);
+        end
+
+        metric_result.k_correct_groups = compute_vb_covariance_kcorrect_groups(T_vb, covariance_vals, ANALYSIS_CONFIG.n_boot);
+        group_stats = metric_result.k_correct_groups;
+        fprintf(fid, '  K-correct grouping:\n');
+        fprintf(fid, '    K correct     n=%4d  mean=%9.4f [%9.4f, %9.4f]\n', ...
+            group_stats.n_correct, group_stats.mean_correct, group_stats.ci_correct(1), group_stats.ci_correct(2));
+        fprintf(fid, '    K incorrect   n=%4d  mean=%9.4f [%9.4f, %9.4f]\n', ...
+            group_stats.n_incorrect, group_stats.mean_incorrect, group_stats.ci_incorrect(1), group_stats.ci_incorrect(2));
+        fprintf(fid, '    Mean diff (correct - incorrect) = %9.4f [%9.4f, %9.4f]\n', ...
+            group_stats.mean_difference, group_stats.ci_difference(1), group_stats.ci_difference(2));
+        fprintf(fid, '\n');
+        results.(spec.name) = metric_result;
+    end
+end
+
+function group_stats = compute_vb_covariance_kcorrect_groups(T_vb, covariance_vals, n_boot)
+    if ~ismember('K_correct', T_vb.Properties.VariableNames)
+        group_stats = default_kcorrect_group_stats();
+        return;
+    end
+
+    k_correct_vals = coerce_numeric_column(T_vb.K_correct);
+    correct_mask = ~isnan(covariance_vals) & (k_correct_vals >= 0.5);
+    incorrect_mask = ~isnan(covariance_vals) & (k_correct_vals < 0.5);
+    correct_vals = covariance_vals(correct_mask);
+    incorrect_vals = covariance_vals(incorrect_mask);
+
+    group_stats = default_kcorrect_group_stats();
+    group_stats.n_correct = numel(correct_vals);
+    group_stats.n_incorrect = numel(incorrect_vals);
+    group_stats.mean_correct = mean(correct_vals, 'omitnan');
+    group_stats.mean_incorrect = mean(incorrect_vals, 'omitnan');
+    group_stats.ci_correct = bootstrap_mean_ci(correct_vals, n_boot);
+    group_stats.ci_incorrect = bootstrap_mean_ci(incorrect_vals, n_boot);
+
+    if ~isempty(correct_vals) && ~isempty(incorrect_vals)
+        group_stats.mean_difference = group_stats.mean_correct - group_stats.mean_incorrect;
+        boot_diff = nan(n_boot, 1);
+        for b = 1:n_boot
+            sample_correct = datasample(correct_vals, numel(correct_vals));
+            sample_incorrect = datasample(incorrect_vals, numel(incorrect_vals));
+            boot_diff(b) = mean(sample_correct, 'omitnan') - mean(sample_incorrect, 'omitnan');
+        end
+        group_stats.ci_difference = [prctile(boot_diff, 2.5), prctile(boot_diff, 97.5)];
+    end
+end
+
+function group_stats = default_kcorrect_group_stats()
+    group_stats = struct( ...
+        'n_correct', 0, ...
+        'n_incorrect', 0, ...
+        'mean_correct', NaN, ...
+        'mean_incorrect', NaN, ...
+        'ci_correct', [NaN NaN], ...
+        'ci_incorrect', [NaN NaN], ...
+        'mean_difference', NaN, ...
+        'ci_difference', [NaN NaN]);
+end
+
+function ci = bootstrap_mean_ci(values, n_boot)
+    if isempty(values)
+        ci = [NaN NaN];
+        return;
+    end
+
+    boot_means = nan(n_boot, 1);
+    for b = 1:n_boot
+        sample = datasample(values, numel(values));
+        boot_means(b) = mean(sample, 'omitnan');
+    end
+    ci = [prctile(boot_means, 2.5), prctile(boot_means, 97.5)];
+end
+
+function cov_specs = get_available_covariance_specs(T)
+    candidates = { ...
+        'selected_spm_cov_trace_mean', 'Mean covariance trace'; ...
+        'selected_spm_cov_trace_median', 'Median covariance trace'; ...
+        'selected_spm_cov_logdet_mean', 'Mean covariance logdet'};
+    cov_specs = struct('name', {}, 'label', {});
+    for i = 1:size(candidates, 1)
+        if ismember(candidates{i,1}, T.Properties.VariableNames)
+            cov_specs(end+1) = struct('name', candidates{i,1}, 'label', candidates{i,2}); %#ok<AGROW>
+        end
+    end
+end
+
+function values = coerce_numeric_column(col)
+    if isnumeric(col)
+        values = double(col);
+        return;
+    end
+    if islogical(col)
+        values = double(col);
+        return;
+    end
+    if iscell(col)
+        values = nan(numel(col), 1);
+        for i = 1:numel(col)
+            value = col{i};
+            if isnumeric(value) && isscalar(value)
+                values(i) = double(value);
+            elseif islogical(value) && isscalar(value)
+                values(i) = double(value);
+            elseif isstring(value) || ischar(value)
+                parsed = str2double(string(value));
+                if ~isnan(parsed)
+                    values(i) = parsed;
+                end
+            end
+        end
+        return;
+    end
+    if iscategorical(col) || isstring(col) || ischar(col)
+        values = str2double(string(col));
+        return;
+    end
+    try
+        values = double(col);
+    catch
+        values = nan(numel(col), 1);
+    end
+end
+
+function mask = is_vb_method(method_col)
+    method_vals = lower(strtrim(cellstr(string(method_col))));
+    mask = contains(method_vals, 'vb');
+end
+
 function [nrows, ncols] = choose_subplot_grid(n)
     if n <= 3, nrows = 1; ncols = n;
     elseif n == 4, nrows = 2; ncols = 2;
@@ -654,7 +884,7 @@ function create_method_effects_plot_with_ci(T, outcomes, outcome_labels, method_
         hold on;
         errlow = means - cil; errhigh = cih - means;
         errorbar(1:numel(methods), means, errlow, errhigh, 'k.','LineWidth', 2, 'CapSize', 8);
-        set(gca,'XTick',1:numel(methods),'XTickLabel',cellfun(@(s)strrep(s,'_',' '),methods,'UniformOutput',false),'XTickLabelRotation',45);
+        set(gca,'XTick',1:numel(methods),'XTickLabel',cellfun(@display_method_label,methods,'UniformOutput',false),'XTickLabelRotation',45);
         set(gca, 'Color', 'white', 'XColor', 'black', 'YColor', 'black');
         ylabel(outcome_labels{i}, 'FontSize', 11, 'FontWeight', 'bold'); 
         title(outcome_labels{i}, 'FontSize', 11); 
@@ -726,7 +956,7 @@ function create_snr_effects_plot(T, outcomes, outcome_labels, plots_dir)
                 if ~isempty(data), means(s) = mean(data,'omitnan'); end
             end
             plot(snr_vals, means,'-o','Color',colors(m,:),'LineWidth', 2.5, 'MarkerSize', 8, ...
-                 'DisplayName',strrep(mname,'_',' '));
+                 'DisplayName',display_method_label(mname));
         end
         set(gca, 'Color', 'white', 'XColor', 'black', 'YColor', 'black');
         xlabel('SNR (dB)', 'FontSize', 11, 'FontWeight', 'bold'); 
@@ -763,7 +993,7 @@ function create_interaction_plot(T, outcomes, outcome_labels, plots_dir)
         hold on;
         for m = 1:numel(methods)
             plot(1:numel(clean_levels), tablevals(m,:), 'o-','Color',colors(m,:),'LineWidth', 2.5, ...
-                 'MarkerSize', 8, 'DisplayName',strrep(methods{m},'_',' '));
+                 'MarkerSize', 8, 'DisplayName',display_method_label(methods{m}));
         end
         set(gca,'XTick',1:numel(clean_levels),'XTickLabel',clean_levels,'XTickLabelRotation',45);
         set(gca, 'Color', 'white', 'XColor', 'black', 'YColor', 'black');
@@ -806,6 +1036,531 @@ function create_cross_validation_plot(cv_results, outcomes, outcome_labels, plot
     end
     sgtitle('Cross-validation Results', 'FontSize', 13, 'FontWeight', 'bold');
     saveas(fig, fullfile(plots_dir,'cross_validation.png'));
+    close(fig);
+end
+
+function create_vb_covariance_relationship_plots(T, outcomes, outcome_labels, vb_covariance_results, plots_dir)
+    if isempty(fieldnames(vb_covariance_results)) || ~isfield(vb_covariance_results, 'covariates')
+        return;
+    end
+
+    vb_mask = is_vb_method(T.method);
+    T_vb = T(vb_mask, :);
+    if height(T_vb) == 0
+        return;
+    end
+
+    cov_specs = vb_covariance_results.covariates;
+    [nrows, ncols] = choose_subplot_grid(numel(outcomes));
+
+    for i = 1:numel(cov_specs)
+        spec = cov_specs(i);
+        covariance_vals = coerce_numeric_column(T_vb.(spec.name));
+        fig = figure('Visible', 'off', 'Position', [100 100 1500 950], 'Color', 'white');
+
+        for j = 1:numel(outcomes)
+            outcome = outcomes{j};
+            subplot(nrows, ncols, j);
+            outcome_vals = coerce_numeric_column(T_vb.(outcome));
+            valid_mask = ~isnan(covariance_vals) & ~isnan(outcome_vals);
+            xv = outcome_vals(valid_mask);
+            yv = covariance_vals(valid_mask);
+
+            if numel(xv) < 3
+                text(0.5, 0.5, 'Insufficient data', 'HorizontalAlignment', 'center', 'FontSize', 12);
+                axis off;
+                title(outcome_labels{j}, 'FontSize', 11);
+                continue;
+            end
+
+            if ismember('SNR_dB', T_vb.Properties.VariableNames)
+                snr_vals = coerce_numeric_column(T_vb.SNR_dB);
+                sv = snr_vals(valid_mask);
+                scatter(xv, yv, 36, sv, 'filled', 'MarkerFaceAlpha', 0.7, 'MarkerEdgeColor', [0.15 0.15 0.15]);
+                cb = colorbar;
+                ylabel(cb, 'SNR (dB)', 'FontSize', 9);
+            else
+                scatter(xv, yv, 36, [0.2 0.45 0.7], 'filled', 'MarkerFaceAlpha', 0.7, 'MarkerEdgeColor', [0.15 0.15 0.15]);
+            end
+            hold on;
+
+            if numel(unique(xv)) > 1
+                xfit = linspace(min(xv), max(xv), 100);
+                stats = vb_covariance_results.(spec.name).(outcome);
+                yfit = stats.slope * xfit + stats.intercept;
+                plot(xfit, yfit, '-', 'Color', [0.85 0.2 0.2], 'LineWidth', 2);
+                title(sprintf('%s\\n\\rho_s=%.2f, p=%.3g', outcome_labels{j}, stats.spearman_rho, stats.spearman_p), 'FontSize', 11);
+            else
+                title(outcome_labels{j}, 'FontSize', 11);
+            end
+
+            xlabel(outcome_labels{j}, 'FontSize', 10, 'FontWeight', 'bold');
+            ylabel(spec.label, 'FontSize', 10, 'FontWeight', 'bold');
+            grid on;
+            set(gca, 'Color', 'white', 'XColor', 'black', 'YColor', 'black');
+            set(gca, 'GridColor', [0.85 0.85 0.85], 'GridAlpha', 0.5);
+        end
+
+        sgtitle(sprintf('VB covariance relationships: %s', spec.label), 'FontSize', 13, 'FontWeight', 'bold');
+        saveas(fig, fullfile(plots_dir, sprintf('vb_covariance_relationships_%s.png', spec.name)));
+        close(fig);
+    end
+end
+
+function create_vb_covariance_kcorrect_barplots(vb_covariance_results, plots_dir)
+    if isempty(fieldnames(vb_covariance_results)) || ~isfield(vb_covariance_results, 'covariates')
+        return;
+    end
+
+    cov_specs = vb_covariance_results.covariates;
+    [nrows, ncols] = choose_subplot_grid(numel(cov_specs));
+    fig = figure('Visible', 'off', 'Position', [120 120 1400 800], 'Color', 'white');
+    group_labels = {'K correct', 'K incorrect'};
+    face_colors = [0.25 0.55 0.85; 0.85 0.35 0.35];
+
+    for i = 1:numel(cov_specs)
+        spec = cov_specs(i);
+        subplot(nrows, ncols, i);
+        stats = vb_covariance_results.(spec.name).k_correct_groups;
+        means = [stats.mean_correct, stats.mean_incorrect];
+        ci_low = [stats.ci_correct(1), stats.ci_incorrect(1)];
+        ci_high = [stats.ci_correct(2), stats.ci_incorrect(2)];
+        err_low = means - ci_low;
+        err_high = ci_high - means;
+
+        b = bar(1:2, means, 'FaceColor', 'flat', 'EdgeColor', 'black', 'LineWidth', 1.5);
+        b.CData = face_colors;
+        hold on;
+        errorbar(1:2, means, err_low, err_high, 'k.', 'LineWidth', 1.8, 'CapSize', 10);
+
+        ylim_vals = [ci_low, ci_high];
+        ylim_vals = ylim_vals(~isnan(ylim_vals));
+        if ~isempty(ylim_vals)
+            span = max(ylim_vals) - min(ylim_vals);
+            if span <= 0
+                span = max(1, abs(max(ylim_vals)) * 0.1);
+            end
+            ylim([min(ylim_vals) - 0.15 * span, max(ylim_vals) + 0.2 * span]);
+        end
+
+        set(gca, 'XTick', 1:2, 'XTickLabel', group_labels, 'XTickLabelRotation', 20);
+        ylabel(spec.label, 'FontSize', 10, 'FontWeight', 'bold');
+        title(sprintf('%s\\nDelta=%.3f [%0.3f, %0.3f]', ...
+            spec.label, stats.mean_difference, stats.ci_difference(1), stats.ci_difference(2)), 'FontSize', 11);
+        text(1, means(1), sprintf(' n=%d', stats.n_correct), 'VerticalAlignment', 'bottom', 'HorizontalAlignment', 'center', 'FontSize', 9);
+        text(2, means(2), sprintf(' n=%d', stats.n_incorrect), 'VerticalAlignment', 'bottom', 'HorizontalAlignment', 'center', 'FontSize', 9);
+        grid on;
+        set(gca, 'Color', 'white', 'XColor', 'black', 'YColor', 'black');
+        set(gca, 'GridColor', [0.85 0.85 0.85], 'GridAlpha', 0.5);
+    end
+
+    sgtitle('VB covariance by K selection accuracy', 'FontSize', 13, 'FontWeight', 'bold');
+    saveas(fig, fullfile(plots_dir, 'vb_covariance_by_k_correct.png'));
+    close(fig);
+end
+
+function create_backfit_confusion_comparison_plots(T, results_dir, plots_dir)
+    if ~istable(T) || height(T) == 0 || ~ismember('backfit_diagnostic_file', T.Properties.VariableNames)
+        return;
+    end
+
+    file_vals = cellstr(string(T.backfit_diagnostic_file));
+    valid_file = ~cellfun(@isempty, file_vals) & cellfun(@isfile, file_vals);
+    if ~any(valid_file)
+        return;
+    end
+
+    underfit_mask = false(height(T), 1);
+    if ismember('K_true', T.Properties.VariableNames) && ismember('K_estimated', T.Properties.VariableNames)
+        underfit_mask = double(T.K_true) > double(T.K_estimated);
+    end
+
+    method_vals = lower(strtrim(cellstr(string(T.method))));
+    kmeans_mask = contains(method_vals, 'kmeans') & ~contains(method_vals, 'spm');
+    vb_mask = contains(method_vals, 'vb');
+    keep_mask = valid_file & underfit_mask & (kmeans_mask | vb_mask);
+    if ~any(keep_mask)
+        return;
+    end
+
+    T_plot = T(keep_mask, :);
+    util = microstate_utilities();
+    cfg = util.load_config();
+    template_file = '';
+    if isfield(cfg, 'paths') && isfield(cfg.paths, 'template_file')
+        template_file = util.resolve_path(char(cfg.paths.template_file), util.project_root());
+    end
+
+    template_maps = [];
+    template_labels = {};
+    template_chanlocs = [];
+    try
+        if ~isempty(template_file) && isfile(template_file)
+            [template_maps, template_labels, ~, template_chanlocs] = load_metamaps_templates(template_file, 'K', 7);
+        end
+    catch ME
+        warning('Could not load canonical template topographies for confusion plots: %s', ME.message);
+    end
+
+    output_dir = fullfile(plots_dir, 'backfit_confusion_comparisons');
+    if ~exist(output_dir, 'dir')
+        mkdir(output_dir);
+    end
+
+    group_keys = strcat( ...
+        string(T_plot.criterion_clean), "|", ...
+        string(T_plot.K_true), "|", ...
+        string(T_plot.K_estimated));
+    [unique_keys, ~, key_idx] = unique(group_keys, 'stable');
+
+    manifest_rows = cell(numel(unique_keys), 1);
+    row_count = 0;
+    for g = 1:numel(unique_keys)
+        group_rows = T_plot(key_idx == g, :);
+        if height(group_rows) == 0
+            continue;
+        end
+
+        group_methods = lower(strtrim(cellstr(string(group_rows.method))));
+        rows_kmeans = group_rows(contains(group_methods, 'kmeans') & ~contains(group_methods, 'spm'), :);
+        rows_vb = group_rows(contains(group_methods, 'vb'), :);
+        if height(rows_kmeans) == 0 && height(rows_vb) == 0
+            continue;
+        end
+
+        [counts_kmeans, labels_kmeans, n_runs_kmeans] = aggregate_backfit_confusions(rows_kmeans.backfit_diagnostic_file);
+        [counts_vb, labels_vb, n_runs_vb] = aggregate_backfit_confusions(rows_vb.backfit_diagnostic_file);
+        if isempty(counts_kmeans) && isempty(counts_vb)
+            continue;
+        end
+
+        label_order = canonical_confusion_label_order(template_labels, labels_kmeans, labels_vb);
+        if ~isempty(counts_kmeans)
+            counts_kmeans = reorder_confusion_matrix(counts_kmeans, labels_kmeans, label_order);
+            rownorm_kmeans = normalize_confusion_rows(counts_kmeans);
+        else
+            rownorm_kmeans = [];
+        end
+        if ~isempty(counts_vb)
+            counts_vb = reorder_confusion_matrix(counts_vb, labels_vb, label_order);
+            rownorm_vb = normalize_confusion_rows(counts_vb);
+        else
+            rownorm_vb = [];
+        end
+
+        criterion = char(string(group_rows.criterion_clean(1)));
+        K_true = double(group_rows.K_true(1));
+        K_estimated = double(group_rows.K_estimated(1));
+        file_stub = sprintf('confusion_compare__%s__Ktrue%d__Kest%d', ...
+            sanitize_stub(criterion), K_true, K_estimated);
+        output_file = fullfile(output_dir, [file_stub '.png']);
+
+        create_method_confusion_pair_plot( ...
+            rownorm_kmeans, rownorm_vb, counts_kmeans, counts_vb, label_order, ...
+            template_maps, template_labels, template_chanlocs, ...
+            output_file, criterion, K_true, K_estimated, n_runs_kmeans, n_runs_vb);
+
+        row_count = row_count + 1;
+        manifest_rows{row_count} = table( ...
+            string(criterion), K_true, K_estimated, K_true - K_estimated, ...
+            n_runs_kmeans, n_runs_vb, string(output_file), ...
+            'VariableNames', {'criterion', 'K_true', 'K_estimated', 'K_gap', ...
+            'n_runs_kmeans', 'n_runs_vb', 'comparison_plot'});
+    end
+
+    manifest_rows = manifest_rows(1:row_count);
+    if row_count > 0
+        manifest = vertcat(manifest_rows{:});
+        writetable(manifest, fullfile(output_dir, 'backfit_confusion_comparison_manifest.csv'));
+    end
+end
+
+function [counts_total, labels, n_runs] = aggregate_backfit_confusions(files)
+    counts_total = [];
+    labels = {};
+    n_runs = 0;
+    if isempty(files)
+        return;
+    end
+
+    file_list = cellstr(string(files));
+    for i = 1:numel(file_list)
+        file_i = char(string(file_list{i}));
+        if isempty(file_i) || ~isfile(file_i)
+            continue;
+        end
+        S = load(file_i, 'BackfitDiagnostics');
+        if ~isfield(S, 'BackfitDiagnostics') || ~isfield(S.BackfitDiagnostics, 'ok') || ~S.BackfitDiagnostics.ok
+            continue;
+        end
+        diag_i = S.BackfitDiagnostics;
+        labels_i = cellstr(string(diag_i.template_labels(:)));
+        counts_i = double(diag_i.confusion_counts);
+        if isempty(counts_total)
+            labels = labels_i;
+            counts_total = counts_i;
+        else
+            [labels, counts_total] = merge_confusion_matrices(labels, counts_total, labels_i, counts_i);
+        end
+        n_runs = n_runs + 1;
+    end
+end
+
+function [labels_out, values_out] = merge_confusion_matrices(labels_a, values_a, labels_b, values_b)
+    labels_out = canonical_confusion_label_order({}, labels_a, labels_b);
+    values_out = zeros(numel(labels_out), numel(labels_out));
+    values_out = values_out + reorder_confusion_matrix(values_a, labels_a, labels_out);
+    values_out = values_out + reorder_confusion_matrix(values_b, labels_b, labels_out);
+end
+
+function label_order = canonical_confusion_label_order(template_labels, labels_a, labels_b)
+    label_order = {};
+    if ~isempty(template_labels)
+        label_order = cellstr(string(template_labels(:)));
+    end
+    extras = [cellstr(string(labels_a(:))); cellstr(string(labels_b(:)))];
+    for i = 1:numel(extras)
+        if ~any(strcmp(label_order, extras{i}))
+            label_order{end+1, 1} = extras{i}; %#ok<AGROW>
+        end
+    end
+    label_order = label_order(:);
+end
+
+function values_out = reorder_confusion_matrix(values_in, labels_in, label_order)
+    n = numel(label_order);
+    values_out = zeros(n, n);
+    if isempty(values_in) || isempty(labels_in)
+        return;
+    end
+
+    label_in = cellstr(string(labels_in(:)));
+    for r = 1:n
+        src_r = find(strcmp(label_in, label_order{r}), 1, 'first');
+        if isempty(src_r)
+            continue;
+        end
+        for c = 1:n
+            src_c = find(strcmp(label_in, label_order{c}), 1, 'first');
+            if isempty(src_c)
+                continue;
+            end
+            values_out(r, c) = values_in(src_r, src_c);
+        end
+    end
+end
+
+function rownorm = normalize_confusion_rows(values)
+    rownorm = values;
+    if isempty(values)
+        return;
+    end
+    for r = 1:size(values, 1)
+        row = values(r, :);
+        finite_mask = isfinite(row);
+        if ~any(finite_mask)
+            continue;
+        end
+        row_sum = sum(row(finite_mask));
+        if row_sum > 0
+            rownorm(r, finite_mask) = row(finite_mask) ./ row_sum;
+        end
+    end
+end
+
+function create_method_confusion_pair_plot( ...
+        rownorm_kmeans, rownorm_vb, counts_kmeans, counts_vb, label_order, ...
+        template_maps, template_labels, template_chanlocs, ...
+        output_file, criterion, K_true, K_estimated, n_runs_kmeans, n_runs_vb)
+    n_labels = numel(label_order);
+    fig = figure('Visible', 'off', 'Position', [60 60 1820 980], 'Color', 'white');
+    sgtitle(sprintf('Microstate misrecognition | %s | K_{true}=%d, K_{est}=%d', ...
+        strrep(criterion, '_', ' '), K_true, K_estimated), 'FontSize', 16, 'FontWeight', 'bold', 'Interpreter', 'tex');
+
+    x_row = 0.03;
+    w_row = 0.12;
+    gap = 0.02;
+    x_left = x_row + w_row + gap;
+    w_heat = 0.29;
+    x_right = x_left + w_heat + 0.12;
+    y_heat = 0.16;
+    h_heat = 0.58;
+    y_top = y_heat + h_heat + 0.035;
+    h_top = 0.11;
+    clim = [0 1];
+
+    left_title = sprintf('kmeans (n=%d)', n_runs_kmeans);
+    right_title = sprintf('VB (n=%d)', n_runs_vb);
+    annotation(fig, 'textbox', [x_left, y_top + h_top + 0.01, w_heat, 0.03], 'String', left_title, ...
+        'EdgeColor', 'none', 'HorizontalAlignment', 'center', 'FontSize', 13, 'FontWeight', 'bold');
+    annotation(fig, 'textbox', [x_right, y_top + h_top + 0.01, w_heat, 0.03], 'String', right_title, ...
+        'EdgeColor', 'none', 'HorizontalAlignment', 'center', 'FontSize', 13, 'FontWeight', 'bold');
+
+    for i = 1:n_labels
+        y_ax = y_heat + (n_labels - i) * (h_heat / n_labels);
+        ax_row = axes('Parent', fig, 'Position', [x_row, y_ax, w_row, h_heat / n_labels]);
+        render_template_topography(ax_row, label_order{i}, template_maps, template_labels, template_chanlocs);
+    end
+
+    for i = 1:n_labels
+        x_left_ax = x_left + (i - 1) * (w_heat / n_labels);
+        ax_top_left = axes('Parent', fig, 'Position', [x_left_ax, y_top, w_heat / n_labels, h_top]);
+        render_template_topography(ax_top_left, label_order{i}, template_maps, template_labels, template_chanlocs);
+
+        x_right_ax = x_right + (i - 1) * (w_heat / n_labels);
+        ax_top_right = axes('Parent', fig, 'Position', [x_right_ax, y_top, w_heat / n_labels, h_top]);
+        render_template_topography(ax_top_right, label_order{i}, template_maps, template_labels, template_chanlocs);
+    end
+
+    ax_left = axes('Parent', fig, 'Position', [x_left, y_heat, w_heat, h_heat]);
+    render_confusion_heatmap(ax_left, rownorm_kmeans, label_order, counts_kmeans, clim);
+    ax_right = axes('Parent', fig, 'Position', [x_right, y_heat, w_heat, h_heat]);
+    render_confusion_heatmap(ax_right, rownorm_vb, label_order, counts_vb, clim);
+
+    annotation(fig, 'textbox', [x_row, y_heat + h_heat + 0.005, w_row, 0.028], 'String', 'True label', ...
+        'EdgeColor', 'none', 'HorizontalAlignment', 'center', 'FontSize', 11, 'FontWeight', 'bold');
+    annotation(fig, 'textbox', [x_left, y_heat - 0.07, w_heat, 0.03], 'String', 'Estimated label', ...
+        'EdgeColor', 'none', 'HorizontalAlignment', 'center', 'FontSize', 11, 'FontWeight', 'bold');
+    annotation(fig, 'textbox', [x_right, y_heat - 0.07, w_heat, 0.03], 'String', 'Estimated label', ...
+        'EdgeColor', 'none', 'HorizontalAlignment', 'center', 'FontSize', 11, 'FontWeight', 'bold');
+
+    cb = colorbar(ax_right, 'eastoutside');
+    cb.Position = [0.92 0.22 0.015 0.46];
+    ylabel(cb, 'Row-normalized confusion', 'FontSize', 10);
+    saveas(fig, output_file);
+    close(fig);
+end
+
+function render_confusion_heatmap(ax, values, label_order, counts, clim)
+    axes(ax);
+    if isempty(values) || all(~isfinite(values), 'all')
+        text(0.5, 0.5, 'No data', 'HorizontalAlignment', 'center', 'FontSize', 14, 'FontWeight', 'bold');
+        axis(ax, 'off');
+        return;
+    end
+
+    imagesc(ax, values, clim);
+    axis(ax, 'square');
+    colormap(ax, parula(256));
+    set(ax, 'XTick', 1:numel(label_order), 'XTickLabel', repmat({''}, 1, numel(label_order)), ...
+        'YTick', 1:numel(label_order), 'YTickLabel', repmat({''}, 1, numel(label_order)), ...
+        'Color', 'white', 'XColor', 'black', 'YColor', 'black');
+    grid(ax, 'on');
+    ax.GridColor = [1 1 1];
+    ax.GridAlpha = 0.4;
+    ax.LineWidth = 1;
+    ax.XTick = 1:numel(label_order);
+    ax.YTick = 1:numel(label_order);
+    ax.XMinorTick = 'off';
+    ax.YMinorTick = 'off';
+
+    if isempty(counts)
+        counts = nan(size(values));
+    end
+    for r = 1:size(values, 1)
+        for c = 1:size(values, 2)
+            v = values(r, c);
+            if ~isfinite(v)
+                continue;
+            end
+            text_color = [0 0 0];
+            if v >= 0.6
+                text_color = [1 1 1];
+            end
+            if r <= size(counts, 1) && c <= size(counts, 2) && isfinite(counts(r, c))
+                cell_txt = sprintf('%.2f\n(n=%.0f)', v, counts(r, c));
+            else
+                cell_txt = sprintf('%.2f', v);
+            end
+            text(ax, c, r, cell_txt, 'HorizontalAlignment', 'center', 'Color', text_color, ...
+                'FontSize', 8, 'FontWeight', 'bold');
+        end
+    end
+end
+
+function render_template_topography(ax, label, template_maps, template_labels, template_chanlocs)
+    axes(ax);
+    cla(ax);
+    axis(ax, 'off');
+    set(ax, 'Color', 'white');
+
+    idx = [];
+    if ~isempty(template_labels)
+        idx = find(strcmp(cellstr(string(template_labels(:))), char(string(label))), 1, 'first');
+    end
+    if isempty(idx) || isempty(template_maps)
+        text(0.5, 0.5, char(string(label)), 'HorizontalAlignment', 'center', 'FontSize', 12, 'FontWeight', 'bold');
+        return;
+    end
+
+    vals = double(template_maps(idx, :));
+    if exist('topoplot', 'file') == 2 && ~isempty(template_chanlocs)
+        try
+            topoplot(vals, template_chanlocs, 'electrodes', 'off', 'numcontour', 6);
+        catch
+            imagesc(ax, reshape(vals, 1, []));
+            axis(ax, 'off');
+        end
+    else
+        imagesc(ax, reshape(vals, 1, []));
+        axis(ax, 'off');
+    end
+    title(ax, char(string(label)), 'FontSize', 9, 'FontWeight', 'bold');
+end
+
+function create_vb_covariance_correlation_heatmap(vb_covariance_results, outcomes, outcome_labels, plots_dir)
+    if isempty(fieldnames(vb_covariance_results)) || ~isfield(vb_covariance_results, 'covariates')
+        return;
+    end
+
+    cov_specs = vb_covariance_results.covariates;
+    rho_mat = nan(numel(cov_specs), numel(outcomes));
+    p_mat = nan(numel(cov_specs), numel(outcomes));
+
+    for i = 1:numel(cov_specs)
+        metric_name = cov_specs(i).name;
+        for j = 1:numel(outcomes)
+            outcome = outcomes{j};
+            if isfield(vb_covariance_results.(metric_name), outcome)
+                rho_mat(i, j) = vb_covariance_results.(metric_name).(outcome).spearman_rho;
+                p_mat(i, j) = vb_covariance_results.(metric_name).(outcome).spearman_p;
+            end
+        end
+    end
+
+    if all(isnan(rho_mat), 'all')
+        return;
+    end
+
+    fig = figure('Visible', 'off', 'Position', [120 120 1200 380], 'Color', 'white');
+    imagesc(rho_mat, [-1 1]);
+    colormap(redbluecmap());
+    cb = colorbar;
+    ylabel(cb, 'Spearman \rho', 'FontSize', 10);
+    set(gca, 'XTick', 1:numel(outcomes), 'XTickLabel', outcome_labels, 'XTickLabelRotation', 35, ...
+        'YTick', 1:numel(cov_specs), 'YTickLabel', {cov_specs.label}, ...
+        'Color', 'white', 'XColor', 'black', 'YColor', 'black');
+    title('VB covariance vs success metrics', 'FontSize', 13, 'FontWeight', 'bold');
+
+    for i = 1:size(rho_mat, 1)
+        for j = 1:size(rho_mat, 2)
+            if ~isnan(rho_mat(i, j))
+                if p_mat(i, j) < 0.001
+                    sig = '***';
+                elseif p_mat(i, j) < 0.01
+                    sig = '**';
+                elseif p_mat(i, j) < 0.05
+                    sig = '*';
+                else
+                    sig = '';
+                end
+                text(j, i, sprintf('%.2f%s', rho_mat(i, j), sig), ...
+                    'HorizontalAlignment', 'center', 'Color', 'black', 'FontSize', 10, 'FontWeight', 'bold');
+            end
+        end
+    end
+
+    saveas(fig, fullfile(plots_dir, 'vb_covariance_correlation_heatmap.png'));
     close(fig);
 end
 
@@ -852,7 +1607,7 @@ function create_runtime_snr_plot(T, plots_dir)
                 plot_count = plot_count + 1;
                 line_style = line_styles{mod(c-1, numel(line_styles)) + 1};
                 marker = marker_styles{mod(m-1, numel(marker_styles)) + 1};
-                label = sprintf('%s - %s', strrep(mname,'_',' '), strrep(clev,'_',' '));
+                label = sprintf('%s - %s', display_method_label(mname), strrep(clev,'_',' '));
                 
                 plot(snr_vals, means, line_style, 'Color', colors(m,:), 'LineWidth', 2.5, ...
                      'Marker', marker, 'MarkerSize', 8, 'DisplayName', label);
@@ -899,7 +1654,7 @@ function create_avg_k_error_plot(T, plots_dir)
     set(h, 'XColor', 'black', 'YColor', 'black');
     axis tight;
     set(gca,'XTick',1:nC,'XTickLabel',clean_levels,'XTickLabelRotation',45,'YTick',1:nM,...
-            'YTickLabel',cellfun(@(s)strrep(s,'_',' '),methods,'UniformOutput',false), ...
+            'YTickLabel',cellfun(@display_method_label,methods,'UniformOutput',false), ...
             'Color', 'white', 'XColor', 'black', 'YColor', 'black');
     title('Average Signed K Error (K_{est} - K_{true})', 'FontSize', 12, 'FontWeight', 'bold');
     for m = 1:nM
@@ -940,7 +1695,7 @@ function create_abs_k_error_plot(T, plots_dir)
     hold on;
     errlow = means - ci_low; errhigh = ci_high - means;
     errorbar(1:n_methods, means, errlow, errhigh, 'k.', 'LineWidth', 2, 'CapSize', 12);
-    set(gca, 'XTick', 1:n_methods, 'XTickLabel', cellfun(@(s)strrep(s,'_',' '), methods, 'UniformOutput', false), ...
+    set(gca, 'XTick', 1:n_methods, 'XTickLabel', cellfun(@display_method_label, methods, 'UniformOutput', false), ...
         'XTickLabelRotation', 45, 'Color', 'white', 'XColor', 'black', 'YColor', 'black');
     ylabel('Mean Absolute K Error', 'FontSize', 11, 'FontWeight', 'bold'); 
     title('Absolute K Error by Method (mean ± 95% CI)', 'FontSize', 12, 'FontWeight', 'bold'); 
@@ -982,17 +1737,28 @@ function s_out = canonicalize_criterion(s_in)
     s_out = s;
 end
 
-function canonicalize_method(m_in)
-    if isempty(m_in), return; end
+function m = canonicalize_method(m_in)
+    if isempty(m_in), m = ''; return; end
     m = char(string(m_in));
     m = lower(m);
     m = strrep(m, '_', ' ');
     m = regexprep(m, '\s+', ' ');
     m = strtrim(m);
-    % Replace "kmeans koenig" with "kmeans standard"
     if contains(m, 'kmeans koenig')
-        m = strrep(m, 'kmeans koenig', 'kmeans standard');
+        m = strrep(m, 'kmeans koenig', 'kmeans');
+    elseif contains(m, 'kmeans standard')
+        m = strrep(m, 'kmeans standard', 'kmeans');
     end
+end
+
+function label = display_method_label(m_in)
+    label = canonicalize_method(m_in);
+end
+
+function s = sanitize_stub(s)
+    s = lower(char(string(s)));
+    s = regexprep(s, '[^a-z0-9]+', '_');
+    s = regexprep(s, '^_+|_+$', '');
 end
 
 function r = ifthenelse(cond, true_val, false_val)
@@ -1072,7 +1838,7 @@ function create_criterion_montage_boxplots(T, plots_dir)
             method_label = 'SPM-K-Means';
         else
             method = kmeans_method;
-            method_label = 'K-Means Standard';
+            method_label = 'kmeans';
         end
         
         fig = figure('Position', [100 100 1400 600]);
@@ -1197,7 +1963,7 @@ function create_criterion_montage_boxplots(T, plots_dir)
             method_label = 'SPM-K-Means';
         else
             method = kmeans_method;
-            method_label = 'K-Means Standard';
+            method_label = 'kmeans';
         end
         
         fig = figure('Position', [100 100 1400 600]);
@@ -1354,7 +2120,7 @@ function create_method_criterion_boxplots(T, plots_dir)
     kmeans_method = unique_methods{kmeans_idx};
     
     methods = {spm_method, kmeans_method};
-    method_labels = {'SPM VB', 'K-Means'};
+    method_labels = {display_method_label(spm_method), display_method_label(kmeans_method)};
     
     % Create figure with two subplots
     fig = figure('Position', [100 100 1400 600]);
@@ -1427,9 +2193,9 @@ function create_method_criterion_boxplots(T, plots_dir)
         data_spm = [];
         data_kmeans = [];
         
-        idx_spm = strcmp(cellstr(string(T_filtered.method)), 'spm vb') & ...
+        idx_spm = strcmp(cellstr(string(T_filtered.method)), spm_method) & ...
                   strcmp(cellstr(string(T_filtered.criterion_clean)), crit);
-        idx_kmeans = strcmp(cellstr(string(T_filtered.method)), 'kmeans standard') & ...
+        idx_kmeans = strcmp(cellstr(string(T_filtered.method)), kmeans_method) & ...
                      strcmp(cellstr(string(T_filtered.criterion_clean)), crit);
         
         if any(idx_spm)
@@ -1558,9 +2324,9 @@ function create_method_criterion_boxplots(T, plots_dir)
         data_spm = [];
         data_kmeans = [];
         
-        idx_spm = strcmp(cellstr(string(T_filtered.method)), 'spm vb') & ...
+        idx_spm = strcmp(cellstr(string(T_filtered.method)), spm_method) & ...
                   strcmp(cellstr(string(T_filtered.criterion_clean)), crit);
-        idx_kmeans = strcmp(cellstr(string(T_filtered.method)), 'kmeans standard') & ...
+        idx_kmeans = strcmp(cellstr(string(T_filtered.method)), kmeans_method) & ...
                      strcmp(cellstr(string(T_filtered.criterion_clean)), crit);
         
         if any(idx_spm)

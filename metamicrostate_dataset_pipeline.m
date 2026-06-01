@@ -51,6 +51,10 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
 %   - Template alignment, if possible, uses a genuine optimal subset/permutation
 %     assignment against the supplied template maps. It does not assume that a
 %     K=4 solution corresponds to template states 1:4.
+%   - By default, GFP peaks are extracted on each file's observed scalp
+%     channels and then remapped onto the densest scalp montage available in
+%     the dataset by direct channel matching plus peak-level IDW
+%     interpolation for missing channels.
 %   - The per-file call to analyze_single_eeg_file is retained for compatibility
 %     with the existing single-file pipeline. The common-channel per-file fit is
 %     separately saved because analyze_single_eeg_file does not expose the GFP
@@ -74,6 +78,7 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     addParameter(p, 'pooled_K_candidates', [], @(x) isempty(x) || (isnumeric(x) && isvector(x)));
 
     addParameter(p, 'call_analyze_single', true, @(x) islogical(x) && isscalar(x));
+    addParameter(p, 'fail_on_analyze_single_error', false, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'save_json', false, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'json_dir', '', @(x) ischar(x) || isstring(x));
     addParameter(p, 'plot_dir', '', @(x) ischar(x) || isstring(x));
@@ -107,7 +112,9 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     addParameter(p, 'max_iter', 300, @(x) isnumeric(x) && isscalar(x) && x >= 1);
     addParameter(p, 'tol', 1e-7, @(x) isnumeric(x) && isscalar(x) && x > 0);
     addParameter(p, 'random_seed', 1, @(x) isnumeric(x) && isscalar(x));
-    addParameter(p, 'force_recompute', false, @(x) islogical(x) && isscalar(x));
+    addParameter(p, 'use_parfor', true, @(x) islogical(x) && isscalar(x));
+    addParameter(p, 'n_workers', 8, @(x) isnumeric(x) && isscalar(x) && x >= 1);
+    addParameter(p, 'force_recompute', true, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'force_recompute_peaks', false, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'force_recompute_clusters', false, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'infer_participant_from_path', true, @(x) islogical(x) && isscalar(x));
@@ -166,6 +173,7 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
         ensure_dir(cfg.json_dir);
         ensure_dir(cfg.plot_dir);
     end
+    cfg.parallel_pool_ready = maybe_start_parallel_pool(cfg);
 
     if cfg.verbose
         fprintf('\n========================================\n');
@@ -178,6 +186,9 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
         fprintf('K candidates: %s\n', mat2str(cfg.K_candidates));
         fprintf('Old hierarchy: not used\n');
         fprintf('Peak interpolation: %s\n', ternary_string(cfg.interpolate_missing_peak_channels, 'enabled', 'disabled'));
+        if cfg.use_parfor
+            fprintf('Parallel K fits: %s\n', ternary_string(cfg.parallel_pool_ready, 'enabled', 'requested but unavailable'));
+        end
         fprintf('========================================\n\n');
     end
 
@@ -222,34 +233,44 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
 
         try
             if cfg.call_analyze_single
-                if cfg.force_recompute || ~isfile(analysis_file)
-                    if exist('analyze_single_eeg_file', 'file') ~= 2
-                        warning('analyze_single_eeg_file is not on the MATLAB path. Continuing with local common-channel fit only.');
-                    else
-                        if cfg.verbose
-                            fprintf('   Running analyze_single_eeg_file...\n');
+                try
+                    if cfg.force_recompute || ~isfile(analysis_file)
+                        if exist('analyze_single_eeg_file', 'file') ~= 2
+                            warning('analyze_single_eeg_file is not on the MATLAB path. Continuing with local common-channel fit only.');
+                        else
+                            if cfg.verbose
+                                fprintf('   Running analyze_single_eeg_file...\n');
+                            end
+                            analyze_args = {'method', cfg.method, ...
+                                'criterion', cfg.criterion, ...
+                                'K_candidates', cfg.K_candidates, ...
+                                'save_json', cfg.save_json, ...
+                                'json_dir', cfg.json_dir, ...
+                                'plot_dir', cfg.plot_dir, ...
+                                'align_template', cfg.align_to_template, ...
+                                'template_file', cfg.template_file, ...
+                                'use_scalp_channels', cfg.use_scalp_channels, ...
+                                'apply_average_reference', cfg.apply_average_reference, ...
+                                'filter_band', cfg.filter_band, ...
+                                'reject_gfp_peak_outliers', cfg.reject_gfp_peak_outliers_individual, ...
+                                'gfp_outlier_mad_multiplier', cfg.gfp_outlier_mad_multiplier_individual, ...
+                                'verbose', false};
+                            [AnalysisResults, json_file] = analyze_single_eeg_file(row.file_path{1}, analyze_args{:});
+                            save(analysis_file, 'AnalysisResults', 'json_file', 'row', 'cfg', '-v7.3');
                         end
-                        analyze_args = {'method', cfg.method, ...
-                            'criterion', cfg.criterion, ...
-                            'K_candidates', cfg.K_candidates, ...
-                            'save_json', cfg.save_json, ...
-                            'json_dir', cfg.json_dir, ...
-                            'plot_dir', cfg.plot_dir, ...
-                            'align_template', cfg.align_to_template, ...
-                            'template_file', cfg.template_file, ...
-                            'use_scalp_channels', cfg.use_scalp_channels, ...
-                            'apply_average_reference', cfg.apply_average_reference, ...
-                            'filter_band', cfg.filter_band, ...
-                            'reject_gfp_peak_outliers', cfg.reject_gfp_peak_outliers_individual, ...
-                            'gfp_outlier_mad_multiplier', cfg.gfp_outlier_mad_multiplier_individual, ...
-                            'verbose', false};
-                        [AnalysisResults, json_file] = analyze_single_eeg_file(row.file_path{1}, analyze_args{:});
-                        save(analysis_file, 'AnalysisResults', 'json_file', 'row', 'cfg', '-v7.3');
+                    else
+                        S = load(analysis_file, 'AnalysisResults', 'json_file');
+                        if isfield(S, 'AnalysisResults'), AnalysisResults = S.AnalysisResults; end
+                        if isfield(S, 'json_file'), json_file = S.json_file; end
                     end
-                else
-                    S = load(analysis_file, 'AnalysisResults', 'json_file');
-                    if isfield(S, 'AnalysisResults'), AnalysisResults = S.AnalysisResults; end
-                    if isfield(S, 'json_file'), json_file = S.json_file; end
+                catch ME_analyze
+                    if cfg.fail_on_analyze_single_error
+                        rethrow(ME_analyze);
+                    end
+                    AnalysisResults = [];
+                    json_file = '';
+                    warning('analyze_single_eeg_file failed for %s; continuing with dataset pipeline local fit only.\n%s', ...
+                        row.file_path{1}, ME_analyze.message);
                 end
             end
 
@@ -617,6 +638,8 @@ end
 function gfp = get_subset_gfp(rows_table, mask)
     if any(strcmpi(rows_table.Properties.VariableNames, 'gfp_effective'))
         gfp = double(rows_table.gfp_effective(mask));
+    elseif any(strcmpi(rows_table.Properties.VariableNames, 'fit_weight_proxy'))
+        gfp = double(rows_table.fit_weight_proxy(mask));
     elseif any(strcmpi(rows_table.Properties.VariableNames, 'gfp'))
         gfp = double(rows_table.gfp(mask));
     else
@@ -937,10 +960,38 @@ function write_checkpoint_manifest(T, fn)
     end
 end
 
+function ok = maybe_start_parallel_pool(cfg)
+    ok = false;
+    if ~isfield(cfg, 'use_parfor') || ~cfg.use_parfor
+        return;
+    end
+    if exist('parpool', 'file') ~= 2 || exist('gcp', 'file') ~= 2
+        warning('Parallel Computing Toolbox functions are unavailable. Falling back to serial K fits.');
+        return;
+    end
+    try
+        p_pool = gcp('nocreate');
+        if isempty(p_pool)
+            max_workers = max(1, maxNumCompThreads());
+            n_workers = min(max(1, round(cfg.n_workers)), max_workers);
+            parpool('local', n_workers);
+        end
+        ok = true;
+    catch ME
+        warning('Could not start/use parallel pool: %s. Falling back to serial K fits.', ME.message);
+        ok = false;
+    end
+end
+
 function tf = peak_cache_needs_refresh(rec, common_labels, cfg)
     tf = isempty(rec) || ~isstruct(rec) || ~isfield(rec, 'maps_norm') || ~isfield(rec, 'gfp') || ...
         size(rec.maps_norm, 2) ~= numel(common_labels);
     if tf
+        return;
+    end
+    if ~isfield(rec, 'common_labels') || numel(rec.common_labels) ~= numel(common_labels) || ...
+            any(~strcmp(cellstr(rec.common_labels(:)), cellstr(common_labels(:))))
+        tf = true;
         return;
     end
     needed_fields = {'gfp_effective', 'n_target_channels', 'n_observed_channels', ...
@@ -1593,18 +1644,21 @@ function Fit = fit_microstate_map_set(maps, gfp, K_candidates, cfg, fit_name)
 
     fits = cell(numel(K_candidates), 1);
     metrics = repmat(empty_metrics_struct(), numel(K_candidates), 1);
-    for k_i = 1:numel(K_candidates)
-        K = K_candidates(k_i);
-        best = [];
-        for r = 1:cfg.n_initialisations
-            seed = cfg.random_seed + 1000 * K + r + sum(double(char(fit_name)));
-            tmp = topographic_kmeans(X, gfp, K, cfg.max_iter, cfg.tol, seed);
-            if isempty(best) || tmp.metrics.wss < best.metrics.wss
-                best = tmp;
-            end
+    fit_name_code = sum(double(char(fit_name)));
+    if should_parallelise_k_fits(cfg, K_candidates)
+        parfor k_i = 1:numel(K_candidates)
+            K = K_candidates(k_i);
+            best = best_topographic_kmeans_across_restarts(X, gfp, K, cfg, fit_name_code);
+            fits{k_i} = best;
+            metrics(k_i) = best.metrics;
         end
-        fits{k_i} = best;
-        metrics(k_i) = best.metrics;
+    else
+        for k_i = 1:numel(K_candidates)
+            K = K_candidates(k_i);
+            best = best_topographic_kmeans_across_restarts(X, gfp, K, cfg, fit_name_code);
+            fits{k_i} = best;
+            metrics(k_i) = best.metrics;
+        end
     end
 
     model_comparison = struct2table(metrics);
@@ -1625,6 +1679,23 @@ function Fit = fit_microstate_map_set(maps, gfp, K_candidates, cfg, fit_name)
     Fit.model_comparison = model_comparison;
     Fit.n_maps = size(X, 1);
     Fit.n_channels = size(X, 2);
+end
+
+function tf = should_parallelise_k_fits(cfg, K_candidates)
+    tf = isfield(cfg, 'use_parfor') && cfg.use_parfor && ...
+        isfield(cfg, 'parallel_pool_ready') && cfg.parallel_pool_ready && ...
+        numel(K_candidates) > 1;
+end
+
+function best = best_topographic_kmeans_across_restarts(X, gfp, K, cfg, fit_name_code)
+    best = [];
+    for r = 1:cfg.n_initialisations
+        seed = cfg.random_seed + 1000 * K + r + fit_name_code;
+        tmp = topographic_kmeans(X, gfp, K, cfg.max_iter, cfg.tol, seed);
+        if isempty(best) || tmp.metrics.wss < best.metrics.wss
+            best = tmp;
+        end
+    end
 end
 
 function fit = topographic_kmeans(X, gfp, K, max_iter, tol, seed)

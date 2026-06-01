@@ -52,7 +52,12 @@ function save_microstate_json(Results, Sim, output_file, META)
     if isfield(Results, 'K_true'), json_data.metadata.K_true = Results.K_true; end
     if isfield(Results, 'K_estimated'), json_data.metadata.K_estimated = Results.K_estimated; end
     if isfield(Results, 'K_model_selected'), json_data.metadata.K_model_selected = Results.K_model_selected; end
+    if isfield(Results, 'K_candidates'), json_data.metadata.K_candidates = Results.K_candidates; end
     if isfield(Results, 'K_effective_vals'), json_data.metadata.K_effective_vals = Results.K_effective_vals; end
+    selected_idx = find_selected_model_index(Results);
+    if ~isnan(selected_idx)
+        json_data.metadata.selected_model_index = double(selected_idx);
+    end
     if isfield(Results, 'polarity_feature_info')
         json_data.metadata.polarity_feature_info = Results.polarity_feature_info;
     end
@@ -74,12 +79,49 @@ function save_microstate_json(Results, Sim, output_file, META)
     if isfield(Results, 'n_maps'), json_data.metadata.n_samples_analyzed = Results.n_maps; end
     if isfield(Results, 'runtime'), json_data.metadata.runtime_s = Results.runtime; end
 
-    if isfield(Results, 'best_criterion_value') && isfield(Results, 'criterion') && ...
-            (strcmp(Results.criterion, 'free_energy') || strcmp(Results.method, 'spm_vb'))
-        json_data.metadata.model_evidence_free_energy = Results.best_criterion_value;
+    if isfield(Results, 'silhouette_vals') && ~isempty(Results.silhouette_vals)
+        json_data.metadata.silhouette_vals = double(real(Results.silhouette_vals(:)'));
+    end
+    if isfield(Results, 'free_energy_vals') && ~isempty(Results.free_energy_vals)
+        json_data.metadata.free_energy_vals = double(real(Results.free_energy_vals(:)'));
+    elseif isfield(Results, 'free_energy') && ~isempty(Results.free_energy)
+        json_data.metadata.free_energy_vals = double(real(Results.free_energy(:)'));
+    end
+    if isfield(Results, 'within_ss') && ~isempty(Results.within_ss)
+        json_data.metadata.within_ss = double(real(Results.within_ss(:)'));
+    end
+    if isfield(Results, 'gev_vals') && ~isempty(Results.gev_vals)
+        json_data.metadata.gev_vals = double(real(Results.gev_vals(:)'));
+    end
+    if ~isnan(selected_idx)
+        if isfield(Results, 'free_energy_vals') && numel(Results.free_energy_vals) >= selected_idx
+            json_data.metadata.selected_model_free_energy = double(real(Results.free_energy_vals(selected_idx)));
+            json_data.metadata.model_evidence_free_energy = double(real(Results.free_energy_vals(selected_idx)));
+        elseif isfield(Results, 'free_energy') && numel(Results.free_energy) >= selected_idx
+            json_data.metadata.selected_model_free_energy = double(real(Results.free_energy(selected_idx)));
+            json_data.metadata.model_evidence_free_energy = double(real(Results.free_energy(selected_idx)));
+        end
+        if isfield(Results, 'silhouette_vals') && numel(Results.silhouette_vals) >= selected_idx
+            json_data.metadata.selected_model_silhouette = double(real(Results.silhouette_vals(selected_idx)));
+        end
+        if isfield(Results, 'within_ss') && numel(Results.within_ss) >= selected_idx
+            json_data.metadata.selected_model_within_ss = double(real(Results.within_ss(selected_idx)));
+        end
     end
     if isfield(Results, 'template_alignment') && ~isempty(Results.template_alignment)
         json_data.metadata.template_alignment = template_alignment_summary(Results.template_alignment);
+    end
+    if isfield(Results, 'backfit_diagnostics') && ~isempty(Results.backfit_diagnostics)
+        json_data.metadata.backfit = backfit_summary(Results.backfit_diagnostics);
+    end
+
+    if isfield(Results, 'spm_mix_model_summaries') && ~isempty(Results.spm_mix_model_summaries)
+        spm_mix_payload = struct();
+        spm_mix_payload.per_k_models = Results.spm_mix_model_summaries;
+        if isfield(Results, 'selected_spm_mix_model') && ~isempty(Results.selected_spm_mix_model)
+            spm_mix_payload.selected_model = Results.selected_spm_mix_model;
+        end
+        json_data.spm_mix = spm_mix_payload;
     end
 
     if ~isempty(META) && isstruct(META)
@@ -234,4 +276,32 @@ function metrics = empty_recovery_metrics()
         'mean_recovery_matched', NaN, ...
         'mean_recovery_padded', NaN, ...
         'match_similarities', []);
+end
+
+function s = backfit_summary(diag)
+    s = struct();
+    fields = {'ok', 'message', 'n_samples', 'template_labels', ...
+        'true_state_template_labels', 'estimated_state_template_labels', ...
+        'coverage_true', 'coverage_estimated', 'coverage_difference', ...
+        'coverage_corr', 'coverage_spearman', 'coverage_mae', ...
+        'coverage_rmse', 'coverage_l1', 'coverage_linf', ...
+        'confusion_counts', 'confusion_row_normalized'};
+    for i = 1:numel(fields)
+        f = fields{i};
+        if isfield(diag, f)
+            s.(f) = diag.(f);
+        end
+    end
+end
+
+function idx = find_selected_model_index(Results)
+    idx = NaN;
+    if ~isfield(Results, 'K_candidates') || isempty(Results.K_candidates) || ...
+            ~isfield(Results, 'K_model_selected') || isempty(Results.K_model_selected)
+        return;
+    end
+    hit = find(double(Results.K_candidates(:)) == double(Results.K_model_selected), 1, 'first');
+    if ~isempty(hit)
+        idx = hit;
+    end
 end

@@ -93,6 +93,22 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
     if strcmp(CONFIG.method, 'spm_kmeans') && (strcmp(CONFIG.criterion, 'free_energy') || strcmp(CONFIG.criterion, 'elbow_sil_combined'))
         error('Criterion %s is not supported for spm_kmeans method. Use ''silhouette'', ''gev'', or ''elbow'' instead.', CONFIG.criterion);
     end
+
+    % SPM-based methods need the mixture toolbox subdirectory, which is not
+    % guaranteed to be on the path just because spm.m is visible.
+    if startsWith(string(CONFIG.method), "spm_")
+        [spm_ok, spm_info] = util.ensure_spm_mix('', path_defaults.spm_mixture_paths, CONFIG.verbose);
+        if ~spm_ok
+            attempted = '';
+            if isfield(spm_info, 'attempted') && ~isempty(spm_info.attempted)
+                attempted = strjoin(spm_info.attempted, ', ');
+            else
+                attempted = '<none>';
+            end
+            error(['SPM spm_mix not found in MATLAB path after attempted initialisation. ', ...
+                'Checked configured candidates: %s'], attempted);
+        end
+    end
     
     if CONFIG.verbose
         fprintf('\n========================================\n');
