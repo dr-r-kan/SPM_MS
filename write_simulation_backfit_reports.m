@@ -19,29 +19,40 @@ function manifest = write_simulation_backfit_reports(T, output_dir)
 
     T_valid = T(valid_file, :);
     coverage_vars = intersect({'backfit_coverage_corr', 'backfit_coverage_spearman', ...
-        'backfit_coverage_mae', 'backfit_coverage_rmse', 'backfit_coverage_l1'}, ...
+        'backfit_coverage_mae', 'backfit_coverage_rmse', 'backfit_coverage_l1', ...
+        'backfit_overlap_fraction', ...
+        'backfit_hard_cluster_top1_accuracy', 'backfit_hard_label_top1_accuracy', ...
+        'backfit_hard_cluster_top1_accuracy_overlap', 'backfit_hard_label_top1_accuracy_overlap', ...
+        'backfit_hard_label_weight_mae', 'backfit_hard_label_weight_mae_overlap', ...
+        'backfit_mix_cluster_top1_accuracy', 'backfit_mix_label_top1_accuracy', ...
+        'backfit_mix_cluster_top1_accuracy_overlap', 'backfit_mix_label_top1_accuracy_overlap', ...
+        'backfit_mix_label_weight_mae', 'backfit_mix_label_weight_mae_overlap'}, ...
         T_valid.Properties.VariableNames, 'stable');
     if ~isempty(coverage_vars)
         coverage_summary = groupsummary(T_valid, {'method', 'criterion', 'K_true', 'K_estimated'}, 'mean', coverage_vars);
         writetable(coverage_summary, fullfile(output_dir, 'backfit_coverage_summary.csv'));
     end
 
-    underfit_mask = double(T_valid.K_true) > double(T_valid.K_estimated);
-    T_under = T_valid(underfit_mask, :);
-    if height(T_under) == 0
+    if ~ismember('K_gap', T_valid.Properties.VariableNames)
+        T_valid.K_gap = double(T_valid.K_true) - double(T_valid.K_estimated);
+    end
+
+    keep_gap_mask = isfinite(T_valid.K_gap) & T_valid.K_gap >= 0 & T_valid.K_gap <= 3;
+    T_gap = T_valid(keep_gap_mask, :);
+    if height(T_gap) == 0
         return;
     end
 
     group_keys = strcat( ...
-        string(T_under.method), "|", ...
-        string(T_under.criterion), "|", ...
-        string(T_under.K_true), "|", ...
-        string(T_under.K_estimated));
+        string(T_gap.method), "|", ...
+        string(T_gap.criterion), "|", ...
+        string(T_gap.K_true), "|", ...
+        string(T_gap.K_estimated));
     [unique_keys, ~, key_idx] = unique(group_keys, 'stable');
 
     rows = cell(numel(unique_keys), 1);
     for g = 1:numel(unique_keys)
-        group_rows = T_under(key_idx == g, :);
+        group_rows = T_gap(key_idx == g, :);
         [counts, labels] = aggregate_confusions(group_rows.backfit_diagnostic_file);
         if isempty(counts)
             continue;
@@ -78,6 +89,50 @@ function manifest = write_simulation_backfit_reports(T, output_dir)
     end
     manifest = vertcat(rows{:});
     writetable(manifest, fullfile(output_dir, 'backfit_confusion_manifest.csv'));
+
+    gap_manifest = aggregate_gap_confusion_reports(T_gap, output_dir);
+    if height(gap_manifest) > 0
+        writetable(gap_manifest, fullfile(output_dir, 'backfit_confusion_gap_manifest.csv'));
+    end
+end
+
+function manifest = aggregate_gap_confusion_reports(T_gap, output_dir)
+    rows = {};
+    row_idx = 0;
+    group_keys = strcat(string(T_gap.method), "|", string(T_gap.criterion), "|", string(T_gap.K_gap));
+    [unique_keys, ~, key_idx] = unique(group_keys, 'stable');
+    for g = 1:numel(unique_keys)
+        group_rows = T_gap(key_idx == g, :);
+        [counts, labels] = aggregate_confusions(group_rows.backfit_diagnostic_file);
+        if isempty(counts)
+            continue;
+        end
+        row_norm = counts ./ max(sum(counts, 2), 1);
+        method = char(string(group_rows.method(1)));
+        criterion = char(string(group_rows.criterion(1)));
+        K_gap = double(group_rows.K_gap(1));
+        file_stub = sprintf('%s__%s__kgap%d', ...
+            sanitize_stub(method), sanitize_stub(criterion), K_gap);
+        counts_csv = fullfile(output_dir, [file_stub '_counts.csv']);
+        rownorm_csv = fullfile(output_dir, [file_stub '_row_normalized.csv']);
+        counts_png = fullfile(output_dir, [file_stub '_counts.png']);
+        rownorm_png = fullfile(output_dir, [file_stub '_row_normalized.png']);
+        writetable(array2table(counts, 'VariableNames', matlab.lang.makeValidName(labels), 'RowNames', labels), counts_csv, 'WriteRowNames', true);
+        writetable(array2table(row_norm, 'VariableNames', matlab.lang.makeValidName(labels), 'RowNames', labels), rownorm_csv, 'WriteRowNames', true);
+        plot_confusion_heatmap(counts, labels, counts_png, sprintf('%s | %s | K_{true}-K_{est}=%d', method, criterion, K_gap), 'Counts');
+        plot_confusion_heatmap(row_norm, labels, rownorm_png, sprintf('%s | %s | K_{true}-K_{est}=%d', method, criterion, K_gap), 'Row-normalized');
+        row_idx = row_idx + 1;
+        rows{row_idx, 1} = table( ...
+            string(method), string(criterion), K_gap, height(group_rows), ...
+            string(counts_csv), string(rownorm_csv), string(counts_png), string(rownorm_png), ...
+            'VariableNames', {'method', 'criterion', 'K_gap', 'n_runs', ...
+            'counts_csv', 'row_normalized_csv', 'counts_png', 'row_normalized_png'});
+    end
+    if isempty(rows)
+        manifest = table();
+    else
+        manifest = vertcat(rows{:});
+    end
 end
 
 function [counts_total, labels] = aggregate_confusions(files)

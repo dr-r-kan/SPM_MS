@@ -9,7 +9,8 @@ function [template_maps, template_labels, channel_labels, chanlocs] = load_metam
 %   indices 10:15  -> K=6
 %   indices 16:22  -> K=7
 %
-% For K=7 the documented label order is D,A,C,F,B,G,E.
+% For K=7 the file order is D,B,C,F,A,G,E. Returned labels/maps are
+% reordered into alphabetical canonical order for consistent plotting.
 
     p = inputParser;
     addRequired(p, 'template_file', @(x) ischar(x) || isstring(x));
@@ -45,7 +46,7 @@ function [template_maps, template_labels, channel_labels, chanlocs] = load_metam
         idx_start = 1 + sum(4:(K - 1));
         idx = idx_start:(idx_start + K - 1);
         if K == 7
-            template_labels = {'D', 'A', 'C', 'F', 'B', 'G', 'E'};
+            template_labels = {'D', 'B', 'C', 'F', 'A', 'G', 'E'};
         else
             template_labels = arrayfun(@(i) char('A' + i - 1), 1:K, 'UniformOutput', false);
         end
@@ -57,22 +58,40 @@ function [template_maps, template_labels, channel_labels, chanlocs] = load_metam
     end
 
     template_maps = all_maps(idx, :);
-    util = microstate_utilities();
-    template_maps = util.normalize_maps(template_maps);
 
     chanlocs = [];
     channel_labels = {};
+    util = microstate_utilities();
     if isfield(EEG, 'chanlocs') && ~isempty(EEG.chanlocs)
         chanlocs = EEG.chanlocs;
-        channel_labels = cell(1, numel(chanlocs));
-        for c = 1:numel(chanlocs)
+        n_channels = min(numel(chanlocs), size(template_maps, 2));
+        chanlocs = chanlocs(1:n_channels);
+        channel_labels = cell(1, n_channels);
+        for c = 1:n_channels
             if isfield(chanlocs(c), 'labels') && ~isempty(chanlocs(c).labels)
                 channel_labels{c} = char(chanlocs(c).labels);
             else
                 channel_labels{c} = sprintf('Ch%03d', c);
             end
         end
+        template_maps = template_maps(:, 1:n_channels);
+        [chanlocs, keep_idx] = util.prepare_metamaps_chanlocs(chanlocs, n_channels);
+        if numel(chanlocs) < n_channels
+            template_maps = template_maps(:, keep_idx);
+            channel_labels = channel_labels(keep_idx);
+        end
     else
         channel_labels = arrayfun(@(c) sprintf('Ch%03d', c), 1:size(template_maps, 2), 'UniformOutput', false);
     end
+
+    [template_labels, sort_idx] = sort_microstate_labels(template_labels);
+    template_maps = template_maps(sort_idx, :);
+    template_maps = util.normalize_maps(template_maps);
+end
+
+function [labels_out, sort_idx] = sort_microstate_labels(labels_in)
+    labels = cellstr(string(labels_in(:)));
+    keys = lower(strtrim(labels));
+    [~, sort_idx] = sort(keys);
+    labels_out = labels(sort_idx);
 end

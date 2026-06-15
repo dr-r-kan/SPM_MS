@@ -1,7 +1,11 @@
 function T = simulated_ms_retrieval_experiment(varargin)
-% BAYESIAN_MS_COMPARISON_PIPELINE: ALL method-criterion combinations
+% BAYESIAN_MS_COMPARISON_PIPELINE: Valid method-criterion combinations only.
 %
-% Each method is tested with EVERY criterion (where applicable)
+% The simulation enumerates only supported method/criterion pairs. For the
+% current retrieval comparison:
+%   - kmeans_koenig: silhouette
+%   - spm_vb: silhouette, free_energy, free_energy_elbow, elbow_sil_combined,
+%             covariance_elbow, free_energy_covariance
 %
 % Requirements:
 % spm on path (development version at spm/spm on github)
@@ -28,7 +32,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
     %  - popFitMSMaps.m
     % All from the "microstates" repository
 
-    test = false;
+    test = true;
 
     p = inputParser;
     if test
@@ -63,11 +67,15 @@ function T = simulated_ms_retrieval_experiment(varargin)
     addParameter(p, 'template_alignment_strong_threshold', double(util.get_field(sim_defaults, 'template_alignment_strong_threshold', 0.5)), @isnumeric);
     addParameter(p, 'validate_simulation', logical(sim_defaults.validate_simulation), @islogical);
     addParameter(p, 'preprocessing', sim_defaults.preprocessing, @isstruct);
+    addParameter(p, 'methods', {'spm_vb', 'kmeans_koenig'}, @(x) iscell(x) || isstring(x));
+    addParameter(p, 'criteria', {'silhouette', 'free_energy', 'free_energy_elbow', 'elbow_sil_combined', 'covariance_elbow', 'free_energy_covariance'}, @(x) iscell(x) || isstring(x));
     parse(p, varargin{:});
     
     CONFIG = p.Results;
     CONFIG.out_dir = util.resolve_path(CONFIG.out_dir, util.project_root());
     CONFIG.set_file = util.resolve_path(CONFIG.set_file, util.project_root());
+    CONFIG.methods = cellstr(string(CONFIG.methods));
+    CONFIG.criteria = cellstr(string(CONFIG.criteria));
     if isempty(CONFIG.rep_vals)
         rep_vals = 1:CONFIG.reps;
     else
@@ -110,11 +118,9 @@ function T = simulated_ms_retrieval_experiment(varargin)
             mat2str(CONFIG.overlap_probs), mat2str(CONFIG.overlap_ms_range), CONFIG.overlap_strength);
     end
 
-    % ===== ALL CRITERIA (universal) =====
-    all_criteria = {'silhouette', 'free_energy', 'elbow', 'elbow_sil_combined', 'gev'};
-    
-    % First-line validation is focused on the VB method.
-    method_names = {'spm_vb', 'kmeans_koenig'};
+    % ===== Valid method/criterion design =====
+    [method_names, method_criteria_map, all_criteria, n_method_criteria_pairs] = ...
+        build_method_criteria_design(CONFIG.methods, CONFIG.criteria);
     
     % Guard: if SPM methods requested but SPM not available, stop early with a clear message
     needs_spm = any(contains(method_names, 'spm'));
@@ -150,25 +156,30 @@ function T = simulated_ms_retrieval_experiment(varargin)
     
     n_eeg_conditions = size(eeg_conditions, 1);
     n_methods = length(method_names);
-    n_criteria = length(all_criteria);
     n_fits = n_eeg_conditions * n_montages * n_methods;
-    n_total_results = n_fits * n_criteria;
+    n_total_results = n_eeg_conditions * n_montages * n_method_criteria_pairs;
     
     if CONFIG.verbose
         fprintf('PIPELINE STRUCTURE:\n');
         fprintf('  EEG conditions: %d (includes %d overlap settings)\n', n_eeg_conditions, n_overlap_conditions);
         fprintf('  Montages: %d\n', n_montages);
         fprintf('  Methods: %d\n', n_methods);
-        fprintf('  Criteria (applied to all): %d\n', n_criteria);
+        fprintf('  Supported method-criterion pairs: %d\n', n_method_criteria_pairs);
         fprintf('  Total FITS: %d (one per montage+method+EEG)\n', n_fits);
-        fprintf('  Total RESULTS: %d (fits × criteria)\n\n', n_total_results);
+        fprintf('  Total RESULTS: %d (fits × valid criteria)\n', n_total_results);
+        for m_idx = 1:n_methods
+            method_str = method_names{m_idx};
+            criteria_this = method_criteria_map(method_str);
+            fprintf('    %s -> %s\n', method_str, strjoin(criteria_this, ', '));
+        end
+        fprintf('\n');
     end
 
     % ===== UNIFIED PIPELINE: GENERATE → FIT → CRITERIA → SAVE (per EEG) =====
     if CONFIG.verbose
         fprintf('Pipeline: Generate EEG → Montage → Fit Methods → Apply Criteria → Save\n');
-        fprintf('Processing %d EEG conditions with %d montages, %d methods and %d criteria each...\n', ...
-            n_eeg_conditions, n_montages, n_methods, n_criteria);
+        fprintf('Processing %d EEG conditions with %d montages, %d methods and %d valid method-criterion pairs...\n', ...
+            n_eeg_conditions, n_montages, n_methods, n_method_criteria_pairs);
     end
     
     rows = [];
@@ -347,9 +358,9 @@ function T = simulated_ms_retrieval_experiment(varargin)
                 method_str = char(string(fit_result.method));
                 selected_solution_cache = struct();
                 
-                % Apply ALL criteria to this ONE fit
-                for c_idx = 1:n_criteria
-                    criterion_str = char(string(all_criteria{c_idx}));
+                criteria_for_method = method_criteria_map(method_str);
+                for c_idx = 1:numel(criteria_for_method)
+                    criterion_str = char(string(criteria_for_method{c_idx}));
                     
                     % Extract K using this criterion
                     K_selected = select_K_by_criterion(Results, criterion_str);
@@ -389,6 +400,20 @@ function T = simulated_ms_retrieval_experiment(varargin)
                     backfit_coverage_mae = NaN;
                     backfit_coverage_rmse = NaN;
                     backfit_coverage_l1 = NaN;
+                    backfit_overlap_fraction = NaN;
+                    backfit_hard_cluster_top1_accuracy = NaN;
+                    backfit_hard_label_top1_accuracy = NaN;
+                    backfit_hard_cluster_top1_accuracy_overlap = NaN;
+                    backfit_hard_label_top1_accuracy_overlap = NaN;
+                    backfit_hard_label_weight_mae = NaN;
+                    backfit_hard_label_weight_mae_overlap = NaN;
+                    backfit_mix_available = false;
+                    backfit_mix_cluster_top1_accuracy = NaN;
+                    backfit_mix_label_top1_accuracy = NaN;
+                    backfit_mix_cluster_top1_accuracy_overlap = NaN;
+                    backfit_mix_label_top1_accuracy_overlap = NaN;
+                    backfit_mix_label_weight_mae = NaN;
+                    backfit_mix_label_weight_mae_overlap = NaN;
                     selected_cov_trace_mean = NaN;
                     selected_cov_trace_median = NaN;
                     selected_cov_logdet_mean = NaN;
@@ -421,6 +446,26 @@ function T = simulated_ms_retrieval_experiment(varargin)
                             backfit_coverage_mae = BackfitDiagnostics.coverage_mae;
                             backfit_coverage_rmse = BackfitDiagnostics.coverage_rmse;
                             backfit_coverage_l1 = BackfitDiagnostics.coverage_l1;
+                            if isfield(BackfitDiagnostics, 'overlap_sample_fraction')
+                                backfit_overlap_fraction = BackfitDiagnostics.overlap_sample_fraction;
+                            end
+                            if isfield(BackfitDiagnostics, 'hard') && isstruct(BackfitDiagnostics.hard)
+                                backfit_hard_cluster_top1_accuracy = BackfitDiagnostics.hard.cluster_top1_accuracy;
+                                backfit_hard_label_top1_accuracy = BackfitDiagnostics.hard.label_top1_accuracy;
+                                backfit_hard_cluster_top1_accuracy_overlap = BackfitDiagnostics.hard.cluster_top1_accuracy_overlap;
+                                backfit_hard_label_top1_accuracy_overlap = BackfitDiagnostics.hard.label_top1_accuracy_overlap;
+                                backfit_hard_label_weight_mae = BackfitDiagnostics.hard.label_weight_mae;
+                                backfit_hard_label_weight_mae_overlap = BackfitDiagnostics.hard.label_weight_mae_overlap;
+                            end
+                            if isfield(BackfitDiagnostics, 'mixture') && isstruct(BackfitDiagnostics.mixture)
+                                backfit_mix_available = isfield(BackfitDiagnostics.mixture, 'available') && BackfitDiagnostics.mixture.available;
+                                backfit_mix_cluster_top1_accuracy = BackfitDiagnostics.mixture.cluster_top1_accuracy;
+                                backfit_mix_label_top1_accuracy = BackfitDiagnostics.mixture.label_top1_accuracy;
+                                backfit_mix_cluster_top1_accuracy_overlap = BackfitDiagnostics.mixture.cluster_top1_accuracy_overlap;
+                                backfit_mix_label_top1_accuracy_overlap = BackfitDiagnostics.mixture.label_top1_accuracy_overlap;
+                                backfit_mix_label_weight_mae = BackfitDiagnostics.mixture.label_weight_mae;
+                                backfit_mix_label_weight_mae_overlap = BackfitDiagnostics.mixture.label_weight_mae_overlap;
+                            end
                             if CONFIG.save_backfit_details
                                 backfit_diagnostic_file = fullfile(backfit_dir, [subj_name '_backfit.mat']);
                                 backfit_payload = struct('BackfitDiagnostics', BackfitDiagnostics, ...
@@ -464,6 +509,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
                         'sim_qc_gfp_median_uv', sim_qc_gfp_median_uv, ...
                         'sim_qc_mean_dwell_ms', sim_qc_mean_dwell_ms, ...
                         'K_estimated', K_selected, ...
+                        'K_gap', fit_result.K_true - K_selected, ...
                         'K_correct', fit_result.K_true == K_selected, ...
                         'K_error', abs(fit_result.K_true - K_selected), ...
                         'n_maps', Results.n_maps, ...
@@ -485,6 +531,20 @@ function T = simulated_ms_retrieval_experiment(varargin)
                         'backfit_coverage_mae', backfit_coverage_mae, ...
                         'backfit_coverage_rmse', backfit_coverage_rmse, ...
                         'backfit_coverage_l1', backfit_coverage_l1, ...
+                        'backfit_overlap_fraction', backfit_overlap_fraction, ...
+                        'backfit_hard_cluster_top1_accuracy', backfit_hard_cluster_top1_accuracy, ...
+                        'backfit_hard_label_top1_accuracy', backfit_hard_label_top1_accuracy, ...
+                        'backfit_hard_cluster_top1_accuracy_overlap', backfit_hard_cluster_top1_accuracy_overlap, ...
+                        'backfit_hard_label_top1_accuracy_overlap', backfit_hard_label_top1_accuracy_overlap, ...
+                        'backfit_hard_label_weight_mae', backfit_hard_label_weight_mae, ...
+                        'backfit_hard_label_weight_mae_overlap', backfit_hard_label_weight_mae_overlap, ...
+                        'backfit_mix_available', backfit_mix_available, ...
+                        'backfit_mix_cluster_top1_accuracy', backfit_mix_cluster_top1_accuracy, ...
+                        'backfit_mix_label_top1_accuracy', backfit_mix_label_top1_accuracy, ...
+                        'backfit_mix_cluster_top1_accuracy_overlap', backfit_mix_cluster_top1_accuracy_overlap, ...
+                        'backfit_mix_label_top1_accuracy_overlap', backfit_mix_label_top1_accuracy_overlap, ...
+                        'backfit_mix_label_weight_mae', backfit_mix_label_weight_mae, ...
+                        'backfit_mix_label_weight_mae_overlap', backfit_mix_label_weight_mae_overlap, ...
                         'backfit_diagnostic_file', backfit_diagnostic_file, ...
                         'best_score', SelectedResults.best_criterion_value, ...
                         'json_file', json_file, ...
@@ -548,7 +608,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
     end
     
     % Convert to table
-    T = struct2table(rows);
+    T = struct2table(rows, 'AsArray', true);
     total_expected_fits = n_eeg_conditions * n_montages * n_methods;
     successful_fit_count = count_unique_method_fits(T);
     failed_fit_count = total_expected_fits - successful_fit_count;
@@ -586,7 +646,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
     fprintf('EEG Conditions: %d (overlap settings: %s)\n', n_eeg_conditions, mat2str(overlap_probs));
     fprintf('Montages: %d\n', n_montages);
     fprintf('Methods: %d\n', n_methods);
-    fprintf('Criteria (universal): %d\n', n_criteria);
+    fprintf('Valid method-criterion pairs: %d\n', n_method_criteria_pairs);
     fprintf('Total Fits: %d (EEG conditions × montages × methods)\n', n_eeg_conditions * n_montages * n_methods);
     fprintf('Total Results: %d (one per method×criterion per montage per EEG)\n', height(T));
     if CONFIG.save_json
@@ -617,6 +677,11 @@ function Tcrit = k_selection_summary_by_method_criterion(T)
 end
 
 function K_selected = select_K_by_criterion(Results, criterion)
+    if isfield(Results, 'method') && strcmpi(char(string(Results.method)), 'spm_vb')
+        [K_selected, ~] = select_spm_vb_k_by_criterion(Results, criterion);
+        return;
+    end
+
     switch criterion
         case 'silhouette'
             if isfield(Results, 'silhouette_vals') && ~isempty(Results.silhouette_vals)
@@ -632,29 +697,14 @@ function K_selected = select_K_by_criterion(Results, criterion)
                 K_selected = NaN;
             end
             
-        case 'gev'
-            if isfield(Results, 'gev_vals') && ~isempty(Results.gev_vals)
-                gev = Results.gev_vals;
-                valid_idx = gev > 0 & isfinite(gev);
+        case {'free_energy_elbow', 'elbow'}
+            if isfield(Results, 'free_energy_vals') && ~isempty(Results.free_energy_vals)
+                fe = Results.free_energy_vals;
+                valid_idx = ~isinf(fe) & fe ~= 0 & isfinite(fe);
                 if any(valid_idx)
-                    [~, idx] = max(gev(valid_idx));
-                    valid_k = find(valid_idx);
-                    K_selected = Results.K_candidates(valid_k(idx));
-                else
-                    K_selected = NaN;
-                end
-            else
-                K_selected = NaN;
-            end
-            
-        case 'elbow'
-            if isfield(Results, 'within_ss') && ~isempty(Results.within_ss)
-                wss = Results.within_ss;
-                valid_idx = isfinite(wss) & wss > 0;
-                if any(valid_idx)
-                    wss_v = wss(valid_idx);
+                    fe_v = fe(valid_idx);
                     k_cand_v = Results.K_candidates(valid_idx);
-                    [K_selected, ~] = select_K_from_elbow_helper(wss_v, k_cand_v);
+                    [K_selected, ~] = select_K_from_free_energy_elbow_helper(fe_v, k_cand_v);
                 else
                     K_selected = NaN;
                 end
@@ -687,6 +737,15 @@ end
 
 function score = criterion_specific_best_score(Results, K_selected, criterion)
     score = NaN;
+    if isfield(Results, 'method') && strcmpi(char(string(Results.method)), 'spm_vb')
+        [~, score, score_by_k] = select_spm_vb_k_by_criterion(Results, criterion);
+        idx_spm = find(double(Results.K_candidates(:)) == double(K_selected), 1, 'first');
+        if ~isempty(idx_spm) && numel(score_by_k) >= idx_spm && isfinite(score_by_k(idx_spm))
+            score = score_by_k(idx_spm);
+        end
+        return;
+    end
+
     idx = find(double(Results.K_candidates(:)) == double(K_selected), 1, 'first');
     if isempty(idx)
         if isfield(Results, 'best_criterion_value')
@@ -703,19 +762,44 @@ function score = criterion_specific_best_score(Results, K_selected, criterion)
             if isfield(Results, 'free_energy_vals') && numel(Results.free_energy_vals) >= idx
                 score = Results.free_energy_vals(idx);
             end
-        case 'gev'
-            if isfield(Results, 'gev_vals') && numel(Results.gev_vals) >= idx
-                score = Results.gev_vals(idx);
-            end
-        case 'elbow'
-            if isfield(Results, 'within_ss') && numel(Results.within_ss) >= idx
-                score = Results.within_ss(idx);
+        case {'free_energy_elbow', 'elbow'}
+            if isfield(Results, 'free_energy_vals') && ~isempty(Results.free_energy_vals)
+                valid_idx = ~isinf(Results.free_energy_vals(:)) & Results.free_energy_vals(:) ~= 0 & isfinite(Results.free_energy_vals(:));
+                fe_v = Results.free_energy_vals(valid_idx);
+                k_cand_v = Results.K_candidates(valid_idx);
+                [~, curvature_by_k] = select_K_from_free_energy_elbow_helper(fe_v, k_cand_v);
+                hit = find(double(k_cand_v(:)) == double(K_selected), 1, 'first');
+                if ~isempty(hit) && numel(curvature_by_k) >= hit
+                    score = curvature_by_k(hit);
+                end
             end
         otherwise
             if isfield(Results, 'best_criterion_value')
                 score = Results.best_criterion_value;
             end
     end
+end
+
+function [K_est, curvature_vals] = select_K_from_free_energy_elbow_helper(fe_vals, K_candidates)
+    n = length(fe_vals);
+    curvature_vals = zeros(n, 1);
+    if n < 3
+        [~, idx] = max(fe_vals);
+        K_est = K_candidates(idx);
+        curvature_vals(idx) = fe_vals(idx);
+        return;
+    end
+
+    fe_norm = (fe_vals - min(fe_vals)) / (max(fe_vals) - min(fe_vals) + eps);
+    k_norm = (K_candidates - min(K_candidates)) / (max(K_candidates) - min(K_candidates) + eps);
+    p1 = [k_norm(1), fe_norm(1)];
+    p2 = [k_norm(end), fe_norm(end)];
+    for i = 2:(n - 1)
+        p = [k_norm(i), fe_norm(i)];
+        curvature_vals(i) = distance_from_line_local(p1, p2, p);
+    end
+    [~, idx] = max(curvature_vals);
+    K_est = K_candidates(idx);
 end
 
 function [K_est, score] = select_K_from_elbow_helper(wss_vals, K_candidates)
@@ -741,6 +825,41 @@ function [K_est, score] = select_K_from_elbow_helper(wss_vals, K_candidates)
     
     K_est = K_candidates(idx);
     score = curvature(idx);
+end
+
+function d = distance_from_line_local(p1, p2, p)
+    d = abs((p2(2)-p1(2))*p(1) - (p2(1)-p1(1))*p(2) + p2(1)*p1(2) - p2(2)*p1(1)) / ...
+        sqrt((p2(2)-p1(2))^2 + (p2(1)-p1(1))^2 + eps);
+end
+
+function [method_names, method_criteria_map, all_criteria, n_pairs] = build_method_criteria_design(methods_in, criteria_in)
+    method_names = cellstr(string(methods_in(:)'));
+    requested_criteria = cellstr(string(criteria_in(:)'));
+    supported_map = containers.Map('KeyType', 'char', 'ValueType', 'any');
+    supported_map('spm_vb') = {'silhouette', 'free_energy', 'free_energy_elbow', 'elbow_sil_combined', 'covariance_elbow', 'free_energy_covariance'};
+    supported_map('kmeans_koenig') = {'silhouette'};
+
+    method_criteria_map = containers.Map('KeyType', 'char', 'ValueType', 'any');
+    all_criteria = {};
+    n_pairs = 0;
+    for i = 1:numel(method_names)
+        method_str = method_names{i};
+        if ~isKey(supported_map, method_str)
+            error('Unsupported simulation method: %s', method_str);
+        end
+        supported = supported_map(method_str);
+        criteria_this = requested_criteria(ismember(requested_criteria, supported));
+        if isempty(criteria_this)
+            error('No requested criteria are supported for method %s.', method_str);
+        end
+        invalid_requested = requested_criteria(~ismember(requested_criteria, supported));
+        if ~isempty(invalid_requested)
+            fprintf('Skipping unsupported criteria for %s: %s\n', method_str, strjoin(invalid_requested, ', '));
+        end
+        method_criteria_map(method_str) = criteria_this;
+        all_criteria = unique([all_criteria, criteria_this], 'stable'); %#ok<AGROW>
+        n_pairs = n_pairs + numel(criteria_this);
+    end
 end
 
 function save_summary_info(CONFIG, ch_labels, montage_pos, output_dir)

@@ -50,7 +50,8 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     
     % Generate clean EEG (store segments for optional overlap)
     X_clean_base = zeros(C, T);
-    z = zeros(1, T);  %#ok<NASGU> % Ground-truth labels (dominant state per sample)
+    z = zeros(1, T);  % Ground-truth dominant labels per sample
+    state_weights_base = zeros(K_true, T);
     segments = struct('state', {}, 'start', {}, 'len', {}, 'template', {}, 'gfp', {});
     
     p_switch = 1 / mean_dur_samples;
@@ -77,6 +78,7 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
             'gfp', gfp_env); %#ok<AGROW>
         
         z(seg_idx) = cur_state;
+        state_weights_base(cur_state, seg_idx) = 1;
         
         % Pick next state
         if K_true > 1
@@ -96,8 +98,10 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     end
     
     rng_state = rng;  % isolate overlap randomness from downstream noise generation
-    [X_clean, overlap_events] = apply_microstate_overlap(X_clean_base, segments, overlap_opts, sfreq, T);
+    [X_clean, state_weights_true, overlap_events] = apply_microstate_overlap( ...
+        X_clean_base, state_weights_base, segments, overlap_opts, sfreq, T);
     rng(rng_state);
+    [~, z] = max(state_weights_true, [], 1);
     
     % Generate PINK noise with REALISTIC AMPLITUDE
     % Background EEG: 5-20 µV RMS (let's use 10 µV as baseline)
@@ -139,6 +143,7 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         'X_noisy', X_noisy, ...
         'maps_true', maps_true, ...  % In µV
         'z_true', z, ...
+        'state_weights_true', state_weights_true, ...
         'sfreq', sfreq, ...
         'pos', pos, ...
         'chanlocs', chanlocs, ...  % Channel location structure
@@ -172,13 +177,14 @@ function opts = fill_overlap_defaults(opts, defaults)
     end
 end
 
-function [X_out, events] = apply_microstate_overlap(X_base, segments, overlap_opts, sfreq, T)
+function [X_out, weights_out, events] = apply_microstate_overlap(X_base, weights_base, segments, overlap_opts, sfreq, T)
 % APPLY_MICROSTATE_OVERLAP: inject partial overlap around segment boundaries
 %
 % Uses cross-fade style mixing so adjacent states co-activate without
 % exploding amplitude. The base signal remains untouched when prob = 0.
 
     X_out = X_base;
+    weights_out = weights_base;
     events = struct('boundary_sample', {}, 'overlap_len', {}, 'strength', {});
     
     if overlap_opts.prob <= 0 || numel(segments) < 2
@@ -211,6 +217,9 @@ function [X_out, events] = apply_microstate_overlap(X_base, segments, overlap_op
             b_idx = min(i, numel(seg_b.gfp));
             bleed = seg_b.template * seg_b.gfp(b_idx);
             X_out(:, idx) = (1 - w_forward(i)) * X_out(:, idx) + w_forward(i) * bleed;
+            next_weight = zeros(size(weights_out, 1), 1);
+            next_weight(seg_b.state) = 1;
+            weights_out(:, idx) = (1 - w_forward(i)) * weights_out(:, idx) + w_forward(i) * next_weight;
         end
         
         % Fade-out of previous state into start of next state
@@ -221,6 +230,9 @@ function [X_out, events] = apply_microstate_overlap(X_base, segments, overlap_op
             a_idx = max(1, seg_a.len - overlap_len + i);
             bleed = seg_a.template * seg_a.gfp(a_idx);
             X_out(:, idx) = (1 - w_backward(i)) * X_out(:, idx) + w_backward(i) * bleed;
+            prev_weight = zeros(size(weights_out, 1), 1);
+            prev_weight(seg_a.state) = 1;
+            weights_out(:, idx) = (1 - w_backward(i)) * weights_out(:, idx) + w_backward(i) * prev_weight;
         end
         
         events(end+1) = struct(...
@@ -228,6 +240,9 @@ function [X_out, events] = apply_microstate_overlap(X_base, segments, overlap_op
             'overlap_len', overlap_len, ...
             'strength', strength); %#ok<AGROW>
     end
+
+    weights_out = max(weights_out, 0);
+    weights_out = weights_out ./ max(sum(weights_out, 1), eps);
 end
 
 % ======================== CHANNEL MONTAGE ========================
@@ -265,8 +280,13 @@ function [pos, chanlocs, channel_labels] = load_chanlocs_from_template()
             return;
         end
         
-        chanlocs = EEG_template.chanlocs;
+        util = microstate_utilities();
+        [chanlocs, keep_idx, pos] = util.prepare_metamaps_chanlocs(EEG_template.chanlocs);
         n_channels = length(chanlocs);
+        if n_channels == 0
+            fprintf('Error: Template has no usable channel locations\n');
+            return;
+        end
         
         % ✅ NEW: Extract channel labels from chanlocs
         channel_labels = cell(n_channels, 1);
@@ -280,33 +300,10 @@ function [pos, chanlocs, channel_labels] = load_chanlocs_from_template()
         
         fprintf('✓ Extracted %d channel labels\n', length(channel_labels));
         
-        % Extract 3D positions
-        pos = zeros(n_channels, 3);
-        valid_coords = 0;
-        
-        for i = 1:n_channels
-            if ~isempty(chanlocs(i).X) && ~isempty(chanlocs(i).Y) && ~isempty(chanlocs(i).Z)
-                pos(i, :) = [chanlocs(i).X, chanlocs(i).Y, chanlocs(i).Z];
-                valid_coords = valid_coords + 1;
-            else
-                % Fallback: convert from spherical coordinates
-                if ~isempty(chanlocs(i).theta) && ~isempty(chanlocs(i).radius)
-                    [x, y, z] = sph2cart(deg2rad(chanlocs(i).theta), ...
-                                        deg2rad(90 - chanlocs(i).radius), 1);
-                    pos(i, :) = [x, y, z];
-                    valid_coords = valid_coords + 1;
-                end
-            end
+        valid_coords = sum(all(isfinite(pos), 2));
+        if numel(keep_idx) < numel(EEG_template.chanlocs)
+            fprintf('✓ Retained %d/%d usable template channels\n', numel(keep_idx), numel(EEG_template.chanlocs));
         end
-        
-        % Normalize positions to unit sphere
-        for i = 1:size(pos, 1)
-            r = norm(pos(i, :));
-            if r > 0
-                pos(i, :) = pos(i, :) / r;
-            end
-        end
-        
         fprintf('✓ Loaded %d channels with valid 3D coordinates\n', valid_coords);
         
     catch ME

@@ -88,7 +88,9 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
     
     % Validate method and criterion combination
     if strcmp(CONFIG.method, 'spm_vb') && strcmp(CONFIG.criterion, 'gev')
-        error('GEV criterion is not supported for spm_vb method. Use ''silhouette'', ''free_energy'', ''elbow'', or ''elbow_sil_combined'' instead.');
+        error(['GEV criterion is not supported for spm_vb method. Use ', ...
+            '''silhouette'', ''free_energy'', ''elbow'', ''elbow_sil_combined'', ', ...
+            '''covariance_elbow'', or ''free_energy_covariance'' instead.']);
     end
     if strcmp(CONFIG.method, 'spm_kmeans') && (strcmp(CONFIG.criterion, 'free_energy') || strcmp(CONFIG.criterion, 'elbow_sil_combined'))
         error('Criterion %s is not supported for spm_kmeans method. Use ''silhouette'', ''gev'', or ''elbow'' instead.', CONFIG.criterion);
@@ -317,6 +319,14 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
             end
         end
     end
+
+    try
+        Results.backfit_timecourse = backfit_microstate_timecourse(Sim, Results);
+    catch ME
+        if CONFIG.verbose
+            fprintf('Backfit timecourse generation skipped: %s\n', ME.message);
+        end
+    end
     
     % Display results
     util = microstate_utilities();
@@ -496,6 +506,7 @@ function [Results, json_file] = analyze_single_eeg_file(eeg_file, varargin)
         catch ME
             if CONFIG.verbose
                 fprintf('⚠ Warning: Could not generate plots: %s\n', ME.message);
+                fprintf('%s\n', getReport(ME, 'extended', 'hyperlinks', 'off'));
             end
         end
     end

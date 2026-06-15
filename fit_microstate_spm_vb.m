@@ -4,7 +4,9 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
 % INPUTS:
 %   Sim          - Simulation structure
 %   K_candidates - Vector of K values to test
-%   criterion    - 'silhouette', 'free_energy', or 'elbow_sil_combined'
+%   criterion    - 'silhouette', 'free_energy', 'free_energy_elbow',
+%                  'elbow_sil_combined', 'covariance_elbow', or
+%                  'free_energy_covariance'
 %
 % OUTPUTS:
 %   Results      - Complete results with recovery metrics
@@ -18,7 +20,9 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     
     % GEV criterion is only valid for k-means methods, not for VB/GMM
     if strcmp(criterion, 'gev')
-        error('GEV criterion is not supported for spm_vb method. Use ''silhouette'', ''free_energy'', ''elbow'', or ''elbow_sil_combined'' instead.');
+        error(['GEV criterion is not supported for spm_vb method. Use ', ...
+            '''silhouette'', ''free_energy'', ''elbow'', ''elbow_sil_combined'', ', ...
+            '''covariance_elbow'', or ''free_energy_covariance'' instead.']);
     end
     
     t_start = tic;
@@ -69,6 +73,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     labels_all = cell(nK, 1);
     K_effective = K_candidates(:);
     polarity_duplicate_info = cell(nK, 1);
+    feature_backfit_models = cell(nK, 1);
 
     for iK = 1:nK
         K = K_candidates(iK);
@@ -100,6 +105,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
                 centers_all{iK} = temp_centers;
                 K_effective(iK) = K_eff;
                 polarity_duplicate_info{iK} = detect_polarity_duplicate_centers(temp_centers, 0.85);
+                feature_backfit_models{iK} = build_feature_backfit_model(features, labels, K_eff);
                 sim = abs(maps_original * temp_centers');
                 [max_sim, ~] = max(sim, [], 2);
                 gfp_squared = sum(maps_original.^2, 2);
@@ -146,46 +152,53 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     K_valid = K_candidates(valid_idx);
     sil_valid = silhouette_score(valid_idx);
     wss_valid = within_ss(valid_idx);
+    [cov_trace_mean_vals, cov_trace_median_vals, cov_logdet_mean_vals, ...
+        cov_logdet_median_vals, cov_logdet_per_dim_mean_vals] = ...
+        summarise_covariance_arrays(spm_mix_model_summaries);
     
     fprintf('\nModel selection using: %s\n', criterion);
-    
-    % Select based on criterion (KOENIG METHOD - no 2nd derivatives)
-    switch criterion
-        case 'silhouette'
-            % KOENIG METHOD: Simple maximum silhouette
-            [best_score, idx] = max(sil_valid);
-            K_estimated = K_valid(idx);
-            best_idx = find(valid_idx);
-            best_idx = best_idx(idx);
-            fprintf('  Silhouette (Koenig): selected K=%d (score=%.4f)\n', K_estimated, best_score);
-            
-        case 'free_energy'
-            % Maximum free energy
-            [best_score, idx] = max(fe_valid);
-            K_estimated = K_valid(idx);
-            best_idx = find(valid_idx);
-            best_idx = best_idx(idx);
-            fprintf('  Free Energy: selected K=%d (FE=%.1f)\n', K_estimated, best_score);
-            
-        case 'elbow'
-            % Elbow method on within-cluster SS
-            [K_estimated, best_score] = select_K_from_elbow_spm(wss_valid, K_valid);
-            best_idx = find(valid_idx);
-            best_idx_local = find(K_valid == K_estimated, 1);
-            best_idx = best_idx(best_idx_local);
-            
-        case 'elbow_sil_combined'
-            % Original combined approach (kept for backwards compatibility)
-            [K_estimated, best_score] = select_K_combined_elbow_silhouette(fe_valid, K_valid, sil_valid);
-            best_idx = find(valid_idx);
-            best_idx_local = find(K_valid == K_estimated, 1);
-            best_idx = best_idx(best_idx_local);
-            
-        otherwise
-            error('Unknown criterion: %s', criterion);
+
+    selection_payload = struct( ...
+        'K_candidates', K_candidates(:), ...
+        'free_energy_vals', free_energy(:), ...
+        'silhouette_vals', silhouette_score(:), ...
+        'covariance_trace_mean_vals', cov_trace_mean_vals(:), ...
+        'covariance_trace_median_vals', cov_trace_median_vals(:), ...
+        'covariance_logdet_mean_vals', cov_logdet_mean_vals(:), ...
+        'covariance_logdet_median_vals', cov_logdet_median_vals(:), ...
+        'covariance_logdet_per_dim_mean_vals', cov_logdet_per_dim_mean_vals(:), ...
+        'spm_mix_model_summaries', spm_mix_model_summaries);
+    [K_model_selected, best_score, selection_score_by_k, selection_details] = ...
+        select_spm_vb_k_by_criterion(selection_payload, criterion);
+    if ~isfinite(K_model_selected)
+        [best_score, idx] = max(fe_valid);
+        K_model_selected = K_valid(idx);
     end
-    
-    K_model_selected = K_candidates(best_idx);
+    best_idx = find(double(K_candidates(:)) == double(K_model_selected), 1, 'first');
+    if isempty(best_idx)
+        [~, idx] = max(fe_valid);
+        best_idx = find(valid_idx);
+        best_idx = best_idx(idx);
+        K_model_selected = K_candidates(best_idx);
+    end
+
+    switch lower(strtrim(char(string(criterion))))
+        case 'silhouette'
+            fprintf('  Silhouette (Koenig): selected K=%d (score=%.4f)\n', K_model_selected, best_score);
+        case 'free_energy'
+            fprintf('  Free Energy: selected K=%d (FE=%.1f)\n', K_model_selected, best_score);
+        case {'free_energy_elbow', 'elbow'}
+            fprintf('  Free-energy elbow: selected K=%d (score=%.4f)\n', K_model_selected, best_score);
+        case 'elbow_sil_combined'
+            fprintf('  Combined (Elbow+Silhouette): selected K=%d (score=%.4f)\n', K_model_selected, best_score);
+        case 'covariance_elbow'
+            fprintf('  Covariance elbow: selected K=%d (score=%.4f)\n', K_model_selected, best_score);
+        case {'free_energy_covariance', 'covariance_free_energy', 'free_energy_covariance_hybrid'}
+            fprintf('  Free-energy+covariance: selected K=%d (score=%.4f)\n', K_model_selected, best_score);
+        otherwise
+            fprintf('  %s: selected K=%d (score=%.4f)\n', criterion, K_model_selected, best_score);
+    end
+            
     K_estimated = K_effective(best_idx);
     fprintf('Best model K: %d; effective polarity-invariant K: %d\n', ...
         K_model_selected, K_estimated);
@@ -276,11 +289,20 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     'free_energy_vals', free_energy, ...      
     'within_ss', within_ss, ...            
     'gev_vals', gev_vals, ...             
+    'covariance_trace_mean_vals', cov_trace_mean_vals, ...
+    'covariance_trace_median_vals', cov_trace_median_vals, ...
+    'covariance_logdet_mean_vals', cov_logdet_mean_vals, ...
+    'covariance_logdet_median_vals', cov_logdet_median_vals, ...
+    'covariance_logdet_per_dim_mean_vals', cov_logdet_per_dim_mean_vals, ...
+    'selection_score_by_k', selection_score_by_k, ...
+    'selection_details', selection_details, ...
     'spm_mix_model_summaries', spm_mix_model_summaries, ...
     'selected_spm_mix_model', spm_mix_model_summaries(best_idx), ...
     'selected_spm_covariances', spm_mix_model_summaries(best_idx).covariances, ...
     'selected_spm_means', spm_mix_model_summaries(best_idx).means, ...
     'selected_spm_priors', spm_mix_model_summaries(best_idx).priors, ...
+    'feature_backfit_models', {feature_backfit_models}, ...
+    'selected_feature_backfit_model', feature_backfit_models{best_idx}, ...
     'best_criterion_value', best_score, ...
     'maps_nc', maps_norm, ...
     'idx_peaks', idx_peaks, ...
@@ -396,6 +418,30 @@ function val = safe_logdet(C)
     end
 end
 
+function [trace_mean, trace_median, logdet_mean, logdet_median, logdet_per_dim] = summarise_covariance_arrays(summaries)
+    n = numel(summaries);
+    trace_mean = nan(n, 1);
+    trace_median = nan(n, 1);
+    logdet_mean = nan(n, 1);
+    logdet_median = nan(n, 1);
+    logdet_per_dim = nan(n, 1);
+
+    for i = 1:n
+        summary = summaries(i);
+        if isfield(summary, 'covariance_traces') && ~isempty(summary.covariance_traces)
+            trace_mean(i) = mean(summary.covariance_traces, 'omitnan');
+            trace_median(i) = median(summary.covariance_traces, 'omitnan');
+        end
+        if isfield(summary, 'covariance_logdets') && ~isempty(summary.covariance_logdets)
+            logdet_mean(i) = mean(summary.covariance_logdets, 'omitnan');
+            logdet_median(i) = median(summary.covariance_logdets, 'omitnan');
+        end
+        if isfield(summary, 'feature_dim') && isfinite(summary.feature_dim) && summary.feature_dim > 0 && isfinite(logdet_mean(i))
+            logdet_per_dim(i) = logdet_mean(i) / summary.feature_dim;
+        end
+    end
+end
+
 % ======================== K SELECTION HELPERS ========================
 
 function [K_est, score] = select_K_from_elbow_spm(wss_vals, K_candidates)
@@ -424,6 +470,30 @@ function [K_est, score] = select_K_from_elbow_spm(wss_vals, K_candidates)
     score = curvature(idx);
     
     fprintf('  Elbow: K=%d (WSS=%.1f, curvature=%.4f)\n', K_est, wss_vals(idx), score);
+end
+
+function [K_est, score] = select_K_from_free_energy_curve(fe_vals, K_candidates)
+    n = length(fe_vals);
+    if n < 3
+        [score, idx] = max(fe_vals);
+        K_est = K_candidates(idx);
+        return;
+    end
+
+    fe_norm = (fe_vals - min(fe_vals)) / (max(fe_vals) - min(fe_vals) + eps);
+    k_norm = (K_candidates - min(K_candidates)) / (max(K_candidates) - min(K_candidates) + eps);
+    p1 = [k_norm(1), fe_norm(1)];
+    p2 = [k_norm(end), fe_norm(end)];
+    elbow_scores = zeros(size(fe_norm));
+    for i = 2:(n - 1)
+        p = [k_norm(i), fe_norm(i)];
+        elbow_scores(i) = abs((p2(2)-p1(2))*p(1) - (p2(1)-p1(1))*p(2) + ...
+            p2(1)*p1(2) - p2(2)*p1(1)) / ...
+            sqrt((p2(2)-p1(2))^2 + (p2(1)-p1(1))^2 + eps);
+    end
+    [score, idx] = max(elbow_scores);
+    K_est = K_candidates(idx);
+    fprintf('  Free-energy elbow: K=%d (FE=%.1f, curvature=%.4f)\n', K_est, fe_vals(idx), score);
 end
 
 function [K_est, score] = select_K_combined_elbow_silhouette(fe_valid, K_valid, sil_valid)
@@ -498,7 +568,7 @@ function [features, info] = pca_features_for_spm(maps_norm)
 %PCA_FEATURES_FOR_SPM Return a numerically stable feature space for spm_mix.
 
     [N, D] = size(maps_norm);
-    [coeff, score, latent] = pca(maps_norm, 'Centered', true);
+    [coeff, score, latent, ~, ~, mu] = pca(maps_norm, 'Centered', true);
     latent = real(latent(:));
     total_var = sum(latent);
     if total_var <= eps
@@ -532,7 +602,9 @@ function [features, info] = pca_features_for_spm(maps_norm)
         'n_dims', n_dims, ...
         'variance_explained_pct', 100 * var_explained(n_dims), ...
         'coeff', coeff(:, 1:n_dims), ...
-        'latent', latent(1:n_dims));
+        'latent', latent(1:n_dims), ...
+        'mean', mu(:)', ...
+        'scale', scale(1:n_dims));
 end
 
 function [features_projective, info] = polarity_invariant_projective_features(features_linear)
@@ -560,7 +632,8 @@ function [features_projective, info] = polarity_invariant_projective_features(fe
         end
     end
 
-    features_projective = features_projective - mean(features_projective, 1);
+    projective_mean = mean(features_projective, 1);
+    features_projective = features_projective - projective_mean;
     sd = std(features_projective, 0, 1);
     keep = sd > (10 * eps);
     features_projective = features_projective(:, keep);
@@ -570,7 +643,57 @@ function [features_projective, info] = polarity_invariant_projective_features(fe
     info = struct('mode', 'projective_outer_product', ...
         'linear_dims', D, ...
         'projective_dims', size(features_projective, 2), ...
-        'dropped_constant_dims', n_features - size(features_projective, 2));
+        'dropped_constant_dims', n_features - size(features_projective, 2), ...
+        'keep_mask', keep, ...
+        'mean', projective_mean(keep), ...
+        'scale', sd);
+end
+
+function model = build_feature_backfit_model(features, labels, K)
+%BUILD_FEATURE_BACKFIT_MODEL Regularized Gaussian model aligned to final labels.
+
+    if nargin < 3
+        K = max(labels);
+    end
+    [N, D] = size(features);
+    means = zeros(K, D);
+    priors = zeros(K, 1);
+    covariances = zeros(D, D, K);
+    global_var = var(features, 0, 1);
+    global_var(~isfinite(global_var) | global_var < 1e-6) = 1e-6;
+    global_cov = diag(global_var);
+    ridge = max(1e-6, mean(global_var) * 1e-3);
+
+    for k = 1:K
+        idx = labels == k;
+        priors(k) = mean(idx);
+        if ~any(idx)
+            means(k, :) = mean(features, 1);
+            covariances(:, :, k) = global_cov + ridge * eye(D);
+            continue;
+        end
+        Xk = features(idx, :);
+        means(k, :) = mean(Xk, 1);
+        if size(Xk, 1) >= 2
+            Ck = cov(Xk, 1);
+        else
+            Ck = global_cov;
+        end
+        if ~all(isfinite(Ck(:))) || isempty(Ck)
+            Ck = global_cov;
+        end
+        Ck = (Ck + Ck') / 2;
+        covariances(:, :, k) = Ck + ridge * eye(D);
+    end
+
+    priors = priors / max(sum(priors), eps);
+    model = struct( ...
+        'means', means, ...
+        'covariances', covariances, ...
+        'priors', priors, ...
+        'feature_dim', D, ...
+        'n_components', K, ...
+        'ridge', ridge);
 end
 
 function info = detect_polarity_duplicate_centers(centers, threshold)
@@ -942,11 +1065,20 @@ function Results = create_empty_results(Sim, K_candidates, n_maps, C_dims, crite
         'silhouette_vals', -ones(numel(K_candidates), 1), ...
         'within_ss', Inf(numel(K_candidates), 1), ...
         'gev_vals', zeros(numel(K_candidates), 1), ...
+        'covariance_trace_mean_vals', nan(numel(K_candidates), 1), ...
+        'covariance_trace_median_vals', nan(numel(K_candidates), 1), ...
+        'covariance_logdet_mean_vals', nan(numel(K_candidates), 1), ...
+        'covariance_logdet_median_vals', nan(numel(K_candidates), 1), ...
+        'covariance_logdet_per_dim_mean_vals', nan(numel(K_candidates), 1), ...
+        'selection_score_by_k', nan(numel(K_candidates), 1), ...
+        'selection_details', struct(), ...
         'spm_mix_model_summaries', repmat(empty_spm_mix_summary(C_dims), numel(K_candidates), 1), ...
         'selected_spm_mix_model', empty_spm_mix_summary(C_dims), ...
         'selected_spm_covariances', nan(C_dims, C_dims, 0), ...
         'selected_spm_means', nan(0, C_dims), ...
         'selected_spm_priors', nan(0, 1), ...
+        'feature_backfit_models', {cell(numel(K_candidates), 1)}, ...
+        'selected_feature_backfit_model', struct(), ...
         'pca_info', struct(), ...
         'polarity_feature_info', struct(), ...
         'polarity_duplicate_info', {cell(numel(K_candidates), 1)}, ...

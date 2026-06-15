@@ -34,16 +34,15 @@ function plot_file = plot_real_eeg_microstate_topographies(json_file, eeg_file, 
     end
 
     [json_idx, set_idx] = match_json_channels_to_set(json_labels, chanlocs_all);
-    valid = has_usable_topoplot_location(chanlocs_all(set_idx));
-    json_idx = json_idx(valid);
-    set_idx = set_idx(valid);
-
+    [chanlocs, keep_idx] = prepare_real_topoplot_chanlocs(chanlocs_all(set_idx));
+    json_idx = json_idx(keep_idx);
+    set_idx = set_idx(keep_idx); %#ok<NASGU>
     if numel(json_idx) < 4
         error('Only %d channels could be matched to usable scalp locations.', numel(json_idx));
     end
 
-    chanlocs = chanlocs_all(set_idx);
     est_states = fieldnames(data.estimated_microstates);
+    est_states = sort_estimated_state_keys(data.estimated_microstates, est_states);
     K = numel(est_states);
     maps = zeros(K, numel(json_idx));
 
@@ -119,31 +118,176 @@ function [json_idx, set_idx] = match_json_channels_to_set(json_labels, chanlocs)
     end
 end
 
-function valid = has_usable_topoplot_location(chanlocs)
-    valid = false(1, numel(chanlocs));
-    for i = 1:numel(chanlocs)
-        has_polar = isfield(chanlocs(i), 'theta') && ~isempty(chanlocs(i).theta) && ...
-            isfield(chanlocs(i), 'radius') && ~isempty(chanlocs(i).radius) && ...
-            isfinite(chanlocs(i).theta) && isfinite(chanlocs(i).radius) && ...
-            chanlocs(i).radius > 0 && chanlocs(i).radius <= 0.5;
-        has_xyz = isfield(chanlocs(i), 'X') && ~isempty(chanlocs(i).X) && ...
-            isfield(chanlocs(i), 'Y') && ~isempty(chanlocs(i).Y) && ...
-            isfield(chanlocs(i), 'Z') && ~isempty(chanlocs(i).Z) && ...
-            all(isfinite([chanlocs(i).X chanlocs(i).Y chanlocs(i).Z])) && ...
-            norm([chanlocs(i).X chanlocs(i).Y chanlocs(i).Z]) > eps;
-        valid(i) = has_polar || (~isfield(chanlocs(i), 'radius') && has_xyz);
+function [chanlocs_out, keep_idx] = prepare_real_topoplot_chanlocs(chanlocs_in)
+    n = numel(chanlocs_in);
+    chanlocs_out = repmat(minimal_chanloc_template(), 1, 0);
+    keep_idx = [];
+    if n == 0
+        return;
+    end
+
+    keep = false(1, n);
+    out = repmat(minimal_chanloc_template(), 1, n);
+
+    for i = 1:n
+        out(i) = sanitize_chanloc_struct(chanlocs_in(i), i);
+
+        xyz = [ ...
+            local_scalar_numeric(getfield_if_present(out(i), 'X')), ...
+            local_scalar_numeric(getfield_if_present(out(i), 'Y')), ...
+            local_scalar_numeric(getfield_if_present(out(i), 'Z'))];
+        if all(isfinite(xyz)) && norm(xyz) > eps
+            xyz = xyz ./ norm(xyz);
+            keep(i) = true;
+            out(i) = fill_chanloc_geometry(out(i), xyz);
+            continue;
+        end
+
+        theta = local_scalar_numeric(getfield_if_present(out(i), 'theta'));
+        radius = local_scalar_numeric(getfield_if_present(out(i), 'radius'));
+        if isfinite(theta) && isfinite(radius) && radius > 0 && radius <= 0.5
+            x = radius * cosd(theta);
+            y = radius * sind(theta);
+            z = sqrt(max(0, 1 - min(1, radius / 0.5) .^ 2));
+            xyz = [x y z];
+            if all(isfinite(xyz)) && norm(xyz) > eps
+                xyz = xyz ./ norm(xyz);
+                keep(i) = true;
+                out(i) = fill_chanloc_geometry(out(i), xyz, theta, radius);
+            end
+        end
+    end
+
+    keep_idx = find(keep);
+    chanlocs_out = out(keep_idx);
+    if numel(chanlocs_out) < 4
+        error('Fewer than four matched channels have usable topoplot geometry.');
+    end
+end
+
+function out = sanitize_chanloc_struct(in, idx)
+    out = minimal_chanloc_template();
+    if ~isfield(in, 'labels') || isempty(in.labels)
+        out.labels = sprintf('Ch%d', idx);
+    else
+        out.labels = char(string(in.labels));
+    end
+
+    numeric_fields = {'X', 'Y', 'Z', 'theta', 'radius', 'sph_theta', 'sph_phi', 'sph_radius'};
+    for f = 1:numel(numeric_fields)
+        name = numeric_fields{f};
+        if isfield(in, name)
+            val = local_scalar_numeric(in.(name));
+        else
+            val = NaN;
+        end
+        if isfinite(val)
+            out.(name) = val;
+        else
+            out.(name) = [];
+        end
+    end
+end
+
+function out = fill_chanloc_geometry(out, xyz, theta_in, radius_in)
+    if nargin < 3
+        theta_in = NaN;
+    end
+    if nargin < 4
+        radius_in = NaN;
+    end
+    xyz = double(xyz(:)');
+    xyz = xyz ./ max(norm(xyz), eps);
+    out.X = xyz(1);
+    out.Y = xyz(2);
+    out.Z = xyz(3);
+
+    if ~(isfinite(theta_in) && isfinite(radius_in) && radius_in > 0 && radius_in <= 0.5)
+        theta_in = atan2d(xyz(2), xyz(1));
+        radius_in = 0.5 * sqrt(xyz(1).^2 + xyz(2).^2);
+    end
+    out.theta = theta_in;
+    out.radius = radius_in;
+    out.sph_theta = [];
+    out.sph_phi = [];
+    out.sph_radius = [];
+end
+
+function s = minimal_chanloc_template()
+    s = struct( ...
+        'labels', '', ...
+        'theta', [], ...
+        'radius', [], ...
+        'X', [], ...
+        'Y', [], ...
+        'Z', [], ...
+        'sph_theta', [], ...
+        'sph_phi', [], ...
+        'sph_radius', []);
+end
+
+function v = getfield_if_present(S, name)
+    if isfield(S, name)
+        v = S.(name);
+    else
+        v = [];
+    end
+end
+
+function x = local_scalar_numeric(v)
+    if isempty(v)
+        x = NaN;
+        return;
+    end
+    if isnumeric(v) || islogical(v)
+        v = double(v(:));
+        x = v(1);
+        return;
+    end
+    if ischar(v) || (isstring(v) && isscalar(v))
+        x = str2double(char(v));
+        if ~isfinite(x)
+            x = NaN;
+        end
+        return;
+    end
+    try
+        v = double(v);
+        v = v(:);
+        if isempty(v)
+            x = NaN;
+        else
+            x = v(1);
+        end
+    catch
+        x = NaN;
     end
 end
 
 function title_text = state_title(state_data, k)
     title_text = sprintf('State %d', k);
     if isfield(state_data, 'template_label')
-        title_text = sprintf('%s (%s', title_text, state_data.template_label);
+        title_text = sprintf('%s', char(string(state_data.template_label)));
+        detail = sprintf('state %d', k);
         if isfield(state_data, 'template_correlation')
-            title_text = sprintf('%s r=%.2f', title_text, state_data.template_correlation);
+            detail = sprintf('%s, r=%.2f', detail, state_data.template_correlation);
         end
-        title_text = sprintf('%s)', title_text);
+        title_text = sprintf('%s (%s)', title_text, detail);
     end
+end
+
+function ordered = sort_estimated_state_keys(estimated_microstates, est_states)
+    labels = cell(numel(est_states), 1);
+    for i = 1:numel(est_states)
+        state_data = estimated_microstates.(est_states{i});
+        if isfield(state_data, 'template_label') && ~isempty(state_data.template_label)
+            labels{i} = upper(strtrim(char(string(state_data.template_label))));
+        else
+            labels{i} = sprintf('ZZZ_%04d', i);
+        end
+    end
+    [~, ord] = sort(labels);
+    ordered = est_states(ord);
 end
 
 function title_text = json_title(data, json_file)

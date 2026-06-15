@@ -1,9 +1,10 @@
 function diagnostics = compute_simulation_backfit_diagnostics(Sim, Results, template_file, varargin)
-% COMPUTE_SIMULATION_BACKFIT_DIAGNOSTICS Compare backfit coverage to truth.
+%COMPUTE_SIMULATION_BACKFIT_DIAGNOSTICS Compare backfit outputs to truth.
 %
-% The true and estimated states are both projected into template-label
-% space, then the continuous noisy record is backfit against the selected
-% estimated maps using polarity-invariant correlation.
+% Reports sample-wise dominant-state accuracy, canonical label accuracy,
+% overlap-specific accuracy, and label-weight agreement for both:
+% 1. Hard winner-take-all backfitting
+% 2. Gaussian-mixture backfitting for SPM-VB fits
 
     p = inputParser;
     addRequired(p, 'Sim', @isstruct);
@@ -47,22 +48,88 @@ function diagnostics = compute_simulation_backfit_diagnostics(Sim, Results, temp
             'strong_threshold', p.Results.strong_threshold);
     end
 
-    X_fit = preprocess_full_record_for_backfit(Sim, util);
-    maps_norm = util.normalize_maps(X_fit');
-    centers_norm = util.normalize_maps(double(Results.centers));
-    sims = abs(maps_norm * centers_norm');
-    [~, est_idx] = max(sims, [], 2);
-    true_idx = Sim.z_true(:);
+    if isfield(Results, 'backfit_timecourse') && isstruct(Results.backfit_timecourse) && ...
+            isfield(Results.backfit_timecourse, 'ok') && Results.backfit_timecourse.ok
+        backfit = Results.backfit_timecourse;
+    else
+        backfit = backfit_microstate_timecourse(Sim, Results);
+    end
+    if ~isfield(backfit, 'ok') || ~backfit.ok
+        diagnostics.message = 'Backfit timecourse generation failed.';
+        if isfield(backfit, 'message')
+            diagnostics.message = backfit.message;
+        end
+        return;
+    end
+
+    true_state_weights = true_state_weight_matrix(Sim);
+    true_top_idx = dominant_state_index(true_state_weights);
+    overlap_mask = sum(true_state_weights > 1e-6, 2) > 1;
 
     true_state_labels = alignment_labels_or_fallback(true_alignment, size(Sim.maps_true, 1), 'T');
     est_state_labels = alignment_labels_or_fallback(estimated_alignment, size(Results.centers, 1), 'E');
     template_order = template_order_union(true_alignment, estimated_alignment, true_state_labels, est_state_labels);
 
-    true_sample_labels = true_state_labels(true_idx);
-    est_sample_labels = est_state_labels(est_idx);
+    est_to_true_idx = estimated_to_true_state_map(Sim.maps_true, Results.centers, util);
+    true_label_weights = aggregate_weights_by_label(true_state_weights, true_state_labels, template_order);
+    true_top_label_idx = dominant_state_index(true_label_weights);
 
-    coverage_true = label_coverage(true_sample_labels, template_order);
-    coverage_est = label_coverage(est_sample_labels, template_order);
+    hard = summarise_backfit_mode(backfit.hard.weights, est_to_true_idx, est_state_labels, ...
+        true_state_weights, true_top_idx, true_label_weights, true_top_label_idx, template_order, overlap_mask);
+
+    if isfield(backfit, 'mixture') && isfield(backfit.mixture, 'available') && backfit.mixture.available
+        mixture = summarise_backfit_mode(backfit.mixture.weights, est_to_true_idx, est_state_labels, ...
+            true_state_weights, true_top_idx, true_label_weights, true_top_label_idx, template_order, overlap_mask);
+        mixture.available = true;
+        mixture.message = 'ok';
+    else
+        mixture = empty_mode_summary(numel(template_order), size(true_state_weights, 2));
+        mixture.available = false;
+        if isfield(backfit, 'mixture') && isfield(backfit.mixture, 'message')
+            mixture.message = backfit.mixture.message;
+        else
+            mixture.message = 'Gaussian-mixture backfit unavailable.';
+        end
+    end
+
+    diagnostics.ok = true;
+    diagnostics.message = 'ok';
+    diagnostics.n_samples = size(true_state_weights, 1);
+    diagnostics.n_overlap_samples = sum(overlap_mask);
+    diagnostics.overlap_sample_fraction = mean(overlap_mask);
+    diagnostics.template_labels = template_order(:);
+    diagnostics.true_state_template_labels = true_state_labels(:);
+    diagnostics.estimated_state_template_labels = est_state_labels(:);
+    diagnostics.estimated_to_true_state_index = est_to_true_idx(:);
+    diagnostics.true_alignment = true_alignment;
+    diagnostics.estimated_alignment = estimated_alignment;
+    diagnostics.hard = hard;
+    diagnostics.mixture = mixture;
+
+    % Preserve legacy top-level fields for existing consumers.
+    diagnostics.coverage_true = hard.coverage_true(:);
+    diagnostics.coverage_estimated = hard.coverage_estimated(:);
+    diagnostics.coverage_difference = hard.coverage_difference(:);
+    diagnostics.coverage_corr = hard.coverage_corr;
+    diagnostics.coverage_spearman = hard.coverage_spearman;
+    diagnostics.coverage_mae = hard.coverage_mae;
+    diagnostics.coverage_rmse = hard.coverage_rmse;
+    diagnostics.coverage_l1 = hard.coverage_l1;
+    diagnostics.coverage_linf = hard.coverage_linf;
+    diagnostics.confusion_counts = hard.label_confusion_counts;
+    diagnostics.confusion_row_normalized = hard.label_confusion_row_normalized;
+end
+
+function summary = summarise_backfit_mode(est_cluster_weights, est_to_true_idx, est_state_labels, ...
+        true_state_weights, true_top_idx, true_label_weights, true_top_label_idx, template_order, overlap_mask)
+
+    pred_true_weights = project_estimated_weights_to_true_states(est_cluster_weights, est_to_true_idx, size(true_state_weights, 2));
+    pred_label_weights = aggregate_weights_by_label(est_cluster_weights, est_state_labels, template_order);
+    pred_top_true_idx = dominant_state_index(pred_true_weights);
+    pred_top_label_idx = dominant_state_index(pred_label_weights);
+
+    coverage_true = mean(true_label_weights, 1)';
+    coverage_est = mean(pred_label_weights, 1)';
     active = coverage_true > 0 | coverage_est > 0;
     if ~any(active)
         active(:) = true;
@@ -76,43 +143,107 @@ function diagnostics = compute_simulation_backfit_diagnostics(Sim, Results, temp
         coverage_spearman = NaN;
     end
 
-    confusion_counts = label_confusion_counts(true_sample_labels, est_sample_labels, template_order);
-    row_sums = sum(confusion_counts, 2);
-    confusion_row_normalized = confusion_counts ./ max(row_sums, 1);
+    label_confusion_counts = confusion_from_indices(true_top_label_idx, pred_top_label_idx, numel(template_order));
+    row_sums = sum(label_confusion_counts, 2);
+    label_confusion_row_normalized = label_confusion_counts ./ max(row_sums, 1);
+    cluster_confusion_counts = confusion_from_indices(true_top_idx, pred_top_true_idx, size(true_state_weights, 2));
 
-    diagnostics.ok = true;
-    diagnostics.message = 'ok';
-    diagnostics.n_samples = numel(true_idx);
-    diagnostics.template_labels = template_order(:);
-    diagnostics.true_state_template_labels = true_state_labels(:);
-    diagnostics.estimated_state_template_labels = est_state_labels(:);
-    diagnostics.coverage_true = coverage_true(:);
-    diagnostics.coverage_estimated = coverage_est(:);
-    diagnostics.coverage_difference = (coverage_est(:) - coverage_true(:));
-    diagnostics.coverage_corr = coverage_corr;
-    diagnostics.coverage_spearman = coverage_spearman;
-    diagnostics.coverage_mae = mean(abs(diff_vec), 'omitnan');
-    diagnostics.coverage_rmse = sqrt(mean(diff_vec .^ 2, 'omitnan'));
-    diagnostics.coverage_l1 = sum(abs(diff_vec), 'omitnan');
-    diagnostics.coverage_linf = max(abs(diff_vec));
-    diagnostics.confusion_counts = confusion_counts;
-    diagnostics.confusion_row_normalized = confusion_row_normalized;
-    diagnostics.true_alignment = true_alignment;
-    diagnostics.estimated_alignment = estimated_alignment;
+    summary = struct();
+    summary.cluster_top1_accuracy = mean(pred_top_true_idx == true_top_idx);
+    summary.label_top1_accuracy = mean(pred_top_label_idx == true_top_label_idx);
+    summary.cluster_top1_accuracy_overlap = masked_accuracy(pred_top_true_idx, true_top_idx, overlap_mask);
+    summary.label_top1_accuracy_overlap = masked_accuracy(pred_top_label_idx, true_top_label_idx, overlap_mask);
+    summary.cluster_weight_mae = mean(abs(pred_true_weights - true_state_weights), 'all');
+    summary.label_weight_mae = mean(abs(pred_label_weights - true_label_weights), 'all');
+    summary.cluster_weight_mae_overlap = masked_weight_mae(pred_true_weights, true_state_weights, overlap_mask);
+    summary.label_weight_mae_overlap = masked_weight_mae(pred_label_weights, true_label_weights, overlap_mask);
+    summary.coverage_true = coverage_true(:);
+    summary.coverage_estimated = coverage_est(:);
+    summary.coverage_difference = coverage_est(:) - coverage_true(:);
+    summary.coverage_corr = coverage_corr;
+    summary.coverage_spearman = coverage_spearman;
+    summary.coverage_mae = mean(abs(diff_vec), 'omitnan');
+    summary.coverage_rmse = sqrt(mean(diff_vec .^ 2, 'omitnan'));
+    summary.coverage_l1 = sum(abs(diff_vec), 'omitnan');
+    summary.coverage_linf = max(abs(diff_vec));
+    summary.cluster_confusion_counts = cluster_confusion_counts;
+    summary.label_confusion_counts = label_confusion_counts;
+    summary.label_confusion_row_normalized = label_confusion_row_normalized;
+    summary.true_top_cluster_index = true_top_idx(:);
+    summary.pred_top_cluster_index = pred_top_true_idx(:);
+    summary.true_top_label_index = true_top_label_idx(:);
+    summary.pred_top_label_index = pred_top_label_idx(:);
 end
 
-function X_fit = preprocess_full_record_for_backfit(Sim, util)
-    X_fit = double(Sim.X_noisy);
-    cfg = struct();
-    if isfield(Sim, 'preprocessing') && isstruct(Sim.preprocessing)
-        cfg = Sim.preprocessing;
+function summary = empty_mode_summary(n_labels, K_true)
+    summary = struct( ...
+        'cluster_top1_accuracy', NaN, ...
+        'label_top1_accuracy', NaN, ...
+        'cluster_top1_accuracy_overlap', NaN, ...
+        'label_top1_accuracy_overlap', NaN, ...
+        'cluster_weight_mae', NaN, ...
+        'label_weight_mae', NaN, ...
+        'cluster_weight_mae_overlap', NaN, ...
+        'label_weight_mae_overlap', NaN, ...
+        'coverage_true', nan(n_labels, 1), ...
+        'coverage_estimated', nan(n_labels, 1), ...
+        'coverage_difference', nan(n_labels, 1), ...
+        'coverage_corr', NaN, ...
+        'coverage_spearman', NaN, ...
+        'coverage_mae', NaN, ...
+        'coverage_rmse', NaN, ...
+        'coverage_l1', NaN, ...
+        'coverage_linf', NaN, ...
+        'cluster_confusion_counts', nan(K_true, K_true), ...
+        'label_confusion_counts', nan(n_labels, n_labels), ...
+        'label_confusion_row_normalized', nan(n_labels, n_labels), ...
+        'true_top_cluster_index', nan(0, 1), ...
+        'pred_top_cluster_index', nan(0, 1), ...
+        'true_top_label_index', nan(0, 1), ...
+        'pred_top_label_index', nan(0, 1));
+end
+
+function weights = true_state_weight_matrix(Sim)
+    if isfield(Sim, 'state_weights_true') && ~isempty(Sim.state_weights_true)
+        weights = double(Sim.state_weights_true');
+    else
+        K_true = size(Sim.maps_true, 1);
+        idx = Sim.z_true(:);
+        weights = zeros(numel(idx), K_true);
+        weights(sub2ind(size(weights), (1:numel(idx))', idx)) = 1;
     end
-    if isfield(cfg, 'apply_average_reference') && cfg.apply_average_reference
-        X_fit = X_fit - mean(X_fit, 1);
+    weights = weights ./ max(sum(weights, 2), eps);
+end
+
+function idx = dominant_state_index(weights)
+    [~, idx] = max(weights, [], 2);
+end
+
+function est_to_true_idx = estimated_to_true_state_map(true_maps, estimated_maps, util)
+    true_maps = util.normalize_maps(double(true_maps));
+    estimated_maps = util.normalize_maps(double(estimated_maps));
+    sim = abs(estimated_maps * true_maps');
+    [~, est_to_true_idx] = max(sim, [], 2);
+end
+
+function weights_true = project_estimated_weights_to_true_states(weights_est, est_to_true_idx, K_true)
+    weights_true = zeros(size(weights_est, 1), K_true);
+    for k = 1:numel(est_to_true_idx)
+        weights_true(:, est_to_true_idx(k)) = weights_true(:, est_to_true_idx(k)) + weights_est(:, k);
     end
-    if isfield(cfg, 'filter_band') && ~isempty(cfg.filter_band)
-        X_fit = util.bandpass_filter(X_fit, Sim.sfreq, cfg.filter_band);
+    weights_true = weights_true ./ max(sum(weights_true, 2), eps);
+end
+
+function label_weights = aggregate_weights_by_label(state_weights, state_labels, label_order)
+    label_weights = zeros(size(state_weights, 1), numel(label_order));
+    for k = 1:numel(state_labels)
+        label_idx = find(strcmp(label_order, state_labels{k}), 1, 'first');
+        if isempty(label_idx)
+            continue;
+        end
+        label_weights(:, label_idx) = label_weights(:, label_idx) + state_weights(:, k);
     end
+    label_weights = label_weights ./ max(sum(label_weights, 2), eps);
 end
 
 function labels = alignment_labels_or_fallback(alignment, n_states, prefix)
@@ -140,21 +271,28 @@ function order = template_order_union(true_alignment, est_alignment, true_labels
     order = unique(order, 'stable');
 end
 
-function coverage = label_coverage(sample_labels, label_order)
-    n = numel(sample_labels);
-    coverage = zeros(numel(label_order), 1);
-    for i = 1:numel(label_order)
-        coverage(i) = sum(strcmp(sample_labels, label_order{i})) / max(n, 1);
+function counts = confusion_from_indices(true_idx, pred_idx, n_states)
+    counts = zeros(n_states, n_states);
+    valid = isfinite(true_idx) & isfinite(pred_idx) & true_idx >= 1 & pred_idx >= 1;
+    true_idx = true_idx(valid);
+    pred_idx = pred_idx(valid);
+    for i = 1:numel(true_idx)
+        counts(true_idx(i), pred_idx(i)) = counts(true_idx(i), pred_idx(i)) + 1;
     end
 end
 
-function counts = label_confusion_counts(true_sample_labels, est_sample_labels, label_order)
-    n_labels = numel(label_order);
-    counts = zeros(n_labels, n_labels);
-    for i = 1:n_labels
-        mask_i = strcmp(true_sample_labels, label_order{i});
-        for j = 1:n_labels
-            counts(i, j) = sum(mask_i & strcmp(est_sample_labels, label_order{j}));
-        end
+function acc = masked_accuracy(pred_idx, true_idx, mask)
+    if ~any(mask)
+        acc = NaN;
+        return;
     end
+    acc = mean(pred_idx(mask) == true_idx(mask));
+end
+
+function val = masked_weight_mae(pred_weights, true_weights, mask)
+    if ~any(mask)
+        val = NaN;
+        return;
+    end
+    val = mean(abs(pred_weights(mask, :) - true_weights(mask, :)), 'all');
 end

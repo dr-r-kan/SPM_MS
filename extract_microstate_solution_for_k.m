@@ -13,6 +13,7 @@ function Selected = extract_microstate_solution_for_k(Results, K_selected, varar
     addParameter(p, 'estimated_channel_labels', {}, @(x) iscell(x) || isstring(x));
     addParameter(p, 'template_K', 7, @(x) isnumeric(x) && isscalar(x) && x >= 1);
     addParameter(p, 'strong_threshold', 0.5, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x <= 1);
+    addParameter(p, 'compute_backfit_timecourse', false, @islogical);
     parse(p, Results, K_selected, varargin{:});
 
     Selected = Results;
@@ -53,6 +54,9 @@ function Selected = extract_microstate_solution_for_k(Results, K_selected, varar
                 Selected.selected_spm_priors = Selected.selected_spm_mix_model.priors;
             end
         end
+        if isfield(Results, 'feature_backfit_models') && numel(Results.feature_backfit_models) >= idx
+            Selected.selected_feature_backfit_model = Results.feature_backfit_models{idx};
+        end
         Selected.best_criterion_value = lookup_selected_score(Results, idx, Selected.criterion);
     end
 
@@ -86,6 +90,15 @@ function Selected = extract_microstate_solution_for_k(Results, K_selected, varar
         catch
         end
     end
+
+    if p.Results.compute_backfit_timecourse && ...
+            isfield(p.Results.Sim, 'X_noisy') && ~isempty(p.Results.Sim.X_noisy) && ...
+            isfield(Selected, 'centers') && ~isempty(Selected.centers)
+        try
+            Selected.backfit_timecourse = backfit_microstate_timecourse(p.Results.Sim, Selected);
+        catch
+        end
+    end
 end
 
 function idx = find_result_k_index(Results, K_selected)
@@ -102,6 +115,14 @@ end
 function score = lookup_selected_score(Results, idx, criterion)
     score = NaN;
     criterion = lower(strtrim(char(string(criterion))));
+    if isfield(Results, 'method') && strcmpi(char(string(Results.method)), 'spm_vb')
+        [~, score, score_by_k] = select_spm_vb_k_by_criterion(Results, criterion);
+        if numel(score_by_k) >= idx && isfinite(score_by_k(idx))
+            score = score_by_k(idx);
+        end
+        return;
+    end
+
     switch criterion
         case 'free_energy'
             if isfield(Results, 'free_energy_vals') && numel(Results.free_energy_vals) >= idx

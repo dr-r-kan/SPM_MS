@@ -1,11 +1,9 @@
 function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, varargin)
 % METAMICROSTATE_DATASET_PIPELINE
 %
-% A dataset-level EEG microstate pipeline modelled on the EEG-Meta-
-% Microstates idea: estimate microstate templates per recording, then
-% cluster those templates again to obtain dataset-level meta-microstates.
-% The pipeline also caches the GFP peaks from each recording using a common
-% channel set, then fits a pooled GFP-peak solution at the end. 
+% A dataset-level EEG microstate pipeline that first builds a common-channel
+% GFP-peak bank, then fits a hierarchical microstate model over those pooled
+% peaks, and finally derives participant-driven meta-microstates.
 %
 % Required input CSV columns:
 %   file_path
@@ -18,25 +16,26 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
 % sub-010300_EC.set -> sub-010300.
 %
 % The pipeline does five things:
-%   1. Calls analyze_single_eeg_file on every CSV row using the requested
-%      K_candidates/method/criterion.
-%   2. Independently caches GFP-peak maps using matched preprocessing and a
-%      common channel set across files.
-%   3. Fits a per-file best-K solution to those cached GFP peaks and saves a
-%      cluster solution .mat per file.
-%   4. Clusters all per-file cluster maps to obtain meta-microstates, then
-%      repeats the fit for group, condition, and group x condition subsets
-%      when those metadata columns are available.
-%   5. Pools cached GFP peaks, removes robust population outliers, and fits a
-%      pooled GFP-peak solution using the same K-selection machinery, again
-%      repeating the fit for metadata-defined subsets when available.
+%   1. Calls analyze_single_eeg_file on every CSV row when requested, while
+%      independently caching all GFP-peak maps on a common channel set.
+%   2. Fits a hierarchical GFP-peak model:
+%         global -> group (if present) -> participant -> participant_condition
+%         -> file
+%      using parent templates as empirical-Bayes priors.
+%   3. Writes conditioned participant solutions and per-row/file solutions
+%      back to the manifest, so each participant/condition row has a fitted
+%      microstate result.
+%   4. Builds global meta-microstates from the participant-level templates,
+%      treating those participant templates as pseudo-GFP peaks.
+%   5. When conditions are present, builds condition-specific population
+%      meta-microstate solutions from the participant-conditioned templates.
 %
 % Core output:
 %   <output_dir>/cluster_solution_manifest.csv
 %   with columns participant, condition, group, file_path,
 %   cluster_solution_file, gfp_peak_cache_file, local_K, status.
-%   Subset comparisons are written under meta_clusters/subsets and
-%   pooled_gfp_clusters/subsets, with summary CSVs in the parent folders.
+%   Hierarchical summaries are written under hierarchical_gfp_clusters and
+%   condition-level meta summaries are written under meta_clusters/subsets.
 %
 % Example:
 %   [R, csv] = metamicrostate_dataset_pipeline('conditioned_lemon_sets.csv', ...
@@ -82,6 +81,10 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     addParameter(p, 'save_json', false, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'json_dir', '', @(x) ischar(x) || isstring(x));
     addParameter(p, 'plot_dir', '', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'export_backfit_state_metrics', true, @(x) islogical(x) && isscalar(x));
+    addParameter(p, 'backfit_state_metrics_csv', 'participant_condition_state_backfit_metrics.csv', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'backfit_pairwise_metrics_csv', 'participant_condition_state_pairwise_backfit_metrics.csv', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'backfit_record_summary_csv', 'participant_condition_record_backfit_summary.csv', @(x) ischar(x) || isstring(x));
 
     addParameter(p, 'template_file', 'MetaMaps_2023_06.set', @(x) ischar(x) || isstring(x));
     addParameter(p, 'align_to_template', true, @(x) islogical(x) && isscalar(x));
@@ -102,6 +105,13 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     addParameter(p, 'min_gfp_peaks_per_file', 20, @(x) isnumeric(x) && isscalar(x) && x >= 1);
     addParameter(p, 'max_maps_per_file', 1500, @(x) isempty(x) || (isnumeric(x) && isscalar(x) && x > 0));
     addParameter(p, 'max_global_maps', 40000, @(x) isempty(x) || (isnumeric(x) && isscalar(x) && x > 0));
+
+    addParameter(p, 'use_template_prior_global', true, @(x) islogical(x) && isscalar(x));
+    addParameter(p, 'canonical_prior_weight_global', NaN, @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    addParameter(p, 'prior_weight_group', NaN, @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    addParameter(p, 'prior_weight_condition', NaN, @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    addParameter(p, 'prior_weight_participant', NaN, @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    addParameter(p, 'prior_weight_file', NaN, @(x) isnumeric(x) && isscalar(x) && x >= 0);
 
     addParameter(p, 'reject_gfp_peak_outliers_individual', true, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'gfp_outlier_mad_multiplier_individual', 6, @(x) isnumeric(x) && isscalar(x) && x > 0);
@@ -131,8 +141,23 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     cfg.peak_interpolation_method = lower(char(cfg.peak_interpolation_method));
     cfg.json_dir = char(cfg.json_dir);
     cfg.plot_dir = char(cfg.plot_dir);
+    cfg.backfit_state_metrics_csv = char(cfg.backfit_state_metrics_csv);
+    cfg.backfit_pairwise_metrics_csv = char(cfg.backfit_pairwise_metrics_csv);
+    cfg.backfit_record_summary_csv = char(cfg.backfit_record_summary_csv);
     cfg.force_recompute_peaks = cfg.force_recompute || cfg.force_recompute_peaks;
     cfg.force_recompute_clusters = cfg.force_recompute || cfg.force_recompute_clusters;
+    util = microstate_utilities();
+    repo_cfg = util.load_config();
+    hier_defaults = struct();
+    if isfield(repo_cfg, 'hierarchical') && isstruct(repo_cfg.hierarchical)
+        hier_defaults = repo_cfg.hierarchical;
+    end
+    cfg.canonical_prior_weight_global = fill_from_hier_defaults(cfg.canonical_prior_weight_global, hier_defaults, 'canonical_prior_weight_global', 0);
+    cfg.prior_weight_group = fill_from_hier_defaults(cfg.prior_weight_group, hier_defaults, 'prior_weight_group', 0);
+    cfg.prior_weight_condition = fill_from_hier_defaults(cfg.prior_weight_condition, hier_defaults, 'prior_weight_condition', 0);
+    cfg.prior_weight_participant = fill_from_hier_defaults(cfg.prior_weight_participant, hier_defaults, 'prior_weight_participant', 0);
+    cfg.prior_weight_file = fill_from_hier_defaults(cfg.prior_weight_file, hier_defaults, 'prior_weight_file', 0);
+    cfg.use_template_prior_global = logical(cfg.use_template_prior_global);
     if ~strcmp(cfg.peak_interpolation_method, 'idw')
         error('peak_interpolation_method must currently be ''idw''.');
     end
@@ -166,6 +191,11 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     dirs.file_solutions = fullfile(cfg.output_dir, 'per_file_solutions'); ensure_dir(dirs.file_solutions);
     dirs.meta = fullfile(cfg.output_dir, 'meta_clusters'); ensure_dir(dirs.meta);
     dirs.pooled = fullfile(cfg.output_dir, 'pooled_gfp_clusters'); ensure_dir(dirs.pooled);
+    dirs.hierarchy = fullfile(cfg.output_dir, 'hierarchical_gfp_clusters'); ensure_dir(dirs.hierarchy);
+    dirs.hierarchy_groups = fullfile(dirs.hierarchy, 'groups'); ensure_dir(dirs.hierarchy_groups);
+    dirs.hierarchy_conditions = fullfile(dirs.hierarchy, 'conditions'); ensure_dir(dirs.hierarchy_conditions);
+    dirs.hierarchy_participants = fullfile(dirs.hierarchy, 'participants'); ensure_dir(dirs.hierarchy_participants);
+    dirs.hierarchy_participant_conditions = fullfile(dirs.hierarchy, 'participant_conditions'); ensure_dir(dirs.hierarchy_participant_conditions);
     dirs.meta_subsets = fullfile(dirs.meta, 'subsets'); ensure_dir(dirs.meta_subsets);
     dirs.pooled_subsets = fullfile(dirs.pooled, 'subsets'); ensure_dir(dirs.pooled_subsets);
     dirs.qc = fullfile(cfg.output_dir, 'qc'); ensure_dir(dirs.qc);
@@ -184,7 +214,7 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
         fprintf('Method:       %s\n', cfg.method);
         fprintf('Criterion:    %s\n', cfg.criterion);
         fprintf('K candidates: %s\n', mat2str(cfg.K_candidates));
-        fprintf('Old hierarchy: not used\n');
+        fprintf('Hierarchy:    global -> group -> participant -> participant_condition -> file\n');
         fprintf('Peak interpolation: %s\n', ternary_string(cfg.interpolate_missing_peak_channels, 'enabled', 'disabled'));
         if cfg.use_parfor
             fprintf('Parallel K fits: %s\n', ternary_string(cfg.parallel_pool_ready, 'enabled', 'requested but unavailable'));
@@ -211,9 +241,8 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     output_rows = initialise_output_rows(height(manifest));
     file_fits = cell(height(manifest), 1);
     record_refs = cell(height(manifest), 1);
-    template_bank = [];
-    template_bank_weights = [];
-    template_bank_rows = table();
+    analysis_cache = cell(height(manifest), 1);
+    solution_files = cell(height(manifest), 1);
 
     for i = 1:height(manifest)
         row = manifest(i, :);
@@ -225,6 +254,8 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
         cache_file = fullfile(dirs.cache, [row_key '_gfp_peaks.mat']);
         solution_file = fullfile(dirs.file_solutions, [row_key '_cluster_solution.mat']);
         analysis_file = fullfile(dirs.single, [row_key '_analyze_single_result.mat']);
+        solution_files{i} = solution_file;
+        analysis_cache{i} = analysis_file;
 
         AnalysisResults = [];
         json_file = '';
@@ -291,46 +322,6 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
             end
             record_refs{i} = rec;
 
-            FileFit = [];
-            need_cluster_refresh = cfg.force_recompute_clusters || ~isfile(solution_file);
-            if ~need_cluster_refresh
-                S = load(solution_file, 'FileFit');
-                FileFit = S.FileFit;
-                need_cluster_refresh = cluster_solution_needs_refresh(FileFit, rec, common_labels);
-            end
-            if need_cluster_refresh
-                if cfg.verbose
-                    fprintf('   Fitting common-channel per-file best-K solution...\n');
-                end
-                FileFit = fit_microstate_map_set(rec.maps_norm, rec.gfp_effective, cfg.K_candidates, cfg, sprintf('file_%03d', i));
-                if cfg.align_to_template
-                    FileFit = attach_template_alignment(FileFit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
-                end
-                ManifestRow = row;
-                save(solution_file, 'FileFit', 'ManifestRow', 'AnalysisResults', 'json_file', 'cache_file', 'cfg', '-v7.3');
-            end
-            file_fits{i} = FileFit;
-
-            centres = normalize_maps(FileFit.centers);
-            n_centres = size(centres, 1);
-            template_bank = [template_bank; centres]; %#ok<AGROW>
-            template_bank_weights = [template_bank_weights; repmat(sqrt(rec.interpolation_weight_scale), n_centres, 1)]; %#ok<AGROW>
-            local_rows = table();
-            local_rows.file_index = repmat(i, n_centres, 1);
-            local_rows.participant = repmat(row.participant, n_centres, 1);
-            local_rows.condition = repmat(row.condition, n_centres, 1);
-            local_rows.group = repmat(row.group, n_centres, 1);
-            local_rows.local_state = (1:n_centres)';
-            local_rows.fit_weight_proxy = repmat(sqrt(rec.interpolation_weight_scale), n_centres, 1);
-            if isfield(FileFit, 'template_alignment') && isfield(FileFit.template_alignment, 'assigned_labels')
-                local_rows.template_label = FileFit.template_alignment.assigned_labels(:);
-                local_rows.template_abs_corr = FileFit.template_alignment.assigned_abs_corr(:);
-            else
-                local_rows.template_label = repmat({''}, n_centres, 1);
-                local_rows.template_abs_corr = nan(n_centres, 1);
-            end
-            template_bank_rows = [template_bank_rows; local_rows]; %#ok<AGROW>
-
             output_rows.participant{i} = row.participant{1};
             output_rows.condition{i} = row.condition{1};
             output_rows.group{i} = row.group{1};
@@ -339,7 +330,7 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
             output_rows.gfp_peak_cache_file{i} = cache_file;
             output_rows.analyze_single_result_file{i} = analysis_file;
             output_rows.json_file{i} = json_file;
-            output_rows.local_K(i) = FileFit.K_estimated;
+            output_rows.local_K(i) = NaN;
             output_rows.n_gfp_peaks(i) = rec.n_peaks_raw;
             output_rows.n_gfp_peaks_used(i) = size(rec.maps_norm, 1);
             output_rows.n_target_channels(i) = rec.n_target_channels;
@@ -379,43 +370,289 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     writetable(output_rows, output_csv);
 
     if cfg.verbose
-        fprintf('\n2. Clustering per-file microstate templates into meta-microstates...\n');
-    end
-    if isempty(template_bank)
-        error('No per-file templates were available for meta-clustering. Check failed rows in %s.', output_csv);
-    end
-    meta_fit = fit_microstate_map_set(template_bank, template_bank_weights, cfg.meta_K_candidates, cfg, 'meta_templates');
-    if cfg.align_to_template
-        meta_fit = attach_template_alignment(meta_fit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
-    end
-    meta_assign = assign_by_abs_correlation(template_bank, meta_fit.centers);
-    template_bank_rows.meta_state = meta_assign(:);
-    writetable(template_bank_rows, fullfile(dirs.meta, 'meta_template_assignments.csv'));
-    save(fullfile(dirs.meta, 'meta_microstate_solution.mat'), 'meta_fit', 'template_bank', 'template_bank_rows', 'common_labels', 'common_chanlocs', 'common_pos', 'cfg', '-v7.3');
-    write_matrix_csv(fullfile(dirs.meta, 'meta_microstate_centers.csv'), meta_fit.centers);
-    writetable(meta_fit.model_comparison, fullfile(dirs.meta, 'meta_model_comparison.csv'));
-    plot_center_grid(meta_fit.centers, common_chanlocs, fullfile(dirs.meta, 'meta_microstate_centers.png'), 'Meta-microstates');
-    meta_subset_summary = run_subset_cluster_fits(template_bank_rows, template_bank, cfg.meta_K_candidates, cfg, dirs.meta_subsets, 'meta', 'meta_state', common_labels, common_chanlocs, common_pos);
-    writetable(meta_subset_summary, fullfile(dirs.meta, 'meta_subset_comparison.csv'));
-
-    if cfg.verbose
-        fprintf('3. Pooling cached GFP peaks, dropping population outliers, and clustering...\n');
+        fprintf('\n2. Building pooled GFP bank and fitting hierarchical microstates...\n');
     end
     [pooled_maps, pooled_gfp, pooled_rows, population_filter] = pool_cached_gfp_maps(record_refs, manifest, cfg);
-    pooled_fit = fit_microstate_map_set(pooled_maps, pooled_gfp, cfg.pooled_K_candidates, cfg, 'pooled_gfp_peaks');
+    [template_prior_maps, template_prior_info] = maybe_load_template_prior(cfg, common_labels, common_chanlocs, common_pos);
+
+    pooled_fit = fit_hierarchical_map_set(pooled_maps, pooled_gfp, cfg.pooled_K_candidates, cfg, 'global_gfp_peaks', ...
+        'primary_prior_maps', template_prior_maps, ...
+        'primary_prior_weight', cfg.use_template_prior_global * cfg.canonical_prior_weight_global);
     if cfg.align_to_template
         pooled_fit = attach_template_alignment(pooled_fit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
     end
+    pooled_fit.template_prior_info = template_prior_info;
     pooled_rows.cluster_label = assign_by_abs_correlation(pooled_maps, pooled_fit.centers);
     writetable(pooled_rows, fullfile(dirs.pooled, 'pooled_gfp_peak_manifest.csv'));
     save(fullfile(dirs.pooled, 'pooled_gfp_microstate_solution.mat'), 'pooled_fit', 'pooled_rows', 'population_filter', 'common_labels', 'common_chanlocs', 'common_pos', 'cfg', '-v7.3');
     write_matrix_csv(fullfile(dirs.pooled, 'pooled_gfp_microstate_centers.csv'), pooled_fit.centers);
     writetable(pooled_fit.model_comparison, fullfile(dirs.pooled, 'pooled_gfp_model_comparison.csv'));
-    plot_center_grid(pooled_fit.centers, common_chanlocs, fullfile(dirs.pooled, 'pooled_gfp_microstate_centers.png'), 'Pooled GFP-peak microstates');
-    pooled_subset_summary = run_subset_cluster_fits(pooled_rows, pooled_maps, cfg.pooled_K_candidates, cfg, dirs.pooled_subsets, 'pooled', 'cluster_label', common_labels, common_chanlocs, common_pos);
-    writetable(pooled_subset_summary, fullfile(dirs.pooled, 'pooled_subset_comparison.csv'));
+    plot_center_grid(pooled_fit.centers, common_chanlocs, fullfile(dirs.pooled, 'pooled_gfp_microstate_centers.png'), 'Global pooled GFP microstates');
 
-    HResults = build_pipeline_hresults(manifest, file_fits, meta_fit, template_bank, template_bank_rows, common_labels, common_chanlocs, common_pos, cfg);
+    group_levels = meaningful_factor_levels(manifest.group, "all");
+    condition_levels = meaningful_factor_levels(manifest.condition, "condition");
+    has_groups = ~isempty(group_levels);
+    has_conditions = ~isempty(condition_levels);
+
+    hierarchy_summary = table();
+    hierarchy_nodes = struct('global', [], 'groups', [], 'conditions', [], 'participant_level', [], ...
+        'participant_conditions', [], 'files', []);
+
+    global_node_dir = fullfile(dirs.hierarchy, 'global');
+    ensure_dir(global_node_dir);
+    save_named_fit_bundle(global_node_dir, pooled_fit, pooled_rows, struct('level', 'global'), common_labels, common_chanlocs, common_pos, cfg, 'global_gfp');
+    hierarchy_summary = [hierarchy_summary; make_hierarchy_summary_row('global', 'all', '', '', pooled_fit, global_node_dir, size(pooled_maps, 1), height(manifest))]; %#ok<AGROW>
+
+    group_nodes = repmat(empty_hierarchy_fit_record(), 0, 1);
+    for g = 1:numel(group_levels)
+        group_value = group_levels(g);
+        mask = string(pooled_rows.group) == group_value;
+        group_dir = fullfile(dirs.hierarchy_groups, sanitize_key_piece(group_value));
+        ensure_dir(group_dir);
+        Fit = fit_hierarchical_map_set(pooled_maps(mask, :), pooled_gfp(mask), cfg.pooled_K_candidates, cfg, ...
+            sprintf('group_%s', sanitize_key_piece(group_value)), ...
+            'primary_prior_maps', pooled_fit.centers, ...
+            'primary_prior_weight', cfg.prior_weight_group);
+        if cfg.align_to_template
+            Fit = attach_template_alignment(Fit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
+        end
+        rows_subset = pooled_rows(mask, :);
+        rows_subset.cluster_label = assign_by_abs_correlation(pooled_maps(mask, :), Fit.centers);
+        save_named_fit_bundle(group_dir, Fit, rows_subset, struct('level', 'group', 'group', char(group_value)), common_labels, common_chanlocs, common_pos, cfg, 'group_gfp');
+        group_nodes(end+1, 1) = build_hierarchy_fit_record('group', '', char(group_value), '', Fit, group_dir, find(mask)); %#ok<AGROW>
+        hierarchy_summary = [hierarchy_summary; make_hierarchy_summary_row('group', 'group', char(group_value), '', Fit, group_dir, sum(mask), numel(unique(pooled_rows.file_index(mask))))]; %#ok<AGROW>
+    end
+
+    condition_nodes = repmat(empty_hierarchy_fit_record(), 0, 1);
+    for c = 1:numel(condition_levels)
+        condition_value = condition_levels(c);
+        mask = string(pooled_rows.condition) == condition_value;
+        condition_dir = fullfile(dirs.hierarchy_conditions, sanitize_key_piece(condition_value));
+        ensure_dir(condition_dir);
+        Fit = fit_hierarchical_map_set(pooled_maps(mask, :), pooled_gfp(mask), cfg.pooled_K_candidates, cfg, ...
+            sprintf('condition_%s', sanitize_key_piece(condition_value)), ...
+            'primary_prior_maps', pooled_fit.centers, ...
+            'primary_prior_weight', cfg.prior_weight_condition);
+        if cfg.align_to_template
+            Fit = attach_template_alignment(Fit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
+        end
+        rows_subset = pooled_rows(mask, :);
+        rows_subset.cluster_label = assign_by_abs_correlation(pooled_maps(mask, :), Fit.centers);
+        save_named_fit_bundle(condition_dir, Fit, rows_subset, struct('level', 'condition', 'condition', char(condition_value)), common_labels, common_chanlocs, common_pos, cfg, 'condition_gfp');
+        condition_nodes(end+1, 1) = build_hierarchy_fit_record('condition', '', '', char(condition_value), Fit, condition_dir, find(mask)); %#ok<AGROW>
+        hierarchy_summary = [hierarchy_summary; make_hierarchy_summary_row('condition', 'condition', '', char(condition_value), Fit, condition_dir, sum(mask), numel(unique(pooled_rows.file_index(mask))))]; %#ok<AGROW>
+    end
+
+    participant_values = unique(strtrim(string(manifest.participant)));
+    participant_values = participant_values(strlength(participant_values) > 0 & ~ismissing(participant_values));
+    participant_nodes = repmat(empty_hierarchy_fit_record(), 0, 1);
+    for p_idx = 1:numel(participant_values)
+        participant_value = participant_values(p_idx);
+        row_mask = string(manifest.participant) == participant_value;
+        peak_mask = string(pooled_rows.participant) == participant_value;
+        if ~any(peak_mask)
+            continue;
+        end
+        participant_group = char(string(manifest.group(find(row_mask, 1, 'first'))));
+        [primary_maps, primary_name] = select_primary_parent_maps(participant_group, '', group_nodes, condition_nodes, pooled_fit.centers);
+        participant_dir = fullfile(dirs.hierarchy_participants, sanitize_key_piece(participant_value));
+        ensure_dir(participant_dir);
+        Fit = fit_hierarchical_map_set(pooled_maps(peak_mask, :), pooled_gfp(peak_mask), cfg.pooled_K_candidates, cfg, ...
+            sprintf('participant_%s', sanitize_key_piece(participant_value)), ...
+            'primary_prior_maps', primary_maps, ...
+            'primary_prior_weight', cfg.prior_weight_participant);
+        if cfg.align_to_template
+            Fit = attach_template_alignment(Fit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
+        end
+        Fit.parent_node = primary_name;
+        rows_subset = pooled_rows(peak_mask, :);
+        rows_subset.cluster_label = assign_by_abs_correlation(pooled_maps(peak_mask, :), Fit.centers);
+        save_named_fit_bundle(participant_dir, Fit, rows_subset, struct('level', 'participant', 'participant', char(participant_value), 'group', participant_group), common_labels, common_chanlocs, common_pos, cfg, 'participant_gfp');
+        participant_nodes(end+1, 1) = build_hierarchy_fit_record('participant', char(participant_value), participant_group, '', Fit, participant_dir, find(peak_mask)); %#ok<AGROW>
+        hierarchy_summary = [hierarchy_summary; make_hierarchy_summary_row('participant', 'participant', participant_group, '', Fit, participant_dir, sum(peak_mask), sum(row_mask))]; %#ok<AGROW>
+    end
+
+    participant_condition_nodes = repmat(empty_hierarchy_fit_record(), 0, 1);
+    if has_conditions
+        [participant_condition_specs, participant_condition_keys] = build_participant_condition_specs(manifest);
+        for pc = 1:numel(participant_condition_specs)
+            spec = participant_condition_specs(pc);
+            peak_mask = string(pooled_rows.participant) == spec.participant & string(pooled_rows.condition) == spec.condition;
+            if ~any(peak_mask)
+                continue;
+            end
+            participant_fit = find_hierarchy_fit_record(participant_nodes, char(spec.participant), '', '');
+            condition_fit = find_hierarchy_fit_record(condition_nodes, '', '', char(spec.condition));
+            participant_prior_maps = pooled_fit.centers;
+            participant_parent_key = 'global';
+            if ~isempty(participant_fit)
+                participant_prior_maps = participant_fit.fit.centers;
+                participant_parent_key = participant_fit.key;
+            end
+            condition_prior_maps = pooled_fit.centers;
+            condition_parent_key = 'global';
+            if ~isempty(condition_fit)
+                condition_prior_maps = condition_fit.fit.centers;
+                condition_parent_key = condition_fit.key;
+            end
+            participant_condition_dir = fullfile(dirs.hierarchy_participant_conditions, participant_condition_keys{pc});
+            ensure_dir(participant_condition_dir);
+            Fit = fit_hierarchical_map_set(pooled_maps(peak_mask, :), pooled_gfp(peak_mask), cfg.K_candidates, cfg, ...
+                sprintf('participant_condition_%s', participant_condition_keys{pc}), ...
+                'primary_prior_maps', participant_prior_maps, ...
+                'primary_prior_weight', cfg.prior_weight_participant, ...
+                'secondary_prior_maps', condition_prior_maps, ...
+                'secondary_prior_weight', 0.5 * cfg.prior_weight_condition);
+            if cfg.align_to_template
+                Fit = attach_template_alignment(Fit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
+            end
+            Fit.parent_node = participant_parent_key;
+            Fit.secondary_parent_node = condition_parent_key;
+            rows_subset = pooled_rows(peak_mask, :);
+            rows_subset.cluster_label = assign_by_abs_correlation(pooled_maps(peak_mask, :), Fit.centers);
+            save_named_fit_bundle(participant_condition_dir, Fit, rows_subset, spec, common_labels, common_chanlocs, common_pos, cfg, 'participant_condition_gfp');
+            participant_condition_nodes(end+1, 1) = build_hierarchy_fit_record('participant_condition', char(spec.participant), char(spec.group), char(spec.condition), Fit, participant_condition_dir, find(peak_mask)); %#ok<AGROW>
+            hierarchy_summary = [hierarchy_summary; make_hierarchy_summary_row('participant_condition', 'participant_condition', char(spec.group), char(spec.condition), Fit, participant_condition_dir, sum(peak_mask), spec.n_rows)]; %#ok<AGROW>
+        end
+    end
+
+    file_nodes = repmat(empty_hierarchy_fit_record(), 0, 1);
+    for i = 1:height(manifest)
+        if ~strcmpi(char(string(output_rows.status{i})), 'ok')
+            continue;
+        end
+        peak_mask = pooled_rows.file_index == i;
+        if ~any(peak_mask)
+            output_rows.status{i} = 'failed';
+            output_rows.error_message{i} = 'No pooled GFP peaks were retained for this row.';
+            continue;
+        end
+        row = manifest(i, :);
+        participant_value = char(string(row.participant{1}));
+        group_value = char(string(row.group{1}));
+        condition_value = char(string(row.condition{1}));
+        if has_conditions
+            parent_fit = find_hierarchy_fit_record(participant_condition_nodes, participant_value, '', condition_value);
+        else
+            parent_fit = find_hierarchy_fit_record(participant_nodes, participant_value, '', '');
+        end
+        if isempty(parent_fit)
+            parent_fit = find_hierarchy_fit_record(participant_nodes, participant_value, '', '');
+        end
+        parent_prior_maps = pooled_fit.centers;
+        parent_prior_key = 'global';
+        if ~isempty(parent_fit)
+            parent_prior_maps = parent_fit.fit.centers;
+            parent_prior_key = parent_fit.key;
+        end
+        secondary_maps = [];
+        if has_conditions
+            condition_fit = find_hierarchy_fit_record(condition_nodes, '', '', condition_value);
+            if ~isempty(condition_fit)
+                secondary_maps = condition_fit.fit.centers;
+            end
+        end
+        try
+            Fit = fit_hierarchical_map_set(pooled_maps(peak_mask, :), pooled_gfp(peak_mask), cfg.K_candidates, cfg, ...
+                sprintf('file_%03d', i), ...
+                'primary_prior_maps', parent_prior_maps, ...
+                'primary_prior_weight', cfg.prior_weight_file, ...
+                'secondary_prior_maps', secondary_maps, ...
+                'secondary_prior_weight', 0.25 * cfg.prior_weight_condition);
+            if cfg.align_to_template
+                Fit = attach_template_alignment(Fit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
+            end
+            Fit.parent_node = parent_prior_key;
+            Fit.preprocessing = struct('apply_average_reference', cfg.apply_average_reference, 'filter_band', cfg.filter_band);
+            Fit.maps_nc = rec.maps_norm;
+            if isfield(Fit, 'labels') && ~isempty(Fit.labels)
+                Fit.backfit_peak_labels = double(Fit.labels(1:min(numel(Fit.labels), size(rec.maps_norm, 1))));
+            else
+                Fit.backfit_peak_labels = [];
+            end
+            Fit.backfit_support = struct( ...
+                'common_labels', {common_labels}, ...
+                'common_chanlocs', common_chanlocs, ...
+                'common_pos', common_pos, ...
+                'channel_remap_spec', common_index_by_file{i}, ...
+                'scalp_channel_labels', {file_meta(i).labels}, ...
+                'scalp_chanlocs', file_meta(i).chanlocs, ...
+                'scalp_pos', file_meta(i).pos, ...
+                'source_file', row.file_path{1});
+            rows_subset = pooled_rows(peak_mask, :);
+            rows_subset.cluster_label = assign_by_abs_correlation(pooled_maps(peak_mask, :), Fit.centers);
+            save_named_fit_bundle(fileparts(solution_files{i}), Fit, rows_subset, struct('level', 'file', 'row_index', i), common_labels, common_chanlocs, common_pos, cfg, sprintf('file_%03d_hierarchy', i));
+            FileFit = Fit; %#ok<NASGU>
+            save(solution_files{i}, 'FileFit', 'rows_subset', 'row', 'cfg', '-v7.3');
+            file_fits{i} = Fit;
+            file_nodes(end+1, 1) = build_hierarchy_fit_record('file', participant_value, group_value, condition_value, Fit, solution_files{i}, find(peak_mask)); %#ok<AGROW>
+            output_rows.local_K(i) = Fit.K_estimated;
+            output_rows.status{i} = 'ok';
+            output_rows.error_message{i} = '';
+            hierarchy_summary = [hierarchy_summary; make_hierarchy_summary_row('file', 'file', group_value, condition_value, Fit, solution_files{i}, sum(peak_mask), 1)]; %#ok<AGROW>
+        catch ME_file
+            output_rows.status{i} = 'failed';
+            output_rows.error_message{i} = ME_file.message;
+            warning('Hierarchical file fit failed for row %d (%s): %s', i, row.file_path{1}, ME_file.message);
+        end
+    end
+    writetable(output_rows, output_csv);
+    writetable(hierarchy_summary, fullfile(cfg.output_dir, 'hierarchical_fit_summary.csv'));
+
+    if cfg.verbose
+        fprintf('3. Building participant-driven global metamicrostates...\n');
+    end
+    [participant_bank, participant_bank_weights, participant_bank_rows] = hierarchy_fit_records_to_bank(participant_nodes);
+    if isempty(participant_bank)
+        error('No participant-level solutions were available for global metamicrostate fitting.');
+    end
+    meta_fit = fit_hierarchical_map_set(participant_bank, participant_bank_weights, cfg.meta_K_candidates, cfg, 'participant_metamicrostates', ...
+        'primary_prior_maps', pooled_fit.centers, ...
+        'primary_prior_weight', cfg.prior_weight_participant);
+    if cfg.align_to_template
+        meta_fit = attach_template_alignment(meta_fit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
+    end
+    meta_assign = assign_by_abs_correlation(participant_bank, meta_fit.centers);
+    participant_bank_rows.meta_state = meta_assign(:);
+    writetable(participant_bank_rows, fullfile(dirs.meta, 'meta_template_assignments.csv'));
+    save(fullfile(dirs.meta, 'meta_microstate_solution.mat'), 'meta_fit', 'participant_bank', 'participant_bank_rows', 'common_labels', 'common_chanlocs', 'common_pos', 'cfg', '-v7.3');
+    write_matrix_csv(fullfile(dirs.meta, 'meta_microstate_centers.csv'), meta_fit.centers);
+    writetable(meta_fit.model_comparison, fullfile(dirs.meta, 'meta_model_comparison.csv'));
+    plot_center_grid(meta_fit.centers, common_chanlocs, fullfile(dirs.meta, 'meta_microstate_centers.png'), 'Participant-derived meta-microstates');
+
+    meta_subset_summary = table();
+    if has_conditions && ~isempty(participant_condition_nodes)
+        [pc_bank, pc_bank_weights, pc_bank_rows] = hierarchy_fit_records_to_bank(participant_condition_nodes);
+        meta_subset_summary = run_conditioned_meta_fits(pc_bank_rows, pc_bank, pc_bank_weights, condition_levels, condition_nodes, ...
+            cfg.meta_K_candidates, cfg, dirs.meta_subsets, common_labels, common_chanlocs, common_pos);
+        writetable(meta_subset_summary, fullfile(dirs.meta, 'meta_subset_comparison.csv'));
+    else
+        writetable(meta_subset_summary, fullfile(dirs.meta, 'meta_subset_comparison.csv'));
+    end
+
+    pooled_subset_summary = hierarchy_summary;
+    HResults = build_hresults_from_hierarchy(manifest, pooled_fit, group_nodes, condition_nodes, participant_nodes, participant_condition_nodes, file_nodes, meta_fit, common_labels, common_chanlocs, common_pos, cfg);
+    backfit_state_metrics = table();
+    backfit_state_metrics_csv = '';
+    backfit_pairwise_metrics = table();
+    backfit_pairwise_metrics_csv = '';
+    backfit_record_summary = table();
+    backfit_record_summary_csv = '';
+    if cfg.export_backfit_state_metrics
+        [backfit_state_metrics, backfit_pairwise_metrics, backfit_record_summary] = compile_backfit_metric_tables(output_rows, cfg);
+        backfit_state_metrics_csv = resolve_backfit_metrics_csv_path(cfg);
+        if ~isempty(backfit_state_metrics)
+            writetable(backfit_state_metrics, backfit_state_metrics_csv);
+        end
+        backfit_pairwise_metrics_csv = resolve_backfit_pairwise_metrics_csv_path(cfg);
+        if ~isempty(backfit_pairwise_metrics)
+            writetable(backfit_pairwise_metrics, backfit_pairwise_metrics_csv);
+        end
+        backfit_record_summary_csv = resolve_backfit_record_summary_csv_path(cfg);
+        if ~isempty(backfit_record_summary)
+            writetable(backfit_record_summary, backfit_record_summary_csv);
+        end
+    end
 
     MResults = struct();
     MResults.config = cfg;
@@ -427,14 +664,32 @@ function [MResults, output_csv] = metamicrostate_dataset_pipeline(manifest_csv, 
     MResults.meta_subset_summary = meta_subset_summary;
     MResults.pooled_subset_summary = pooled_subset_summary;
     MResults.file_fits = file_fits;
+    MResults.population_filter = population_filter;
+    MResults.hierarchy_summary = hierarchy_summary;
+    MResults.participant_bank_rows = participant_bank_rows;
     MResults.runtime_s = toc(t0);
     MResults.HResults = HResults;
+    MResults.backfit_state_metrics = backfit_state_metrics;
+    MResults.backfit_state_metrics_csv = backfit_state_metrics_csv;
+    MResults.backfit_pairwise_metrics = backfit_pairwise_metrics;
+    MResults.backfit_pairwise_metrics_csv = backfit_pairwise_metrics_csv;
+    MResults.backfit_record_summary = backfit_record_summary;
+    MResults.backfit_record_summary_csv = backfit_record_summary_csv;
     save(fullfile(cfg.output_dir, 'meta_microstate_dataset_results.mat'), 'MResults', 'HResults', '-v7.3');
     save(fullfile(cfg.output_dir, 'hierarchical_microstate_results.mat'), 'HResults', 'MResults', '-v7.3');
 
     if cfg.verbose
         fprintf('\nDone.\n');
         fprintf('Output CSV: %s\n', output_csv);
+        if ~isempty(backfit_state_metrics_csv)
+            fprintf('Backfit state metrics CSV: %s\n', backfit_state_metrics_csv);
+        end
+        if ~isempty(backfit_pairwise_metrics_csv)
+            fprintf('Backfit pairwise metrics CSV: %s\n', backfit_pairwise_metrics_csv);
+        end
+        if ~isempty(backfit_record_summary_csv)
+            fprintf('Backfit record summary CSV: %s\n', backfit_record_summary_csv);
+        end
         fprintf('Meta solution: %s\n', fullfile(dirs.meta, 'meta_microstate_solution.mat'));
         fprintf('Pooled GFP solution: %s\n', fullfile(dirs.pooled, 'pooled_gfp_microstate_solution.mat'));
         fprintf('Runtime: %.1f s\n', MResults.runtime_s);
@@ -500,6 +755,288 @@ function manifest = read_and_standardise_manifest(manifest_csv, cfg)
 
     manifest = table(cellstr(participant), cellstr(condition), cellstr(group), cellstr(file_path), ...
         'VariableNames', {'participant', 'condition', 'group', 'file_path'});
+end
+
+function value = fill_from_hier_defaults(value, defaults, field_name, fallback)
+    if isnumeric(value) && isscalar(value) && ~isnan(value)
+        return;
+    end
+    if isstruct(defaults) && isfield(defaults, field_name) && ~isempty(defaults.(field_name))
+        value = double(defaults.(field_name));
+    else
+        value = double(fallback);
+    end
+end
+
+function levels = meaningful_factor_levels(values, default_value)
+    levels = unique(strtrim(string(values)));
+    levels = levels(strlength(levels) > 0 & ~ismissing(levels));
+    levels = levels(levels ~= string(default_value));
+    levels = levels(:)';
+end
+
+function [prior_maps, info] = maybe_load_template_prior(cfg, common_labels, common_chanlocs, common_pos)
+    prior_maps = [];
+    info = struct('ok', false, 'message', '', 'n_maps', 0);
+    if ~cfg.use_template_prior_global || isempty(cfg.template_file) || ~isfile(cfg.template_file)
+        info.message = 'template_prior_disabled';
+        return;
+    end
+    try
+        [template_maps, ~, template_channel_labels, template_chanlocs] = load_template_maps(cfg.template_file);
+        prior_maps = remap_template_to_common(template_maps, template_channel_labels, template_chanlocs, common_labels, common_pos);
+        prior_maps = normalize_maps(prior_maps);
+        info.ok = true;
+        info.message = 'ok';
+        info.n_maps = size(prior_maps, 1);
+    catch ME
+        prior_maps = [];
+        info.ok = false;
+        info.message = ME.message;
+        warning('Global template prior could not be loaded: %s', ME.message);
+    end
+end
+
+function Fit = fit_hierarchical_map_set(maps, gfp, K_candidates, cfg, fit_name, varargin)
+    p = inputParser;
+    addRequired(p, 'maps', @isnumeric);
+    addRequired(p, 'gfp', @isnumeric);
+    addRequired(p, 'K_candidates', @isnumeric);
+    addRequired(p, 'cfg', @isstruct);
+    addRequired(p, 'fit_name', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'primary_prior_maps', [], @isnumeric);
+    addParameter(p, 'primary_prior_weight', 0, @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    addParameter(p, 'secondary_prior_maps', [], @isnumeric);
+    addParameter(p, 'secondary_prior_weight', 0, @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    parse(p, maps, gfp, K_candidates, cfg, fit_name, varargin{:});
+
+    X = double(p.Results.maps);
+    w = double(p.Results.gfp(:));
+    if isempty(w) || numel(w) ~= size(X, 1)
+        w = ones(size(X, 1), 1);
+    end
+
+    prior_specs = {};
+    [X_aug, w_aug, prior_specs] = append_prior_maps(X, w, p.Results.primary_prior_maps, p.Results.primary_prior_weight, 'primary', prior_specs);
+    [X_aug, w_aug, prior_specs] = append_prior_maps(X_aug, w_aug, p.Results.secondary_prior_maps, p.Results.secondary_prior_weight, 'secondary', prior_specs);
+
+    Fit = fit_microstate_map_set(X_aug, w_aug, K_candidates, cfg, char(p.Results.fit_name));
+    Fit.fit_stage = 'hierarchical_empirical_bayes';
+    Fit.observed_n_maps = size(X, 1);
+    Fit.observed_weight_sum = sum(w.^2);
+    Fit.augmented_n_maps = size(X_aug, 1);
+    Fit.prior_specs = prior_specs;
+end
+
+function [X_out, w_out, prior_specs] = append_prior_maps(X_in, w_in, prior_maps, total_weight, label, prior_specs)
+    X_out = X_in;
+    w_out = w_in;
+    if nargin < 6 || isempty(prior_specs)
+        prior_specs = {};
+    end
+    prior_maps = double(prior_maps);
+    total_weight = double(total_weight);
+    if isempty(prior_maps) || total_weight <= 0
+        return;
+    end
+    prior_maps = normalize_maps(prior_maps);
+    per_map_weight = sqrt(total_weight / max(1, size(prior_maps, 1)));
+    prior_weights = repmat(per_map_weight, size(prior_maps, 1), 1);
+    X_out = [X_out; prior_maps]; %#ok<AGROW>
+    w_out = [w_out; prior_weights]; %#ok<AGROW>
+    prior_specs{end+1} = struct('label', char(label), 'n_maps', size(prior_maps, 1), 'total_weight', total_weight); %#ok<AGROW>
+end
+
+function save_named_fit_bundle(out_dir, Fit, rows_subset, spec, common_labels, common_chanlocs, common_pos, cfg, prefix)
+    ensure_dir(out_dir);
+    mat_file = fullfile(out_dir, [prefix '_solution.mat']);
+    centers_file = fullfile(out_dir, [prefix '_centers.csv']);
+    model_file = fullfile(out_dir, [prefix '_model_comparison.csv']);
+    save(mat_file, 'Fit', 'rows_subset', 'spec', 'common_labels', 'common_chanlocs', 'common_pos', 'cfg', '-v7.3');
+    write_matrix_csv(centers_file, Fit.centers);
+    writetable(Fit.model_comparison, model_file);
+    if istable(rows_subset) && ~isempty(rows_subset)
+        writetable(rows_subset, fullfile(out_dir, [prefix '_manifest.csv']));
+    end
+    plot_center_grid(Fit.centers, common_chanlocs, fullfile(out_dir, [prefix '_centers.png']), prefix);
+end
+
+function row = make_hierarchy_summary_row(level, subset_kind, group_value, condition_value, Fit, fit_path, n_maps, n_units)
+    row = table(string(level), string(subset_kind), string(group_value), string(condition_value), ...
+        double(Fit.K_estimated), double(n_maps), double(n_units), string(fit_path), string('ok'), ...
+        'VariableNames', {'level', 'subset_kind', 'group', 'condition', 'K_estimated', 'n_maps', 'n_units', 'fit_path', 'status'});
+end
+
+function rec = empty_hierarchy_fit_record()
+    rec = struct('level', '', 'participant', '', 'group', '', 'condition', '', 'key', '', ...
+        'fit', struct(), 'fit_path', '', 'peak_index', []);
+end
+
+function rec = build_hierarchy_fit_record(level, participant, group, condition, Fit, fit_path, peak_index)
+    rec = empty_hierarchy_fit_record();
+    rec.level = char(string(level));
+    rec.participant = char(string(participant));
+    rec.group = char(string(group));
+    rec.condition = char(string(condition));
+    rec.key = char(strjoin([string(rec.level), string(rec.participant), string(rec.group), string(rec.condition)], '|'));
+    rec.fit = Fit;
+    rec.fit_path = char(string(fit_path));
+    rec.peak_index = peak_index(:);
+end
+
+function rec = find_hierarchy_fit_record(records, participant, group, condition)
+    rec = [];
+    if isempty(records)
+        return;
+    end
+    mask = true(numel(records), 1);
+    if ~isempty(participant)
+        mask = mask & strcmp({records.participant}', char(string(participant)));
+    end
+    if ~isempty(group)
+        mask = mask & strcmp({records.group}', char(string(group)));
+    end
+    if ~isempty(condition)
+        mask = mask & strcmp({records.condition}', char(string(condition)));
+    end
+    idx = find(mask, 1, 'first');
+    if ~isempty(idx)
+        rec = records(idx);
+    end
+end
+
+function [primary_maps, primary_name] = select_primary_parent_maps(group_value, ~, group_nodes, ~, global_maps)
+    primary_maps = global_maps;
+    primary_name = 'global';
+    if isempty(group_value) || isempty(group_nodes)
+        return;
+    end
+    group_fit = find_hierarchy_fit_record(group_nodes, '', char(string(group_value)), '');
+    if ~isempty(group_fit)
+        primary_maps = group_fit.fit.centers;
+        primary_name = group_fit.key;
+    end
+end
+
+function [specs, keys] = build_participant_condition_specs(manifest)
+    keys = {};
+    specs = repmat(struct('participant', "", 'condition', "", 'group', "", 'n_rows', 0, 'level', 'participant_condition'), 0, 1);
+    combo = strcat(string(manifest.participant), "__", string(manifest.condition));
+    [uniq_combo, ~, idx] = unique(combo, 'stable');
+    for i = 1:numel(uniq_combo)
+        mask = idx == i;
+        spec = struct();
+        spec.participant = string(manifest.participant(find(mask, 1, 'first')));
+        spec.condition = string(manifest.condition(find(mask, 1, 'first')));
+        spec.group = string(manifest.group(find(mask, 1, 'first')));
+        spec.n_rows = sum(mask);
+        spec.level = 'participant_condition';
+        specs(end+1, 1) = spec; %#ok<AGROW>
+        keys{end+1, 1} = char(sanitize_key_piece(sprintf('%s__%s', spec.participant, spec.condition))); %#ok<AGROW>
+    end
+end
+
+function [bank_maps, bank_weights, bank_rows] = hierarchy_fit_records_to_bank(records)
+    bank_maps = [];
+    bank_weights = [];
+    bank_rows = table();
+    for i = 1:numel(records)
+        Fit = records(i).fit;
+        if ~isstruct(Fit) || ~isfield(Fit, 'centers') || isempty(Fit.centers)
+            continue;
+        end
+        K = size(Fit.centers, 1);
+        node_weight = max(1, get_field_or_default(Fit, 'observed_n_maps', get_field_or_default(Fit, 'n_maps', K)));
+        bank_maps = [bank_maps; normalize_maps(Fit.centers)]; %#ok<AGROW>
+        bank_weights = [bank_weights; repmat(sqrt(node_weight / max(1, K)), K, 1)]; %#ok<AGROW>
+        rows = table();
+        rows.record_index = repmat(i, K, 1);
+        rows.level = repmat(string(records(i).level), K, 1);
+        rows.participant = repmat(string(records(i).participant), K, 1);
+        rows.group = repmat(string(records(i).group), K, 1);
+        rows.condition = repmat(string(records(i).condition), K, 1);
+        rows.local_state = (1:K)';
+        rows.fit_weight_proxy = repmat(sqrt(node_weight / max(1, K)), K, 1);
+        rows.fit_path = repmat(string(records(i).fit_path), K, 1);
+        bank_rows = [bank_rows; rows]; %#ok<AGROW>
+    end
+end
+
+function summary = run_conditioned_meta_fits(bank_rows, bank_maps, bank_weights, condition_levels, condition_nodes, K_candidates, cfg, out_root, common_labels, common_chanlocs, common_pos)
+    summary = table();
+    for c = 1:numel(condition_levels)
+        condition_value = condition_levels(c);
+        mask = string(bank_rows.condition) == condition_value;
+        if ~any(mask)
+            continue;
+        end
+        out_dir = fullfile(out_root, ['condition_' sanitize_key_piece(condition_value)]);
+        ensure_dir(out_dir);
+        try
+            condition_fit = find_hierarchy_fit_record(condition_nodes, '', '', char(condition_value));
+            prior_maps = [];
+            if ~isempty(condition_fit)
+                prior_maps = condition_fit.fit.centers;
+            end
+            Fit = fit_hierarchical_map_set(bank_maps(mask, :), bank_weights(mask), K_candidates, cfg, ...
+                sprintf('condition_meta_%s', sanitize_key_piece(condition_value)), ...
+                'primary_prior_maps', prior_maps, ...
+                'primary_prior_weight', cfg.prior_weight_condition);
+            if cfg.align_to_template
+                Fit = attach_template_alignment(Fit, cfg.template_file, common_labels, common_chanlocs, common_pos, cfg);
+            end
+            rows_subset = bank_rows(mask, :);
+            rows_subset.meta_state = assign_by_abs_correlation(bank_maps(mask, :), Fit.centers);
+            save_named_fit_bundle(out_dir, Fit, rows_subset, struct('level', 'condition_meta', 'condition', char(condition_value)), common_labels, common_chanlocs, common_pos, cfg, 'condition_meta');
+            row = table(string(condition_value), double(Fit.K_estimated), double(sum(mask)), string(fullfile(out_dir, 'condition_meta_solution.mat')), string('ok'), ...
+                'VariableNames', {'condition', 'K_estimated', 'n_rows', 'fit_file', 'status'});
+        catch ME
+            row = table(string(condition_value), NaN, double(sum(mask)), string(fullfile(out_dir, 'condition_meta_solution.mat')), string(ME.message), ...
+                'VariableNames', {'condition', 'K_estimated', 'n_rows', 'fit_file', 'status'});
+            warning('Conditioned meta fit failed for %s: %s', condition_value, ME.message);
+        end
+        summary = [summary; row]; %#ok<AGROW>
+    end
+end
+
+function HResults = build_hresults_from_hierarchy(manifest, pooled_fit, group_nodes, condition_nodes, participant_nodes, participant_condition_nodes, file_nodes, meta_fit, common_labels, common_chanlocs, common_pos, cfg)
+    HResults = struct();
+    HResults.source = 'metamicrostate_dataset_pipeline';
+    HResults.created = datestr(now, 30);
+    HResults.cfg = cfg;
+    HResults.manifest = manifest;
+    HResults.common_channel_labels = common_labels;
+    HResults.common_labels = common_labels;
+    HResults.common_chanlocs = common_chanlocs;
+    HResults.common_pos = common_pos;
+    HResults.selected_K = pooled_fit.K_estimated;
+    HResults.global = build_pipeline_node('', 'all', '', 'global', 'global', pooled_fit.centers, pooled_fit.n_maps, '', pooled_fit);
+    HResults.groups = hierarchy_records_to_nodes(group_nodes);
+    HResults.conditions = hierarchy_records_to_nodes(condition_nodes);
+    HResults.participant_level = hierarchy_records_to_nodes(participant_nodes);
+    if isempty(participant_condition_nodes)
+        HResults.participant_conditions = HResults.participant_level;
+        HResults.participants = HResults.participant_level;
+    else
+        HResults.participant_conditions = hierarchy_records_to_nodes(participant_condition_nodes);
+        HResults.participants = HResults.participant_conditions;
+    end
+    HResults.files = hierarchy_records_to_nodes(file_nodes);
+    HResults.meta_fit = meta_fit;
+    HResults.group_conditions = repmat(build_pipeline_node('', '', '', 'group_condition', '', zeros(1, size(pooled_fit.centers, 2)), 0, '', struct()), 0, 1);
+end
+
+function nodes = hierarchy_records_to_nodes(records)
+    nodes = repmat(build_pipeline_node('', '', '', 'empty', '', zeros(1, 1), 0, '', struct()), 0, 1);
+    for i = 1:numel(records)
+        Fit = records(i).fit;
+        if ~isstruct(Fit) || ~isfield(Fit, 'centers') || isempty(Fit.centers)
+            continue;
+        end
+        n_maps = get_field_or_default(Fit, 'observed_n_maps', get_field_or_default(Fit, 'n_maps', size(Fit.centers, 1)));
+        nodes(end+1, 1) = build_pipeline_node(records(i).participant, records(i).group, records(i).condition, ...
+            records(i).level, records(i).key, Fit.centers, n_maps, records(i).fit_path, Fit); %#ok<AGROW>
+    end
 end
 
 function subset_summary = run_subset_cluster_fits(rows_table, maps, K_candidates, cfg, out_root, fit_kind, label_column, common_labels, common_chanlocs, common_pos)
@@ -960,6 +1497,614 @@ function write_checkpoint_manifest(T, fn)
     end
 end
 
+function out_csv = resolve_backfit_metrics_csv_path(cfg)
+    out_csv = cfg.backfit_state_metrics_csv;
+    if isempty(out_csv)
+        out_csv = fullfile(cfg.output_dir, 'participant_condition_state_backfit_metrics.csv');
+        return;
+    end
+    if ~is_absolute_path_local(out_csv)
+        out_csv = fullfile(cfg.output_dir, out_csv);
+    end
+end
+
+function out_csv = resolve_backfit_pairwise_metrics_csv_path(cfg)
+    out_csv = cfg.backfit_pairwise_metrics_csv;
+    if isempty(out_csv)
+        out_csv = fullfile(cfg.output_dir, 'participant_condition_state_pairwise_backfit_metrics.csv');
+        return;
+    end
+    if ~is_absolute_path_local(out_csv)
+        out_csv = fullfile(cfg.output_dir, out_csv);
+    end
+end
+
+function out_csv = resolve_backfit_record_summary_csv_path(cfg)
+    out_csv = cfg.backfit_record_summary_csv;
+    if isempty(out_csv)
+        out_csv = fullfile(cfg.output_dir, 'participant_condition_record_backfit_summary.csv');
+        return;
+    end
+    if ~is_absolute_path_local(out_csv)
+        out_csv = fullfile(cfg.output_dir, out_csv);
+    end
+end
+
+function [T_state_metrics, T_pairwise_metrics, T_record_summary] = compile_backfit_metric_tables(output_rows, cfg)
+    T_state_metrics = table();
+    T_pairwise_metrics = table();
+    T_record_summary = table();
+    if ~istable(output_rows) || height(output_rows) == 0
+        return;
+    end
+
+    state_rows = cell(height(output_rows), 1);
+    pair_rows = cell(height(output_rows), 1);
+    record_rows = cell(height(output_rows), 1);
+    state_row_count = 0;
+    pair_row_count = 0;
+    record_row_count = 0;
+    for i = 1:height(output_rows)
+        if ~ismember('status', output_rows.Properties.VariableNames) || ~strcmpi(char(string(output_rows.status{i})), 'ok')
+            continue;
+        end
+        eeg_file = char(string(output_rows.file_path{i}));
+        if isempty(eeg_file) || ~isfile(eeg_file)
+            continue;
+        end
+        try
+            [Results, backfit_source] = load_backfit_result_for_row(output_rows, i);
+            if isempty(Results) || ~isstruct(Results) || ~isfield(Results, 'centers')
+                continue;
+            end
+            [file_table, pairwise_table, record_table] = summarise_single_file_backfit_metrics( ...
+                eeg_file, Results, ...
+                char(string(output_rows.participant{i})), ...
+                char(string(output_rows.condition{i})), ...
+                char(string(output_rows.group{i})), ...
+                cfg, backfit_source);
+            if ~isempty(file_table)
+                state_row_count = state_row_count + 1;
+                state_rows{state_row_count} = file_table;
+            end
+            if ~isempty(pairwise_table)
+                pair_row_count = pair_row_count + 1;
+                pair_rows{pair_row_count} = pairwise_table;
+            end
+            if ~isempty(record_table)
+                record_row_count = record_row_count + 1;
+                record_rows{record_row_count} = record_table;
+            end
+        catch ME
+            warning('Backfit state-metric extraction failed for %s: %s', eeg_file, ME.message);
+        end
+    end
+
+    state_rows = state_rows(1:state_row_count);
+    if ~isempty(state_rows)
+        T_state_metrics = vertcat(state_rows{:});
+        if ismember('template_label', T_state_metrics.Properties.VariableNames)
+            T_state_metrics = sortrows(T_state_metrics, {'participant', 'condition', 'backfit_method', 'template_label', 'state_index'});
+        end
+    end
+
+    pair_rows = pair_rows(1:pair_row_count);
+    if ~isempty(pair_rows)
+        T_pairwise_metrics = vertcat(pair_rows{:});
+        T_pairwise_metrics = sortrows(T_pairwise_metrics, {'participant', 'condition', 'backfit_method', 'state_i_label', 'state_j_label'});
+    end
+
+    record_rows = record_rows(1:record_row_count);
+    if ~isempty(record_rows)
+        T_record_summary = vertcat(record_rows{:});
+        T_record_summary = sortrows(T_record_summary, {'participant', 'condition', 'backfit_method'});
+    end
+end
+
+function [Results, source_name] = load_backfit_result_for_row(output_rows, row_idx)
+    Results = [];
+    source_name = '';
+    if ismember('analyze_single_result_file', output_rows.Properties.VariableNames)
+        result_file = char(string(output_rows.analyze_single_result_file{row_idx}));
+        if ~isempty(result_file) && isfile(result_file)
+            S = load(result_file, 'AnalysisResults');
+            if isfield(S, 'AnalysisResults') && isstruct(S.AnalysisResults) && isfield(S.AnalysisResults, 'centers')
+                Results = S.AnalysisResults;
+                source_name = 'analyze_single';
+                return;
+            end
+        end
+    end
+    if ismember('cluster_solution_file', output_rows.Properties.VariableNames)
+        cluster_file = char(string(output_rows.cluster_solution_file{row_idx}));
+        if ~isempty(cluster_file) && isfile(cluster_file)
+            S = load(cluster_file, 'FileFit');
+            if isfield(S, 'FileFit') && isstruct(S.FileFit) && isfield(S.FileFit, 'centers')
+                Results = S.FileFit;
+                source_name = 'hierarchical_file_fit';
+            end
+        end
+    end
+end
+
+function [T_file, T_pairwise, T_record] = summarise_single_file_backfit_metrics(eeg_file, Results, participant, condition, group, cfg, backfit_source)
+    T_file = table();
+    T_pairwise = table();
+    T_record = table();
+    if ~isfield(Results, 'centers') || isempty(Results.centers)
+        return;
+    end
+
+    [Sim_backfit, gfp] = prepare_full_record_for_state_metrics(eeg_file, Results, cfg);
+    if isempty(gfp) || ~isstruct(Sim_backfit) || ~isfield(Sim_backfit, 'X_noisy') || isempty(Sim_backfit.X_noisy)
+        return;
+    end
+
+    backfit = [];
+    if isfield(Results, 'backfit_timecourse') && isstruct(Results.backfit_timecourse) && ...
+            isfield(Results.backfit_timecourse, 'ok') && Results.backfit_timecourse.ok
+        backfit = Results.backfit_timecourse;
+    end
+    if isempty(backfit)
+        backfit = backfit_microstate_timecourse(Sim_backfit, Results);
+    end
+    if ~isstruct(backfit) || ~isfield(backfit, 'ok') || ~backfit.ok
+        return;
+    end
+
+    [state_labels, state_order, template_corr] = state_labels_for_metrics(Results);
+    duration_s = size(Sim_backfit.X_noisy, 2) / max(Sim_backfit.sfreq, eps);
+    n_samples = min(size(gfp, 1), backfit.n_samples);
+    gfp = gfp(1:n_samples);
+
+    rows = {};
+    pair_rows = {};
+    record_rows = {};
+    row_count = 0;
+    pair_row_count = 0;
+    record_row_count = 0;
+    mix_available = isfield(backfit, 'mixture') && isstruct(backfit.mixture) && ...
+        isfield(backfit.mixture, 'available') && backfit.mixture.available;
+    mix_weights = [];
+    mix_assignments = [];
+    if mix_available
+        mix_weights = backfit.mixture.weights;
+        mix_assignments = backfit.mixture.assignments;
+    end
+    mode_specs = { ...
+        struct('name', 'hard', 'available', true, 'weights', backfit.hard.weights, 'assignments', backfit.hard.assignments), ...
+        struct('name', 'gaussian_mixture', 'available', mix_available, 'weights', mix_weights, 'assignments', mix_assignments)};
+
+    for m = 1:numel(mode_specs)
+        spec = mode_specs{m};
+        n_samples_mode = n_samples;
+        gfp_mode = gfp;
+        weights = spec.weights;
+        assignments = spec.assignments;
+        if spec.available
+            if size(weights, 1) > n_samples_mode
+                weights = weights(1:n_samples_mode, :);
+            elseif size(weights, 1) < n_samples_mode
+                n_samples_mode = size(weights, 1);
+                gfp_mode = gfp_mode(1:n_samples_mode);
+            end
+            if isempty(assignments)
+                [~, assignments] = max(weights, [], 2);
+            else
+                assignments = assignments(:);
+                assignments = assignments(1:min(numel(assignments), size(weights, 1)));
+            end
+            if numel(assignments) < size(weights, 1)
+                [~, assignments] = max(weights, [], 2);
+            end
+        else
+            weights = nan(n_samples_mode, size(Results.centers, 1));
+            assignments = nan(n_samples_mode, 1);
+        end
+
+        record_differential_entropy_bits = NaN;
+        record_shannon_entropy_bits = NaN;
+        if spec.available
+            weights_for_record = normalize_weight_matrix_rows(weights);
+            if strcmpi(char(spec.name), 'hard')
+                record_shannon_entropy_bits = shannon_entropy_bits_from_state_distribution(mean(weights_for_record, 1, 'omitnan'));
+            else
+                record_differential_entropy_bits = joint_differential_entropy_bits_from_weight_matrix(weights_for_record);
+            end
+        end
+
+        record_row_count = record_row_count + 1;
+        record_rows{record_row_count, 1} = table( ...
+            string(participant), string(condition), string(group), string(eeg_file), ...
+            string(backfit_source), string(char(spec.name)), logical(spec.available), ...
+            double(Results.K_estimated), double(n_samples_mode), double(Sim_backfit.sfreq), double(duration_s), ...
+            double(record_differential_entropy_bits), double(record_shannon_entropy_bits), ...
+            'VariableNames', {'participant', 'condition', 'group', 'file_path', ...
+            'backfit_result_source', 'backfit_method', 'backfit_available', ...
+            'K_estimated', 'n_samples', 'sfreq', 'duration_s', ...
+            'record_differential_entropy_bits', 'record_shannon_entropy_bits'});
+
+        for j = 1:numel(state_order)
+            k = state_order(j);
+            wk = double(weights(:, k));
+            wk(~isfinite(wk)) = 0;
+            occupancy = mean(wk, 'omitnan');
+            percentage_record_present = 100 * mean(assignments == k, 'omitnan');
+            mean_quantity = occupancy;
+            if spec.available && sum(wk, 'omitnan') > eps
+                mean_gfp = sum(wk .* gfp_mode, 'omitnan') / sum(wk, 'omitnan');
+            else
+                mean_gfp = NaN;
+            end
+            if spec.available
+                occurrence_count = count_state_occurrences(assignments, k);
+                occurrence_rate_hz = occurrence_count / max(duration_s, eps);
+            else
+                occupancy = NaN;
+                percentage_record_present = NaN;
+                mean_quantity = NaN;
+                occurrence_count = NaN;
+                occurrence_rate_hz = NaN;
+                record_differential_entropy_bits = NaN;
+                record_shannon_entropy_bits = NaN;
+            end
+
+            row_count = row_count + 1;
+            rows{row_count, 1} = table( ...
+                string(participant), string(condition), string(group), string(eeg_file), ...
+                string(backfit_source), ...
+                string(char(spec.name)), logical(spec.available), ...
+                double(k), string(state_labels{k}), double(Results.K_estimated), ...
+                double(n_samples_mode), double(Sim_backfit.sfreq), double(duration_s), ...
+                double(occupancy), double(percentage_record_present), double(mean_quantity), ...
+                double(mean_gfp), double(occurrence_count), double(occurrence_rate_hz), ...
+                double(template_corr(k)), ...
+                'VariableNames', {'participant', 'condition', 'group', 'file_path', ...
+                'backfit_result_source', 'backfit_method', 'backfit_available', 'state_index', 'template_label', 'K_estimated', ...
+                'n_samples', 'sfreq', 'duration_s', ...
+                'occupancy', 'percentage_record_present', 'mean_quantity', 'mean_gfp', ...
+                'occurrence_count', 'occurrence_rate_hz', ...
+                'template_match_abs_correlation'});
+        end
+
+        if spec.available
+            for a = 1:(numel(state_order) - 1)
+                k1 = state_order(a);
+                x = double(weights(:, k1));
+                for b = (a + 1):numel(state_order)
+                    k2 = state_order(b);
+                    y = double(weights(:, k2));
+                    if strcmpi(char(spec.name), 'hard')
+                        [mi_bits, nmi_bits] = binary_mutual_information_bits(x > 0.5, y > 0.5);
+                    else
+                        [mi_bits, nmi_bits] = normalized_quantity_mutual_information_bits(x, y);
+                    end
+                    pair_row_count = pair_row_count + 1;
+                    pair_rows{pair_row_count, 1} = table( ...
+                        string(participant), string(condition), string(group), string(eeg_file), ...
+                        string(backfit_source), string(char(spec.name)), logical(spec.available), ...
+                        double(Results.K_estimated), double(n_samples_mode), double(Sim_backfit.sfreq), double(duration_s), ...
+                        double(k1), string(state_labels{k1}), double(k2), string(state_labels{k2}), ...
+                        double(mi_bits), double(nmi_bits), ...
+                        'VariableNames', {'participant', 'condition', 'group', 'file_path', ...
+                        'backfit_result_source', 'backfit_method', 'backfit_available', ...
+                        'K_estimated', 'n_samples', 'sfreq', 'duration_s', ...
+                        'state_i_index', 'state_i_label', 'state_j_index', 'state_j_label', ...
+                        'mutual_information_bits', 'normalized_mutual_information'});
+                end
+            end
+        end
+    end
+
+    if ~isempty(rows)
+        T_file = vertcat(rows{:});
+    end
+    if ~isempty(pair_rows)
+        T_pairwise = vertcat(pair_rows{:});
+    end
+    if ~isempty(record_rows)
+        T_record = vertcat(record_rows{:});
+    end
+end
+
+function [Sim_backfit, gfp] = prepare_full_record_for_state_metrics(eeg_file, Results, cfg)
+    [eeg_data, sfreq, chanlocs, labels, pos] = load_eeg_matrix(eeg_file, cfg.sfreq);
+    eeg_data = double(eeg_data);
+    Sim_backfit = struct();
+    if isempty(eeg_data)
+        gfp = [];
+        return;
+    end
+
+    if isempty(labels)
+        labels = channel_labels_from_chanlocs(chanlocs, size(eeg_data, 1));
+    end
+
+    pre = struct();
+    if isfield(Results, 'preprocessing') && isstruct(Results.preprocessing)
+        pre = Results.preprocessing;
+    else
+        pre.apply_average_reference = cfg.apply_average_reference;
+        pre.filter_band = cfg.filter_band;
+    end
+
+    Sim_backfit.X_noisy = eeg_data;
+    Sim_backfit.sfreq = sfreq;
+    Sim_backfit.chanlocs = chanlocs;
+    Sim_backfit.channel_labels = labels;
+    Sim_backfit.pos = pos;
+    Sim_backfit.preprocessing = pre;
+
+    remapped = prepare_record_matrix_for_backfit_metrics(Sim_backfit, Results);
+    gfp = std(remapped, 0, 1, 'omitnan')';
+end
+
+function X_fit = prepare_record_matrix_for_backfit_metrics(Sim_backfit, Results)
+    util = microstate_utilities();
+    X_fit = double(Sim_backfit.X_noisy);
+    if isfield(Results, 'backfit_support') && isstruct(Results.backfit_support) && ...
+            isfield(Results.backfit_support, 'channel_remap_spec') && ~isempty(Results.backfit_support.channel_remap_spec)
+        X_fit = remap_full_record_for_metrics(X_fit, Results.backfit_support.channel_remap_spec);
+    elseif size(X_fit, 1) ~= size(Results.centers, 2)
+        if ~isempty(Sim_backfit.chanlocs)
+            scalp_mask = scalp_channel_mask(Sim_backfit.channel_labels, Sim_backfit.chanlocs, Sim_backfit.pos);
+            if any(scalp_mask) && nnz(scalp_mask) == size(Results.centers, 2)
+                X_fit = X_fit(scalp_mask, :);
+            end
+        end
+    end
+    if size(X_fit, 1) ~= size(Results.centers, 2)
+        error('Backfit metric preparation could not match record channels (%d) to result channels (%d).', ...
+            size(X_fit, 1), size(Results.centers, 2));
+    end
+    if isfield(Sim_backfit.preprocessing, 'apply_average_reference') && Sim_backfit.preprocessing.apply_average_reference
+        X_fit = X_fit - mean(X_fit, 1, 'omitnan');
+    end
+    if isfield(Sim_backfit.preprocessing, 'filter_band') && ~isempty(Sim_backfit.preprocessing.filter_band)
+        X_fit = util.bandpass_filter(X_fit, Sim_backfit.sfreq, Sim_backfit.preprocessing.filter_band);
+    end
+end
+
+function X_target = remap_full_record_for_metrics(eeg_data, spec)
+    source_idx = double(spec.source_data_index(:));
+    source_subset = eeg_data(source_idx, :);
+    n_target = double(spec.n_target_channels);
+    X_target = nan(n_target, size(source_subset, 2));
+    direct = double(spec.direct_local_index(:));
+    observed = isfinite(direct);
+    if any(observed)
+        X_target(observed, :) = source_subset(direct(observed), :);
+    end
+    missing = find(~observed);
+    for j = 1:numel(missing)
+        t = missing(j);
+        local_idx = double(spec.interpolation_source_local_index{t});
+        weights = double(spec.interpolation_weights{t});
+        X_target(t, :) = weights(:)' * source_subset(local_idx, :);
+    end
+end
+
+function [state_labels, state_order, template_corr] = state_labels_for_metrics(Results)
+    K = size(Results.centers, 1);
+    state_labels = arrayfun(@(k) sprintf('state_%02d', k), 1:K, 'UniformOutput', false);
+    template_corr = nan(K, 1);
+    if isfield(Results, 'template_alignment') && isstruct(Results.template_alignment) && ~isempty(Results.template_alignment)
+        ta = Results.template_alignment;
+        if isfield(ta, 'labels') && numel(ta.labels) >= K
+            state_labels = cellstr(string(ta.labels(:)));
+        elseif isfield(ta, 'assigned_labels') && numel(ta.assigned_labels) >= K
+            state_labels = cellstr(string(ta.assigned_labels(:)));
+        end
+        if isfield(ta, 'correlations') && numel(ta.correlations) >= K
+            template_corr = abs(double(ta.correlations(:)));
+        elseif isfield(ta, 'assigned_abs_corr') && numel(ta.assigned_abs_corr) >= K
+            template_corr = double(ta.assigned_abs_corr(:));
+        end
+    end
+    [~, state_order] = sort(lower(string(state_labels)));
+end
+
+function n = count_state_occurrences(assignments, state_idx)
+    if isempty(assignments)
+        n = NaN;
+        return;
+    end
+    assignments = double(assignments(:));
+    valid = isfinite(assignments);
+    assignments = assignments(valid);
+    if isempty(assignments)
+        n = NaN;
+        return;
+    end
+    state_mask = assignments == state_idx;
+    n = double(state_mask(1)) + sum(state_mask(2:end) & ~state_mask(1:end-1));
+end
+
+function h = occupancy_entropy_bits(p)
+    p = double(p);
+    if ~isfinite(p) || p <= 0
+        h = 0;
+        return;
+    end
+    h = -p * log2(max(p, eps));
+end
+
+function W = normalize_weight_matrix_rows(W)
+    W = double(W);
+    if isempty(W)
+        return;
+    end
+    W(~isfinite(W)) = 0;
+    row_sum = sum(W, 2);
+    valid = row_sum > eps;
+    W(valid, :) = W(valid, :) ./ row_sum(valid);
+    W(~valid, :) = 0;
+end
+
+function h_bits = joint_differential_entropy_bits_from_weight_matrix(W)
+    W = normalize_weight_matrix_rows(W);
+    if isempty(W) || size(W, 1) < 16 || size(W, 2) < 1
+        h_bits = NaN;
+        return;
+    end
+
+    valid = all(isfinite(W), 2);
+    W = W(valid, :);
+    if size(W, 1) < 16
+        h_bits = NaN;
+        return;
+    end
+
+    d = size(W, 2);
+    n_bins = min(5, max(3, round(size(W, 1) .^ (1 / max(d + 1, 2)))));
+    edges = linspace(0, 1, n_bins + 1);
+    bin_subs = zeros(size(W));
+    for j = 1:d
+        bin_subs(:, j) = discretize(min(max(W(:, j), 0), 1), edges);
+    end
+    valid = all(bin_subs >= 1 & bin_subs <= n_bins, 2);
+    bin_subs = bin_subs(valid, :);
+    if size(bin_subs, 1) < 16
+        h_bits = NaN;
+        return;
+    end
+
+    strides = [1, cumprod(repmat(n_bins, 1, d - 1))];
+    linear_idx = 1 + sum((bin_subs - 1) .* strides, 2);
+    counts = accumarray(linear_idx, 1, [n_bins ^ d, 1]);
+    p = counts / sum(counts);
+    mask = p > 0;
+    discrete_h_bits = -sum(p(mask) .* log2(p(mask)));
+    bin_width = edges(2) - edges(1);
+    h_bits = discrete_h_bits + d * log2(bin_width);
+end
+
+function h_bits = shannon_entropy_bits_from_state_distribution(p)
+    p = double(p(:));
+    p(~isfinite(p)) = 0;
+    total = sum(p);
+    if total <= eps
+        h_bits = NaN;
+        return;
+    end
+    p = p / total;
+    mask = p > 0;
+    h_bits = -sum(p(mask) .* log2(p(mask)));
+end
+
+function [mi_bits, nmi] = binary_mutual_information_bits(x, y)
+    x = logical(x(:));
+    y = logical(y(:));
+    n = min(numel(x), numel(y));
+    if n == 0
+        mi_bits = NaN;
+        nmi = NaN;
+        return;
+    end
+    x = x(1:n);
+    y = y(1:n);
+    joint = zeros(2, 2);
+    for xi = 0:1
+        for yi = 0:1
+            joint(xi + 1, yi + 1) = mean((x == logical(xi)) & (y == logical(yi)));
+        end
+    end
+    px = sum(joint, 2);
+    py = sum(joint, 1);
+    mi_bits = 0;
+    for i = 1:2
+        for j = 1:2
+            pij = joint(i, j);
+            if pij > 0
+                mi_bits = mi_bits + pij * log2(pij / max(px(i) * py(j), eps));
+            end
+        end
+    end
+    hx = discrete_entropy_bits(px);
+    hy = discrete_entropy_bits(py(:));
+    nmi = normalized_mutual_information_from_components(mi_bits, hx, hy);
+end
+
+function [mi_bits, nmi] = normalized_quantity_mutual_information_bits(x, y)
+    x_norm = normalize_single_quantity_trace(x);
+    y_norm = normalize_single_quantity_trace(y);
+    valid = isfinite(x_norm) & isfinite(y_norm);
+    x_norm = x_norm(valid);
+    y_norm = y_norm(valid);
+    if numel(x_norm) < 16 || max(x_norm) - min(x_norm) <= eps || max(y_norm) - min(y_norm) <= eps
+        mi_bits = NaN;
+        nmi = NaN;
+        return;
+    end
+
+    n_bins = min(16, max(6, round(sqrt(numel(x_norm)) / 2)));
+    x_edges = linspace(0, 1, n_bins + 1);
+    y_edges = linspace(0, 1, n_bins + 1);
+    joint_counts = histcounts2(min(max(x_norm, 0), 1), min(max(y_norm, 0), 1), x_edges, y_edges);
+    total = sum(joint_counts, 'all');
+    if total <= 0
+        mi_bits = NaN;
+        nmi = NaN;
+        return;
+    end
+
+    pxy = joint_counts / total;
+    px = sum(pxy, 2);
+    py = sum(pxy, 1);
+    mi_bits = 0;
+    for i = 1:size(pxy, 1)
+        for j = 1:size(pxy, 2)
+            pij = pxy(i, j);
+            if pij > 0
+                mi_bits = mi_bits + pij * log2(pij / max(px(i) * py(j), eps));
+            end
+        end
+    end
+    hx = discrete_entropy_bits(px);
+    hy = discrete_entropy_bits(py(:));
+    nmi = normalized_mutual_information_from_components(mi_bits, hx, hy);
+end
+
+function h = discrete_entropy_bits(p)
+    p = double(p(:));
+    p = p(isfinite(p) & p > 0);
+    if isempty(p)
+        h = 0;
+        return;
+    end
+    h = -sum(p .* log2(p));
+end
+
+function nmi = normalized_mutual_information_from_components(mi_bits, hx, hy)
+    denom = sqrt(max(hx, 0) * max(hy, 0));
+    if denom <= eps
+        nmi = NaN;
+    else
+        nmi = mi_bits / denom;
+    end
+end
+
+function x_norm = normalize_single_quantity_trace(x)
+    x = double(x(:));
+    x(~isfinite(x)) = 0;
+    if isempty(x)
+        x_norm = x;
+        return;
+    end
+    x = x - min(x);
+    xmax = max(x);
+    if xmax <= eps
+        x_norm = zeros(size(x));
+    else
+        x_norm = x ./ xmax;
+    end
+end
+
+function tf = is_absolute_path_local(pth)
+    pth = char(string(pth));
+    tf = startsWith(pth, filesep) || ~isempty(regexp(pth, '^[A-Za-z]:[\\/]', 'once'));
+end
+
 function ok = maybe_start_parallel_pool(cfg)
     ok = false;
     if ~isfield(cfg, 'use_parfor') || ~cfg.use_parfor
@@ -1011,7 +2156,27 @@ function tf = cluster_solution_needs_refresh(FileFit, rec, common_labels)
     if tf
         return;
     end
-    tf = isfield(rec, 'maps_norm') && size(rec.maps_norm, 2) ~= size(FileFit.centers, 2);
+    if isfield(rec, 'maps_norm') && size(rec.maps_norm, 2) ~= size(FileFit.centers, 2)
+        tf = true;
+        return;
+    end
+    if ~isfield(FileFit, 'backfit_support') || ~isstruct(FileFit.backfit_support) || ...
+            ~isfield(FileFit.backfit_support, 'channel_remap_spec') || isempty(FileFit.backfit_support.channel_remap_spec)
+        tf = true;
+        return;
+    end
+    if ~isfield(FileFit, 'preprocessing') || ~isstruct(FileFit.preprocessing)
+        tf = true;
+        return;
+    end
+    needs_mixture_payload = isfield(FileFit, 'requested_method') && strcmpi(char(string(FileFit.requested_method)), 'spm_vb');
+    if needs_mixture_payload
+        tf = ~isfield(FileFit, 'maps_nc') || isempty(FileFit.maps_nc) || ...
+            ~isfield(FileFit, 'backfit_peak_labels') || isempty(FileFit.backfit_peak_labels) || ...
+            numel(FileFit.backfit_peak_labels) ~= size(FileFit.maps_nc, 1);
+        return;
+    end
+    tf = false;
 end
 
 function out = ternary_string(cond, true_str, false_str)
@@ -2033,27 +3198,8 @@ function [maps, labels, channel_labels, chanlocs] = load_template_maps(template_
     [~, ~, ext] = fileparts(template_file);
     ext = lower(ext);
     if strcmp(ext, '.set')
-        if exist('pop_loadset', 'file') ~= 2
-            error('EEGLAB pop_loadset is required to read template .set files.');
-        end
-        EEG = pop_loadset(template_file);
-        data = double(EEG.data);
-        if ndims(data) == 3
-            data = squeeze(data);
-            if ndims(data) == 3
-                data = reshape(data, size(data, 1), []);
-            end
-        end
-        nchan = numel(EEG.chanlocs);
-        channel_labels = channel_labels_from_chanlocs(EEG.chanlocs, nchan);
-        chanlocs = EEG.chanlocs;
-        if size(data, 1) == nchan
-            maps = data';
-        elseif size(data, 2) == nchan
-            maps = data;
-        else
-            error('Could not infer template map orientation in %s.', template_file);
-        end
+        [maps, labels, channel_labels, chanlocs] = load_metamaps_templates(template_file, 'K', 7);
+        return;
     elseif strcmp(ext, '.mat')
         S = load(template_file);
         if isfield(S, 'template_maps')
@@ -2206,6 +3352,7 @@ function [pooled_maps, pooled_gfp, pooled_rows, population_filter] = pool_cached
         rows.participant = repmat(manifest.participant(i), n, 1);
         rows.condition = repmat(manifest.condition(i), n, 1);
         rows.group = repmat(manifest.group(i), n, 1);
+        rows.file_path = repmat(manifest.file_path(i), n, 1);
         rows.peak_sample = rec.peak_sample(:);
         rows.gfp = double(rec.gfp(:));
         if isfield(rec, 'gfp_effective')

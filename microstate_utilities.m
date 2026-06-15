@@ -15,6 +15,8 @@ function utils = microstate_utilities()
     utils.get_field = @get_field_internal;
     utils.channel_labels_from_chanlocs = @channel_labels_from_chanlocs_internal;
     utils.positions_from_chanlocs = @positions_from_chanlocs_internal;
+    utils.prepare_chanlocs_for_topoplot = @prepare_chanlocs_for_topoplot_internal;
+    utils.prepare_metamaps_chanlocs = @prepare_metamaps_chanlocs_internal;
     utils.scalp_channel_mask = @scalp_channel_mask_internal;
     utils.canonical_channel_labels = @canonical_channel_labels_internal;
     utils.sanitize_channel_labels = @sanitize_channel_labels_internal;
@@ -813,6 +815,136 @@ function pos = positions_from_chanlocs_internal(chanlocs, n_channels)
     end
 end
 
+function [chanlocs_out, keep_idx] = prepare_chanlocs_for_topoplot_internal(chanlocs, n_channels)
+    chanlocs_out = chanlocs;
+    keep_idx = [];
+    if nargin < 2 || isempty(n_channels)
+        n_channels = numel(chanlocs);
+    end
+    if isempty(chanlocs_out)
+        return;
+    end
+
+    n = min([n_channels, numel(chanlocs_out)]);
+    chanlocs_out = chanlocs_out(1:n);
+    pos = positions_from_chanlocs_internal(chanlocs_out, n);
+    keep = all(isfinite(pos), 2);
+    keep_idx = find(keep);
+    chanlocs_out = chanlocs_out(keep);
+    pos = pos(keep, :);
+
+    for i = 1:numel(chanlocs_out)
+        chanlocs_out(i).X = pos(i, 1);
+        chanlocs_out(i).Y = pos(i, 2);
+        chanlocs_out(i).Z = pos(i, 3);
+        if isfield(chanlocs_out(i), 'theta')
+            chanlocs_out(i).theta = [];
+        end
+        if isfield(chanlocs_out(i), 'radius')
+            chanlocs_out(i).radius = [];
+        end
+        if isfield(chanlocs_out(i), 'sph_theta')
+            chanlocs_out(i).sph_theta = [];
+        end
+        if isfield(chanlocs_out(i), 'sph_phi')
+            chanlocs_out(i).sph_phi = [];
+        end
+        if isfield(chanlocs_out(i), 'sph_radius')
+            chanlocs_out(i).sph_radius = [];
+        end
+    end
+end
+
+function [chanlocs_out, keep_idx, pos_out] = prepare_metamaps_chanlocs_internal(chanlocs, n_channels)
+%PREPARE_METAMAPS_CHANLOCS_INTERNAL Canonicalise MetaMaps geometry once.
+%
+% The MetaMaps template file is stored in a frame that renders 90 degrees
+% clockwise relative to the intended scalp orientation. Rotate the
+% channel geometry anticlockwise here while preserving the raw chanloc
+% structure so topoplot sees the same geometry as the original template.
+
+    if nargin < 2 || isempty(n_channels)
+        n_channels = numel(chanlocs);
+    end
+    chanlocs_out = chanlocs;
+    if isempty(chanlocs_out)
+        keep_idx = [];
+        pos_out = nan(0, 3);
+        return;
+    end
+
+    n = min([n_channels, numel(chanlocs_out)]);
+    chanlocs_out = chanlocs_out(1:n);
+    keep = has_usable_topoplot_location_internal(chanlocs_out);
+    keep_idx = find(keep);
+    chanlocs_out = chanlocs_out(keep_idx);
+    if isempty(chanlocs_out)
+        pos_out = nan(0, 3);
+        return;
+    end
+
+    chanlocs_out = rotate_chanlocs_xy_internal(chanlocs_out, 90);
+    pos_out = positions_from_chanlocs_internal(chanlocs_out, numel(chanlocs_out));
+end
+
+function chanlocs_out = rotate_chanlocs_xy_internal(chanlocs_in, angle_deg)
+    chanlocs_out = chanlocs_in;
+    if isempty(chanlocs_in) || ~isfinite(angle_deg)
+        return;
+    end
+
+    rot = [cosd(angle_deg) -sind(angle_deg); sind(angle_deg) cosd(angle_deg)];
+    for i = 1:numel(chanlocs_out)
+        xyz = [ ...
+            double_or_nan_internal(get_field_or_empty_local(chanlocs_out(i), 'X')), ...
+            double_or_nan_internal(get_field_or_empty_local(chanlocs_out(i), 'Y')), ...
+            double_or_nan_internal(get_field_or_empty_local(chanlocs_out(i), 'Z'))];
+        if all(isfinite(xyz))
+            xy = rot * xyz(1:2)';
+            chanlocs_out(i).X = xy(1);
+            chanlocs_out(i).Y = xy(2);
+            chanlocs_out(i).Z = xyz(3);
+        end
+
+        has_theta_radius = isfield(chanlocs_out(i), 'theta') && ~isempty(chanlocs_out(i).theta) && ...
+            isfield(chanlocs_out(i), 'radius') && ~isempty(chanlocs_out(i).radius) && ...
+            isfinite(double(chanlocs_out(i).theta)) && isfinite(double(chanlocs_out(i).radius));
+        if has_theta_radius
+            chanlocs_out(i).theta = wrap_display_angle_internal(double(chanlocs_out(i).theta) + angle_deg);
+        elseif all(isfinite(xyz(1:2)))
+            chanlocs_out(i).theta = wrap_display_angle_internal(atan2d(chanlocs_out(i).Y, chanlocs_out(i).X));
+        end
+    end
+end
+
+function valid = has_usable_topoplot_location_internal(chanlocs)
+    valid = false(1, numel(chanlocs));
+    for i = 1:numel(chanlocs)
+        has_polar = isfield(chanlocs(i), 'theta') && ~isempty(chanlocs(i).theta) && ...
+            isfield(chanlocs(i), 'radius') && ~isempty(chanlocs(i).radius) && ...
+            isfinite(double(chanlocs(i).theta)) && isfinite(double(chanlocs(i).radius)) && ...
+            double(chanlocs(i).radius) > 0 && double(chanlocs(i).radius) <= 0.5;
+        has_xyz = isfield(chanlocs(i), 'X') && ~isempty(chanlocs(i).X) && ...
+            isfield(chanlocs(i), 'Y') && ~isempty(chanlocs(i).Y) && ...
+            isfield(chanlocs(i), 'Z') && ~isempty(chanlocs(i).Z) && ...
+            all(isfinite(double([chanlocs(i).X chanlocs(i).Y chanlocs(i).Z]))) && ...
+            norm(double([chanlocs(i).X chanlocs(i).Y chanlocs(i).Z])) > eps;
+        valid(i) = has_polar || has_xyz;
+    end
+end
+
+function angle_out = wrap_display_angle_internal(angle_in)
+    angle_out = mod(angle_in + 180, 360) - 180;
+end
+
+function value = get_field_or_empty_local(S, field_name)
+    if isfield(S, field_name)
+        value = S.(field_name);
+    else
+        value = [];
+    end
+end
+
 function mask = scalp_channel_mask_internal(chanlocs, n_channels)
     mask = false(n_channels, 1);
     if isempty(chanlocs)
@@ -908,11 +1040,32 @@ end
 function x = double_or_nan_internal(x)
     if isempty(x)
         x = NaN;
-    else
+        return;
+    end
+    if isnumeric(x) || islogical(x)
+        x = double(x(:));
+        x = x(1);
+        return;
+    end
+    if ischar(x) || (isstring(x) && isscalar(x))
+        tmp = str2double(char(x));
+        if isfinite(tmp)
+            x = tmp;
+        else
+            x = NaN;
+        end
+        return;
+    end
+    try
         x = double(x);
-        if numel(x) ~= 1
+        x = x(:);
+        if isempty(x)
+            x = NaN;
+        else
             x = x(1);
         end
+    catch
+        x = NaN;
     end
 end
 
@@ -968,8 +1121,14 @@ function display_name = format_criterion_name_internal(criterion_code)
             display_name = 'Free Energy';
         case 'elbow'
             display_name = 'Elbow';
+        case 'free_energy_elbow'
+            display_name = 'Free Energy Elbow';
         case 'elbow_sil_combined'
             display_name = 'Elbow+Silhouette';
+        case 'covariance_elbow'
+            display_name = 'Covariance Elbow';
+        case 'free_energy_covariance'
+            display_name = 'Free Energy+Covariance';
         case 'gev'
             display_name = 'GEV';
         otherwise

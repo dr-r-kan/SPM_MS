@@ -75,6 +75,26 @@ function analyze_comparison_results(varargin)
         T.n_leads = repmat(71, height(T), 1);
     end
 
+    if ~ismember('method', T.Properties.VariableNames)
+        error('Table missing ''method'' column.');
+    end
+
+    raw_methods = cellstr(string(T.method));
+    canonical_methods = cellfun(@canonicalize_method, raw_methods, 'UniformOutput', false);
+    supported_method_mask = ismember(canonical_methods, {'koenig kmeans', 'spm vb'});
+    if ~any(supported_method_mask)
+        error(['No supported methods found in comparison results. ', ...
+            'Expected Koenig k-means and/or SPM-VB rows.']);
+    end
+    if any(~supported_method_mask)
+        dropped_methods = unique(canonical_methods(~supported_method_mask), 'stable');
+        fprintf('Filtering out unsupported methods: %s\n', strjoin(dropped_methods, ', '));
+        T = T(supported_method_mask, :);
+        canonical_methods = canonical_methods(supported_method_mask);
+    end
+    T.method = canonical_methods(:);
+    fprintf('Retained methods: %s\n\n', strjoin(unique(canonical_methods, 'stable'), ', '));
+
     % ---------- Derived columns ----------
     % K_error signed
     if ismember('K_estimated', T.Properties.VariableNames) && ismember('K_true', T.Properties.VariableNames)
@@ -180,6 +200,7 @@ function analyze_comparison_results(varargin)
     try, T.method = categorical(T.method); catch, T.method = categorical(cellstr(string(T.method))); end
     T.criterion_clean = categorical(T.criterion_clean);
     T.subject = categorical(T.subject);
+    T.method_criterion_combo = categorical(strcat(string(T.method), " | ", string(T.criterion_clean)));
 
     % ---------- Output setup ----------
     plots_dir = fullfile(fileparts(results_dir), 'analysis_plots');
@@ -197,6 +218,10 @@ function analyze_comparison_results(varargin)
     fprintf(fid, 'CV folds: %d\n', ANALYSIS_CONFIG.n_folds);
     fprintf(fid, '========================================\n\n');
 
+    design_info = summarize_method_criterion_design(T, fid);
+    T_method_effects = subset_to_shared_criteria(T, design_info.shared_criteria);
+    T_criterion_effects = subset_to_full_support_methods(T, design_info.full_support_methods);
+
     % ---------- Outcomes ----------
     % Note: runtime_s is excluded from main comparison plots and handled separately
     outcomes = {'K_correct', 'f1_score', 'sensitivity', 'precision', 'mean_recovery_matched', 'K_abs_error'};
@@ -207,8 +232,8 @@ function analyze_comparison_results(varargin)
     outcome_labels_full = {'K_{true} Selection Accuracy', 'F1 Score', 'Sensitivity', 'Precision', 'Runtime (s)', 'Mean Matched Correlation', 'Absolute K Error'};
 
     % ---------- Analyses ----------
-    fprintf('1) METHOD effects\n');    method_results = analyze_factor_effects_with_ci(T, 'method', outcomes_full, fid);
-    fprintf('2) CRITERION effects\n'); criterion_results = analyze_factor_effects_with_ci_using_clean(T, 'criterion_clean', outcomes_full, fid);
+    fprintf('1) METHOD effects\n');    method_results = analyze_factor_effects_with_ci(T_method_effects, 'method', outcomes_full, fid);
+    fprintf('2) CRITERION effects\n'); criterion_results = analyze_factor_effects_with_ci_using_clean(T_criterion_effects, 'criterion_clean', outcomes_full, fid);
     fprintf('3) SNR effects\n'); snr_results = analyze_snr_effects(T, outcomes_full, fid);
     fprintf('4) MONTAGE effects\n'); montage_results = analyze_factor_effects_with_ci(T, 'montage_type', outcomes_full, fid);
     fprintf('5) Interaction METHOD × CRITERION\n'); interaction_results = analyze_interaction(T, outcomes_full, fid);
@@ -218,7 +243,7 @@ function analyze_comparison_results(varargin)
 
     % Bootstrapped LMMs (cluster bootstrap by subject) including interaction
     fprintf('7) Bootstrapped Linear Mixed Models (LMM)\n');
-    fprintf(fid, '\n========================================\nLMM Analysis (cluster bootstrap by subject)\nRandom intercept: subject\nFixed effects: method * criterion_clean + SNR_dB\n========================================\n\n');
+    fprintf(fid, '\n========================================\nLMM Analysis (cluster bootstrap by subject)\nRandom intercept: subject\nFixed effects: method_criterion_combo + SNR_dB\n========================================\n\n');
     for i = 1:length(outcomes_full)
         out = outcomes_full{i};
         fprintf('  LMM for %s\n', out);
@@ -242,8 +267,8 @@ function analyze_comparison_results(varargin)
     fprintf('Generating plots...\n');
     % Use outcomes without runtime for these plots
     create_boxplot_comparison(T, outcomes, outcome_labels, plots_dir);
-    create_method_effects_plot_with_ci(T, outcomes, outcome_labels, method_results, plots_dir);
-    create_criterion_effects_plot_with_ci(T, outcomes, outcome_labels, criterion_results, plots_dir);
+    create_method_effects_plot_with_ci(T_method_effects, outcomes, outcome_labels, method_results, plots_dir);
+    create_criterion_effects_plot_with_ci(T_criterion_effects, outcomes, outcome_labels, criterion_results, plots_dir);
     create_snr_effects_plot(T, outcomes, outcome_labels, plots_dir);
     create_interaction_plot(T, outcomes, outcome_labels, plots_dir);
     create_cross_validation_plot(cv_results, outcomes, outcome_labels, plots_dir);
@@ -254,6 +279,7 @@ function analyze_comparison_results(varargin)
     create_avg_k_error_plot(T, plots_dir);
     create_abs_k_error_plot(T, plots_dir);
     create_backfit_confusion_comparison_plots(T, results_dir, plots_dir);
+    create_simulated_backfit_confusion_summary(T, results_dir, plots_dir);
     
     % Method-Criterion comparison boxplots with significance
     create_method_criterion_boxplots(T, plots_dir);
@@ -265,6 +291,8 @@ function analyze_comparison_results(varargin)
     if length(montages) > 1
         fprintf('Generating criterion-montage comparison boxplots...\n');
         create_criterion_montage_boxplots(T, plots_dir);
+        fprintf('Generating integrated montage robustness analysis...\n');
+        analyze_montage_robustness(csv_file, 'output_dir', fullfile(plots_dir, 'montage_robustness'));
     end
 
     fprintf('All plots saved in %s\n', plots_dir);
@@ -291,6 +319,66 @@ function levels = get_factor_levels(T, factor_name)
         col_cell = cellstr(string(col));
     end
     levels = unique(col_cell, 'stable');
+end
+
+function design_info = summarize_method_criterion_design(T, fid)
+    methods = get_factor_levels(T, 'method');
+    criteria = get_factor_levels(T, 'criterion_clean');
+    observed = false(numel(methods), numel(criteria));
+    counts = zeros(numel(methods), numel(criteria));
+    for m = 1:numel(methods)
+        for c = 1:numel(criteria)
+            mask = strcmp(cellstr(string(T.method)), methods{m}) & ...
+                strcmp(cellstr(string(T.criterion_clean)), criteria{c});
+            counts(m, c) = nnz(mask);
+            observed(m, c) = counts(m, c) > 0;
+        end
+    end
+    shared_criteria = criteria(all(observed, 1));
+    full_support_methods = methods(all(observed, 2));
+    design_info = struct('methods', {methods}, 'criteria', {criteria}, ...
+        'observed', observed, 'counts', counts, ...
+        'shared_criteria', {shared_criteria}, ...
+        'full_support_methods', {full_support_methods});
+
+    fprintf(fid, 'Observed method-criterion design:\n');
+    for m = 1:numel(methods)
+        observed_criteria = criteria(observed(m, :));
+        if isempty(observed_criteria)
+            observed_label = '<none>';
+        else
+            observed_label = strjoin(observed_criteria, ', ');
+        end
+        fprintf(fid, '  %s: %s\n', methods{m}, observed_label);
+    end
+    if ~isempty(shared_criteria)
+        fprintf(fid, 'Shared criteria across all methods: %s\n', strjoin(shared_criteria, ', '));
+    else
+        fprintf(fid, 'Shared criteria across all methods: <none>\n');
+    end
+    if ~isempty(full_support_methods)
+        fprintf(fid, 'Methods with full criterion support: %s\n\n', strjoin(full_support_methods, ', '));
+    else
+        fprintf(fid, 'Methods with full criterion support: <none>\n\n');
+    end
+end
+
+function T_sub = subset_to_shared_criteria(T, shared_criteria)
+    if isempty(shared_criteria)
+        T_sub = T;
+        return;
+    end
+    mask = ismember(cellstr(string(T.criterion_clean)), shared_criteria);
+    T_sub = T(mask, :);
+end
+
+function T_sub = subset_to_full_support_methods(T, full_support_methods)
+    if isempty(full_support_methods)
+        T_sub = T;
+        return;
+    end
+    mask = ismember(cellstr(string(T.method)), full_support_methods);
+    T_sub = T(mask, :);
 end
 
 function results = analyze_factor_effects_with_ci(T, factor_name, outcomes, fid)
@@ -482,7 +570,7 @@ function analyze_lmm_bootstrap(T, outcome_var, n_boot, fid)
         fprintf(fid, 'Not enough subjects (%d) for LMM on %s; skipping\n', n_subj, outcome_var); return;
     end
     if ~isnumeric(Tsub.SNR_dB), Tsub.SNR_dB = double(Tsub.SNR_dB); end
-    formula = sprintf('%s ~ 1 + method*criterion_clean + SNR_dB + (1|subject)', outcome_var);
+    formula = sprintf('%s ~ 1 + method_criterion_combo + SNR_dB + (1|subject)', outcome_var);
     % Treat near-zero residual variance as degenerate to cut down on fitlme warnings
     base_var = var(Tsub.(outcome_var), 'omitnan');
     resvar_floor = max(1e-8, 1e-4 * base_var);
@@ -891,7 +979,7 @@ function create_method_effects_plot_with_ci(T, outcomes, outcome_labels, method_
         grid on;
         set(gca, 'GridColor', [0.85 0.85 0.85], 'GridAlpha', 0.5);
     end
-    sgtitle('Method effects (aggregated over criteria)', 'FontSize', 13, 'FontWeight', 'bold');
+    sgtitle('Method effects (shared criteria only)', 'FontSize', 13, 'FontWeight', 'bold');
     saveas(fig, fullfile(plots_dir,'method_effects_with_ci.png'));
     close(fig);
 end
@@ -930,7 +1018,7 @@ function create_criterion_effects_plot_with_ci(T, outcomes, outcome_labels, crit
         grid on;
         set(gca, 'GridColor', [0.85 0.85 0.85], 'GridAlpha', 0.5);
     end
-    sgtitle('Criterion effects', 'FontSize', 13, 'FontWeight', 'bold');
+    sgtitle('Criterion effects (full-support methods only)', 'FontSize', 13, 'FontWeight', 'bold');
     saveas(fig, fullfile(plots_dir,'criterion_effects_with_ci.png'));
     close(fig);
 end
@@ -1089,7 +1177,7 @@ function create_vb_covariance_relationship_plots(T, outcomes, outcome_labels, vb
                 stats = vb_covariance_results.(spec.name).(outcome);
                 yfit = stats.slope * xfit + stats.intercept;
                 plot(xfit, yfit, '-', 'Color', [0.85 0.2 0.2], 'LineWidth', 2);
-                title(sprintf('%s\\n\\rho_s=%.2f, p=%.3g', outcome_labels{j}, stats.spearman_rho, stats.spearman_p), 'FontSize', 11);
+                title(sprintf('%s\n\\rho_s=%.2f, p=%.3g', outcome_labels{j}, stats.spearman_rho, stats.spearman_p), 'FontSize', 11);
             else
                 title(outcome_labels{j}, 'FontSize', 11);
             end
@@ -1145,7 +1233,7 @@ function create_vb_covariance_kcorrect_barplots(vb_covariance_results, plots_dir
 
         set(gca, 'XTick', 1:2, 'XTickLabel', group_labels, 'XTickLabelRotation', 20);
         ylabel(spec.label, 'FontSize', 10, 'FontWeight', 'bold');
-        title(sprintf('%s\\nDelta=%.3f [%0.3f, %0.3f]', ...
+        title(sprintf('%s\nDelta=%.3f [%0.3f, %0.3f]', ...
             spec.label, stats.mean_difference, stats.ci_difference(1), stats.ci_difference(2)), 'FontSize', 11);
         text(1, means(1), sprintf(' n=%d', stats.n_correct), 'VerticalAlignment', 'bottom', 'HorizontalAlignment', 'center', 'FontSize', 9);
         text(2, means(2), sprintf(' n=%d', stats.n_incorrect), 'VerticalAlignment', 'bottom', 'HorizontalAlignment', 'center', 'FontSize', 9);
@@ -1196,7 +1284,8 @@ function create_backfit_confusion_comparison_plots(T, results_dir, plots_dir)
     template_chanlocs = [];
     try
         if ~isempty(template_file) && isfile(template_file)
-            [template_maps, template_labels, ~, template_chanlocs] = load_metamaps_templates(template_file, 'K', 7);
+            [template_maps, template_labels] = load_metamaps_templates(template_file, 'K', 7);
+            [template_maps, template_chanlocs] = prepare_template_topoplot_data(template_file, template_maps);
         end
     catch ME
         warning('Could not load canonical template topographies for confusion plots: %s', ME.message);
@@ -1272,6 +1361,34 @@ function create_backfit_confusion_comparison_plots(T, results_dir, plots_dir)
     if row_count > 0
         manifest = vertcat(manifest_rows{:});
         writetable(manifest, fullfile(output_dir, 'backfit_confusion_comparison_manifest.csv'));
+    end
+end
+
+function create_simulated_backfit_confusion_summary(T, results_dir, plots_dir)
+    if ~istable(T) || height(T) == 0 || ~ismember('backfit_diagnostic_file', T.Properties.VariableNames)
+        return;
+    end
+
+    results_csv = fullfile(results_dir, 'comparison_results.csv');
+    if ~isfile(results_csv)
+        return;
+    end
+
+    diag_files = cellstr(string(T.backfit_diagnostic_file));
+    valid_diag_mask = ~cellfun(@isempty, diag_files) & cellfun(@isfile, diag_files);
+    if ~any(valid_diag_mask)
+        fprintf('Skipping simulated backfit confusion summary: no valid diagnostic files were found.\n');
+        return;
+    end
+
+    output_file = fullfile(plots_dir, 'backfit_confusion_summary.png');
+    try
+        plot_simulated_backfit_confusion_summary( ...
+            'results_csv', results_csv, ...
+            'output_file', output_file, ...
+            'visible', false);
+    catch ME
+        fprintf('Skipping simulated backfit confusion summary: %s\n', ME.message);
     end
 end
 
@@ -1493,19 +1610,73 @@ function render_template_topography(ax, label, template_maps, template_labels, t
         return;
     end
 
-    vals = double(template_maps(idx, :));
-    if exist('topoplot', 'file') == 2 && ~isempty(template_chanlocs)
+    [vals, ok] = select_template_topography_values(template_maps, idx, numel(template_chanlocs));
+    if exist('topoplot', 'file') == 2 && ~isempty(template_chanlocs) && ok
         try
-            topoplot(vals, template_chanlocs, 'electrodes', 'off', 'numcontour', 6);
-        catch
-            imagesc(ax, reshape(vals, 1, []));
+            topoplot(vals, template_chanlocs, 'electrodes', 'off', 'numcontour', 6, 'maplimits', 'absmax');
             axis(ax, 'off');
+            colormap(ax, jet(256));
+        catch ME
+            warning('Template topography for %s fell back to text because topoplot failed: %s', char(string(label)), ME.message);
+            text(0.5, 0.5, char(string(label)), 'HorizontalAlignment', 'center', 'FontSize', 12, 'FontWeight', 'bold');
         end
     else
-        imagesc(ax, reshape(vals, 1, []));
-        axis(ax, 'off');
+        text(0.5, 0.5, char(string(label)), 'HorizontalAlignment', 'center', 'FontSize', 12, 'FontWeight', 'bold');
     end
     title(ax, char(string(label)), 'FontSize', 9, 'FontWeight', 'bold');
+end
+
+function [template_maps_out, chanlocs_out] = prepare_template_topoplot_data(template_file, template_maps_in)
+    template_maps_out = template_maps_in;
+    chanlocs_out = [];
+    if isempty(template_maps_in) || isempty(template_file) || ~isfile(template_file) || exist('pop_loadset', 'file') ~= 2
+        return;
+    end
+
+    EEG = pop_loadset('filename', char(template_file));
+    if ~isfield(EEG, 'chanlocs') || isempty(EEG.chanlocs)
+        return;
+    end
+
+    n_channels = size(template_maps_in, 2);
+    if numel(EEG.chanlocs) < n_channels
+        warning('Template chanloc count (%d) is smaller than map width (%d); skipping template topoplots.', numel(EEG.chanlocs), n_channels);
+        return;
+    end
+
+    util = microstate_utilities();
+    [chanlocs_out, keep] = util.prepare_metamaps_chanlocs(EEG.chanlocs, n_channels);
+    if numel(chanlocs_out) < 4
+        warning('Fewer than four canonical template channels have usable topoplot geometry; skipping template topoplots.');
+        return;
+    end
+
+    template_maps_out = template_maps_in(:, keep);
+end
+
+function [vals, ok] = select_template_topography_values(template_maps, idx, n_chanlocs)
+    vals = [];
+    ok = false;
+    if isempty(template_maps) || isempty(idx) || n_chanlocs < 1
+        return;
+    end
+
+    if idx <= size(template_maps, 1)
+        candidate = double(template_maps(idx, :));
+        if numel(candidate) == n_chanlocs
+            vals = candidate(:)';
+            ok = true;
+            return;
+        end
+    end
+
+    if idx <= size(template_maps, 2)
+        candidate = double(template_maps(:, idx));
+        if numel(candidate) == n_chanlocs
+            vals = candidate(:)';
+            ok = true;
+        end
+    end
 end
 
 function create_vb_covariance_correlation_heatmap(vb_covariance_results, outcomes, outcome_labels, plots_dir)
@@ -1744,15 +1915,28 @@ function m = canonicalize_method(m_in)
     m = strrep(m, '_', ' ');
     m = regexprep(m, '\s+', ' ');
     m = strtrim(m);
-    if contains(m, 'kmeans koenig')
-        m = strrep(m, 'kmeans koenig', 'kmeans');
-    elseif contains(m, 'kmeans standard')
-        m = strrep(m, 'kmeans standard', 'kmeans');
+    if contains(m, 'spm vb')
+        m = 'spm vb';
+    elseif contains(m, 'spm kmeans')
+        m = 'spm kmeans';
+    elseif contains(m, 'kmeans koenig') || contains(m, 'koenig kmeans')
+        m = 'koenig kmeans';
+    elseif contains(m, 'kmeans standard') || contains(m, 'standard kmeans')
+        m = 'standard kmeans';
     end
 end
 
 function label = display_method_label(m_in)
-    label = canonicalize_method(m_in);
+    switch canonicalize_method(m_in)
+        case 'spm vb'
+            label = 'SPM-VB';
+        case 'koenig kmeans'
+            label = 'Koenig k-means';
+        case 'standard kmeans'
+            label = 'Standard k-means';
+        otherwise
+            label = canonicalize_method(m_in);
+    end
 end
 
 function s = sanitize_stub(s)
@@ -1774,10 +1958,10 @@ function create_criterion_montage_boxplots(T, plots_dir)
         ANALYSIS_CONFIG.n_boot = 10000;
     end
     
-    % Filter for SPM and k-means methods only
+    % Filter for the supported methods only
     method_col = cellstr(string(T.method));
-    method_filter = contains(method_col, 'spm', 'IgnoreCase', true) | ...
-                    contains(method_col, 'kmeans', 'IgnoreCase', true);
+    method_canon = cellfun(@canonicalize_method, method_col, 'UniformOutput', false);
+    method_filter = ismember(method_canon, {'koenig kmeans', 'spm vb'});
     T_filtered = T(method_filter, :);
     
     if height(T_filtered) == 0
@@ -1812,33 +1996,31 @@ function create_criterion_montage_boxplots(T, plots_dir)
     end
     
     % Identify methods
-    unique_methods = unique(cellstr(string(T_filtered.method)));
-    
-    % Look for spm-k-means (combined method)
-    spm_kmeans_idx = find(contains(unique_methods, 'spm', 'IgnoreCase', true) & contains(unique_methods, 'kmeans', 'IgnoreCase', true), 1);
-    
-    % Look for standard kmeans
-    kmeans_idx = find(contains(unique_methods, 'kmeans', 'IgnoreCase', true) & ~contains(unique_methods, 'spm', 'IgnoreCase', true), 1);
-    
-    if isempty(spm_kmeans_idx) || isempty(kmeans_idx)
-        fprintf('⚠ Need both SPM-K-Means and K-Means data\n');
+    method_canon_filtered = method_canon(method_filter);
+    unique_methods = unique(method_canon_filtered, 'stable');
+
+    spm_vb_idx = find(strcmp(unique_methods, 'spm vb'), 1);
+    kmeans_idx = find(strcmp(unique_methods, 'koenig kmeans'), 1);
+
+    if isempty(spm_vb_idx) || isempty(kmeans_idx)
+        fprintf('⚠ Need both SPM-VB and Koenig k-means data\n');
         fprintf('   Available methods: %s\n', strjoin(unique_methods, ', '));
         return;
     end
-    
-    spm_kmeans_method = unique_methods{spm_kmeans_idx};
+
+    spm_vb_method = unique_methods{spm_vb_idx};
     kmeans_method = unique_methods{kmeans_idx};
-    
-    fprintf('  Using methods: %s vs %s\n', spm_kmeans_method, kmeans_method);
+
+    fprintf('  Using methods: %s vs %s\n', spm_vb_method, kmeans_method);
     
     % ========== FIGURE 1: Absolute K Error by Criterion and Montage ==========
     for method_idx = 1:2
         if method_idx == 1
-            method = spm_kmeans_method;
-            method_label = 'SPM-K-Means';
+            method = spm_vb_method;
+            method_label = display_method_label(method);
         else
             method = kmeans_method;
-            method_label = 'kmeans';
+            method_label = display_method_label(method);
         end
         
         fig = figure('Position', [100 100 1400 600]);
@@ -1959,11 +2141,11 @@ function create_criterion_montage_boxplots(T, plots_dir)
     % ========== FIGURE 2: F1 Score by Criterion and Montage ==========
     for method_idx = 1:2
         if method_idx == 1
-            method = spm_kmeans_method;
-            method_label = 'SPM-K-Means';
+            method = spm_vb_method;
+            method_label = display_method_label(method);
         else
             method = kmeans_method;
-            method_label = 'kmeans';
+            method_label = display_method_label(method);
         end
         
         fig = figure('Position', [100 100 1400 600]);
