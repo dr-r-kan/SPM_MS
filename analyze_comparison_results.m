@@ -9,7 +9,7 @@
 
 function analyze_comparison_results(varargin)
     % ---------- Parse inputs ----------
-    default_results_dir = 'Output/results';
+    default_results_dir = 'outputs/simulations/results/';
     default_n_boot = 2000;
     default_n_boot_lmm = 2000;
     default_n_folds = 20;
@@ -1896,14 +1896,23 @@ function s_out = canonicalize_criterion(s_in)
     s = regexprep(s, '\s+', ' ');
     s = strtrim(s);
     
-    % Replace "elbow" with "free energy elbow"
-    if contains(s, 'elbow') && ~contains(s, 'free energy')
-        s = strrep(s, 'elbow', 'free energy elbow');
+    % Bare "elbow" refers to the free-energy elbow in the simulation outputs.
+    if strcmp(s, 'elbow')
+        s = 'free energy elbow';
     end
     
-    if contains(s,'elbow sil') || contains(s, 'free energy elbow sil'), s = 'elbow sil combined';
-    elseif strcmp(s,'free energy elbow only'), s = 'free energy elbow';
-    elseif strcmp(s,'silhouette only'), s = 'silhouette'; end
+    if any(strcmp(s, {'gfp', 'global field power', 'global explained variance'}))
+        s = 'gev';
+    end
+    if contains(s,'elbow sil') || contains(s, 'free energy elbow sil')
+        s = 'elbow sil combined';
+    elseif strcmp(s,'free energy elbow only')
+        s = 'free energy elbow';
+    elseif strcmp(s,'silhouette only')
+        s = 'silhouette';
+    elseif any(strcmp(s, {'covariance raw', 'covariance min'}))
+        s = 'covariance';
+    end
     s = regexprep(s, '(\b\w+\b)(\s+\1)+', '$1');
     s_out = s;
 end

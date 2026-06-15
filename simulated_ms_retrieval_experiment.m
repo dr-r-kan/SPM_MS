@@ -5,7 +5,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
 % current retrieval comparison:
 %   - kmeans_koenig: silhouette
 %   - spm_vb: silhouette, free_energy, free_energy_elbow, elbow_sil_combined,
-%             covariance_elbow, free_energy_covariance
+%             gev/gfp, covariance, covariance_elbow, free_energy_covariance
 %
 % Requirements:
 % spm on path (development version at spm/spm on github)
@@ -32,7 +32,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
     %  - popFitMSMaps.m
     % All from the "microstates" repository
 
-    test = true;
+    test = false;
 
     p = inputParser;
     if test
@@ -58,6 +58,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
     addParameter(p, 'spm_path', '', @ischar); % optional: point to SPM toolbox/mixture if not obvious
     addParameter(p, 'verbose', true, @islogical);
     addParameter(p, 'save_json', true, @islogical);
+    addParameter(p, 'save_k_candidate_metrics', true, @islogical);
     addParameter(p, 'montages', cellstr(string(sim_defaults.montages)), @iscell);  % montage robustness analysis
     addParameter(p, 'overlap_probs', double(sim_defaults.overlap_probs(:)'), @isnumeric); % run with and without overlap
     addParameter(p, 'overlap_ms_range', double(sim_defaults.overlap_ms_range(:)'), @isnumeric);
@@ -68,7 +69,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
     addParameter(p, 'validate_simulation', logical(sim_defaults.validate_simulation), @islogical);
     addParameter(p, 'preprocessing', sim_defaults.preprocessing, @isstruct);
     addParameter(p, 'methods', {'spm_vb', 'kmeans_koenig'}, @(x) iscell(x) || isstring(x));
-    addParameter(p, 'criteria', {'silhouette', 'free_energy', 'free_energy_elbow', 'elbow_sil_combined', 'covariance_elbow', 'free_energy_covariance'}, @(x) iscell(x) || isstring(x));
+    addParameter(p, 'criteria', {'silhouette', 'free_energy', 'free_energy_elbow', 'gev', 'covariance', 'covariance_elbow', 'elbow_sil_combined', 'free_energy_covariance'}, @(x) iscell(x) || isstring(x));
     parse(p, varargin{:});
     
     CONFIG = p.Results;
@@ -208,6 +209,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
     
     % Prepare for parallel execution
     all_results = cell(n_eeg_conditions, 1);
+    all_k_candidate_results = cell(n_eeg_conditions, 1);
     
     % We cannot use the progress bar object inside parfor easily
     fprintf('Starting parallel processing of %d EEG conditions...\n', n_eeg_conditions);
@@ -215,6 +217,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
     parfor eeg_idx = 1:n_eeg_conditions
         % Local variables for this iteration
         local_rows = [];
+        local_k_candidate_rows = [];
         
         rep = eeg_conditions(eeg_idx, 1);
         K_true = eeg_conditions(eeg_idx, 2);
@@ -357,6 +360,9 @@ function T = simulated_ms_retrieval_experiment(varargin)
                 Results = fit_result.Results;
                 method_str = char(string(fit_result.method));
                 selected_solution_cache = struct();
+                candidate_rows = build_k_candidate_metric_rows( ...
+                    eeg_idx, m_idx, fit_result, Results, Sim, montage_type);
+                local_k_candidate_rows = [local_k_candidate_rows; candidate_rows]; %#ok<AGROW>
                 
                 criteria_for_method = method_criteria_map(method_str);
                 for c_idx = 1:numel(criteria_for_method)
@@ -590,11 +596,13 @@ function T = simulated_ms_retrieval_experiment(varargin)
         
         % Store results for this EEG condition
         all_results{eeg_idx} = local_rows;
+        all_k_candidate_results{eeg_idx} = local_k_candidate_rows;
         
     end  % End PARFOR loop
     
     % Combine all results
     rows = vertcat(all_results{:});
+    k_candidate_rows = vertcat(all_k_candidate_results{:});
     
     % Fix IDs
     if ~isempty(rows)
@@ -627,6 +635,11 @@ function T = simulated_ms_retrieval_experiment(varargin)
     criterion_summary_csv = fullfile(res_dir, 'k_selection_summary_by_method_criterion.csv');
     Tcrit = k_selection_summary_by_method_criterion(T);
     writetable(Tcrit, criterion_summary_csv);
+    if CONFIG.save_k_candidate_metrics && ~isempty(k_candidate_rows)
+        Tk = struct2table(k_candidate_rows, 'AsArray', true);
+        k_candidate_csv = fullfile(res_dir, 'k_candidate_metrics.csv');
+        writetable(Tk, k_candidate_csv);
+    end
     if CONFIG.compute_backfit_diagnostics
         if ~exist(confusion_dir, 'dir'), mkdir(confusion_dir); end
         write_simulation_backfit_reports(T, confusion_dir);
@@ -635,6 +648,9 @@ function T = simulated_ms_retrieval_experiment(varargin)
     if CONFIG.verbose
         fprintf('✓ Saved: %s\n', summary_csv);
         fprintf('âœ“ Saved: %s\n', criterion_summary_csv);
+        if CONFIG.save_k_candidate_metrics && ~isempty(k_candidate_rows)
+            fprintf('✓ Saved: %s\n', fullfile(res_dir, 'k_candidate_metrics.csv'));
+        end
         fprintf('  Successful: %d rows | Failed: %d\n', height(T), n_failed);
     end
     
@@ -674,6 +690,251 @@ end
 function Tcrit = k_selection_summary_by_method_criterion(T)
     Tcrit = groupsummary(T, {'method', 'criterion'}, {'mean', 'std'}, {'K_correct', 'K_error'});
     Tcrit.accuracy_pct = 100 * Tcrit.mean_K_correct;
+end
+
+function rows = build_k_candidate_metric_rows(eeg_idx, m_idx, fit_result, Results, Sim, montage_type)
+    rows = [];
+    if ~isfield(Results, 'K_candidates') || isempty(Results.K_candidates)
+        return;
+    end
+
+    K_candidates = double(Results.K_candidates(:));
+    nK = numel(K_candidates);
+    method_str = char(string(fit_result.method));
+    montage_name = char(string(montage_type));
+    overlap_pct = round(100 * double(Sim.overlap_prob));
+    run_group_id = sprintf('sim_E%d_rep%d_K%d_SNR%s_ovl%03d_%s', ...
+        eeg_idx, fit_result.rep, fit_result.K_true, signed_token(fit_result.SNR_dB), ...
+        overlap_pct, safe_token(montage_name));
+    fit_group_id = sprintf('%s_%s', run_group_id, safe_token(method_str));
+
+    free_energy = resize_numeric_metric(get_result_metric(Results, 'free_energy_vals'), nK, NaN);
+    silhouette = resize_numeric_metric(get_result_metric(Results, 'silhouette_vals'), nK, NaN);
+    gev_vals = resize_numeric_metric(get_result_metric(Results, 'gev_vals'), nK, NaN);
+    within_ss = resize_numeric_metric(get_result_metric(Results, 'within_ss'), nK, NaN);
+    cov_trace_mean = resize_numeric_metric(get_result_metric(Results, 'covariance_trace_mean_vals'), nK, NaN);
+    cov_trace_median = resize_numeric_metric(get_result_metric(Results, 'covariance_trace_median_vals'), nK, NaN);
+    cov_logdet_mean = resize_numeric_metric(get_result_metric(Results, 'covariance_logdet_mean_vals'), nK, NaN);
+    cov_logdet_median = resize_numeric_metric(get_result_metric(Results, 'covariance_logdet_median_vals'), nK, NaN);
+    cov_logdet_per_dim = resize_numeric_metric(get_result_metric(Results, 'covariance_logdet_per_dim_mean_vals'), nK, NaN);
+    [cov_primary, cov_primary_name] = primary_covariance_metric_for_export( ...
+        cov_logdet_per_dim, cov_logdet_mean, cov_trace_mean, cov_trace_median);
+
+    score_silhouette = criterion_score_vector_for_export(Results, 'silhouette');
+    score_free_energy = criterion_score_vector_for_export(Results, 'free_energy');
+    score_free_energy_elbow = criterion_score_vector_for_export(Results, 'free_energy_elbow');
+    score_gev = criterion_score_vector_for_export(Results, 'gev');
+    score_covariance = criterion_score_vector_for_export(Results, 'covariance');
+    score_covariance_elbow = criterion_score_vector_for_export(Results, 'covariance_elbow');
+    score_elbow_sil_combined = criterion_score_vector_for_export(Results, 'elbow_sil_combined');
+    score_free_energy_covariance = criterion_score_vector_for_export(Results, 'free_energy_covariance');
+
+    selected_silhouette = select_K_by_criterion(Results, 'silhouette');
+    selected_free_energy = select_K_by_criterion(Results, 'free_energy');
+    selected_free_energy_elbow = select_K_by_criterion(Results, 'free_energy_elbow');
+    selected_gev = select_K_by_criterion(Results, 'gev');
+    selected_covariance = select_K_by_criterion(Results, 'covariance');
+    selected_covariance_elbow = select_K_by_criterion(Results, 'covariance_elbow');
+    selected_elbow_sil_combined = select_K_by_criterion(Results, 'elbow_sil_combined');
+    selected_free_energy_covariance = select_K_by_criterion(Results, 'free_energy_covariance');
+
+    sim_qc_status = 'NOT_RUN';
+    sim_qc_psd_slope = NaN;
+    sim_qc_mean_dwell_ms = NaN;
+    sim_qc_gfp_median_uv = NaN;
+    if isfield(Sim, 'sim_qc') && ~isempty(Sim.sim_qc)
+        sim_qc_status = Sim.sim_qc.overall_status;
+        sim_qc_psd_slope = Sim.sim_qc.spectrum.power_slope_2_40hz;
+        sim_qc_gfp_median_uv = Sim.sim_qc.amplitude.gfp_median_uv;
+        if isfield(Sim.sim_qc.microstate_dynamics, 'mean_dwell_ms')
+            sim_qc_mean_dwell_ms = Sim.sim_qc.microstate_dynamics.mean_dwell_ms;
+        end
+    end
+
+    free_energy_norm = normalize_01_export(free_energy);
+    silhouette_norm = normalize_01_export(silhouette);
+    gev_norm = normalize_01_export(gev_vals);
+    within_ss_norm = normalize_01_export(invert_metric_for_export(within_ss));
+    covariance_primary_norm = normalize_01_export(invert_metric_for_export(cov_primary));
+    free_energy_elbow_norm = normalize_01_export(score_free_energy_elbow);
+    covariance_elbow_norm = normalize_01_export(score_covariance_elbow);
+
+    rows = repmat(struct(), nK, 1);
+    for i = 1:nK
+        K_candidate = K_candidates(i);
+        rows(i) = struct( ...
+            'fit_group_id', fit_group_id, ...
+            'run_group_id', run_group_id, ...
+            'k_row_id', sprintf('%s_K%02d', fit_group_id, round(K_candidate)), ...
+            'eeg_idx', eeg_idx, ...
+            'rep', fit_result.rep, ...
+            'method', method_str, ...
+            'Method', string(method_str), ...
+            'K_true', fit_result.K_true, ...
+            'K_candidate', K_candidate, ...
+            'is_true_k', double(K_candidate == fit_result.K_true), ...
+            'K', K_candidate, ...
+            'K_correct', double(K_candidate == fit_result.K_true), ...
+            'K_error', abs(K_candidate - fit_result.K_true), ...
+            'K_gap', fit_result.K_true - K_candidate, ...
+            'candidate_index', i, ...
+            'n_k_candidates', nK, ...
+            'edge_distance', min(i - 1, nK - i), ...
+            'is_edge_candidate', double(i == 1 || i == nK), ...
+            'SNR_dB', fit_result.SNR_dB, ...
+            'SNR', fit_result.SNR_dB, ...
+            'overlap_prob', Sim.overlap_prob, ...
+            'overlap_strength', Sim.overlap_strength, ...
+            'overlap_ms_min', Sim.overlap_ms_range(1), ...
+            'overlap_ms_max', Sim.overlap_ms_range(end), ...
+            'montage_type', montage_name, ...
+            'n_leads', fit_result.n_leads, ...
+            'N_channels', fit_result.n_leads, ...
+            'sim_qc_status', sim_qc_status, ...
+            'sim_qc_psd_slope_2_40hz', sim_qc_psd_slope, ...
+            'sim_qc_gfp_median_uv', sim_qc_gfp_median_uv, ...
+            'sim_qc_mean_dwell_ms', sim_qc_mean_dwell_ms, ...
+            'free_energy', free_energy(i), ...
+            'FreeEnergy', free_energy(i), ...
+            'silhouette', silhouette(i), ...
+            'Silhouette', silhouette(i), ...
+            'gev', gev_vals(i), ...
+            'GEV', gev_vals(i), ...
+            'GFP', sim_qc_gfp_median_uv, ...
+            'GFP_median_uv', sim_qc_gfp_median_uv, ...
+            'within_ss', within_ss(i), ...
+            'covariance_primary', cov_primary(i), ...
+            'Covariance', cov_primary(i), ...
+            'covariance_primary_name', cov_primary_name, ...
+            'covariance_trace_mean', cov_trace_mean(i), ...
+            'covariance_trace_median', cov_trace_median(i), ...
+            'covariance_logdet_mean', cov_logdet_mean(i), ...
+            'covariance_logdet_median', cov_logdet_median(i), ...
+            'covariance_logdet_per_dim_mean', cov_logdet_per_dim(i), ...
+            'free_energy_norm', free_energy_norm(i), ...
+            'silhouette_norm', silhouette_norm(i), ...
+            'gev_norm', gev_norm(i), ...
+            'within_ss_improvement_norm', within_ss_norm(i), ...
+            'covariance_tightness_norm', covariance_primary_norm(i), ...
+            'score_silhouette', score_silhouette(i), ...
+            'score_free_energy', score_free_energy(i), ...
+            'score_free_energy_elbow', score_free_energy_elbow(i), ...
+            'score_gev', score_gev(i), ...
+            'score_covariance', score_covariance(i), ...
+            'score_covariance_elbow', score_covariance_elbow(i), ...
+            'score_elbow_sil_combined', score_elbow_sil_combined(i), ...
+            'score_free_energy_covariance', score_free_energy_covariance(i), ...
+            'FreeEnergyElbow', score_free_energy_elbow(i), ...
+            'CovarianceElbow', score_covariance_elbow(i), ...
+            'free_energy_elbow_norm', free_energy_elbow_norm(i), ...
+            'covariance_elbow_norm', covariance_elbow_norm(i), ...
+            'selected_by_silhouette', double(K_candidate == selected_silhouette), ...
+            'selected_by_free_energy', double(K_candidate == selected_free_energy), ...
+            'selected_by_free_energy_elbow', double(K_candidate == selected_free_energy_elbow), ...
+            'selected_by_gev', double(K_candidate == selected_gev), ...
+            'selected_by_covariance', double(K_candidate == selected_covariance), ...
+            'selected_by_covariance_elbow', double(K_candidate == selected_covariance_elbow), ...
+            'selected_by_elbow_sil_combined', double(K_candidate == selected_elbow_sil_combined), ...
+            'selected_by_free_energy_covariance', double(K_candidate == selected_free_energy_covariance));
+    end
+end
+
+function vec = criterion_score_vector_for_export(Results, criterion)
+    if isfield(Results, 'method') && strcmpi(char(string(Results.method)), 'spm_vb')
+        [~, ~, vec] = select_spm_vb_k_by_criterion(Results, criterion);
+        vec = resize_numeric_metric(vec, numel(Results.K_candidates), NaN);
+        return;
+    end
+
+    nK = numel(Results.K_candidates);
+    vec = nan(nK, 1);
+    switch lower(strtrim(char(string(criterion))))
+        case 'silhouette'
+            vec = resize_numeric_metric(get_result_metric(Results, 'silhouette_vals'), nK, NaN);
+        case 'free_energy'
+            vec = resize_numeric_metric(get_result_metric(Results, 'free_energy_vals'), nK, NaN);
+        case {'gev', 'gfp', 'global_explained_variance'}
+            vec = resize_numeric_metric(get_result_metric(Results, 'gev_vals'), nK, NaN);
+        case {'free_energy_elbow', 'elbow'}
+            fe_vals = resize_numeric_metric(get_result_metric(Results, 'free_energy_vals'), nK, NaN);
+            valid_mask = isfinite(fe_vals) & fe_vals ~= 0;
+            if any(valid_mask)
+                k_valid = double(Results.K_candidates(valid_mask));
+                [~, curvature_valid] = select_K_from_free_energy_elbow_helper(fe_vals(valid_mask), k_valid);
+                vec(valid_mask) = curvature_valid;
+            end
+        otherwise
+            vec = nan(nK, 1);
+    end
+end
+
+function values = get_result_metric(Results, field_name)
+    if isfield(Results, field_name) && ~isempty(Results.(field_name))
+        values = double(Results.(field_name)(:));
+    else
+        values = [];
+    end
+end
+
+function values = resize_numeric_metric(values, n, fill_value)
+    if nargin < 3
+        fill_value = NaN;
+    end
+    values = double(values(:));
+    if isempty(values)
+        values = repmat(fill_value, n, 1);
+        return;
+    end
+    if numel(values) < n
+        values(end + 1:n, 1) = fill_value;
+    elseif numel(values) > n
+        values = values(1:n);
+    end
+end
+
+function [values, metric_name] = primary_covariance_metric_for_export(logdet_per_dim, logdet_mean, trace_mean, trace_median)
+    candidates = { ...
+        {'covariance_logdet_per_dim_mean', logdet_per_dim}, ...
+        {'covariance_logdet_mean', logdet_mean}, ...
+        {'covariance_trace_mean', trace_mean}, ...
+        {'covariance_trace_median', trace_median}};
+    values = nan(size(logdet_per_dim));
+    metric_name = 'none';
+    for i = 1:numel(candidates)
+        metric_name_i = candidates{i}{1};
+        values_i = candidates{i}{2};
+        finite_vals = values_i(isfinite(values_i));
+        if numel(finite_vals) >= 2 && range(finite_vals) > eps
+            values = values_i;
+            metric_name = metric_name_i;
+            return;
+        end
+    end
+end
+
+function values_norm = normalize_01_export(values)
+    values_norm = nan(size(values));
+    finite_mask = isfinite(values);
+    if ~any(finite_mask)
+        return;
+    end
+    finite_vals = values(finite_mask);
+    vmin = min(finite_vals);
+    vmax = max(finite_vals);
+    if ~isfinite(vmin) || ~isfinite(vmax) || abs(vmax - vmin) <= eps
+        values_norm(finite_mask) = 0;
+    else
+        values_norm(finite_mask) = (finite_vals - vmin) ./ (vmax - vmin);
+    end
+end
+
+function values_out = invert_metric_for_export(values_in)
+    values_out = nan(size(values_in));
+    finite_mask = isfinite(values_in);
+    if ~any(finite_mask)
+        return;
+    end
+    values_out(finite_mask) = max(values_in(finite_mask)) - values_in(finite_mask);
 end
 
 function K_selected = select_K_by_criterion(Results, criterion)
@@ -726,6 +987,14 @@ function K_selected = select_K_by_criterion(Results, criterion)
             else
                 K_selected = NaN;
             end
+
+        case {'gev', 'gfp', 'global_explained_variance'}
+            if isfield(Results, 'gev_vals') && ~isempty(Results.gev_vals)
+                [~, idx] = max(Results.gev_vals);
+                K_selected = Results.K_candidates(idx);
+            else
+                K_selected = NaN;
+            end
             
         case {'elbow_sil_combined', 'elbow_only'}
             K_selected = Results.K_estimated;
@@ -761,6 +1030,10 @@ function score = criterion_specific_best_score(Results, K_selected, criterion)
         case 'free_energy'
             if isfield(Results, 'free_energy_vals') && numel(Results.free_energy_vals) >= idx
                 score = Results.free_energy_vals(idx);
+            end
+        case {'gev', 'gfp', 'global_explained_variance'}
+            if isfield(Results, 'gev_vals') && numel(Results.gev_vals) >= idx
+                score = Results.gev_vals(idx);
             end
         case {'free_energy_elbow', 'elbow'}
             if isfield(Results, 'free_energy_vals') && ~isempty(Results.free_energy_vals)
@@ -836,7 +1109,7 @@ function [method_names, method_criteria_map, all_criteria, n_pairs] = build_meth
     method_names = cellstr(string(methods_in(:)'));
     requested_criteria = cellstr(string(criteria_in(:)'));
     supported_map = containers.Map('KeyType', 'char', 'ValueType', 'any');
-    supported_map('spm_vb') = {'silhouette', 'free_energy', 'free_energy_elbow', 'elbow_sil_combined', 'covariance_elbow', 'free_energy_covariance'};
+    supported_map('spm_vb') = {'silhouette', 'free_energy', 'free_energy_elbow', 'gev', 'gfp', 'covariance', 'covariance_elbow', 'elbow_sil_combined', 'free_energy_covariance'};
     supported_map('kmeans_koenig') = {'silhouette'};
 
     method_criteria_map = containers.Map('KeyType', 'char', 'ValueType', 'any');

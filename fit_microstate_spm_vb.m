@@ -5,8 +5,8 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
 %   Sim          - Simulation structure
 %   K_candidates - Vector of K values to test
 %   criterion    - 'silhouette', 'free_energy', 'free_energy_elbow',
-%                  'elbow_sil_combined', 'covariance_elbow', or
-%                  'free_energy_covariance'
+%                  'elbow_sil_combined', 'gev'/'gfp', 'covariance',
+%                  'covariance_elbow', or 'free_energy_covariance'
 %
 % OUTPUTS:
 %   Results      - Complete results with recovery metrics
@@ -16,13 +16,6 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     end
     if nargin < 3
         criterion = 'silhouette';
-    end
-    
-    % GEV criterion is only valid for k-means methods, not for VB/GMM
-    if strcmp(criterion, 'gev')
-        error(['GEV criterion is not supported for spm_vb method. Use ', ...
-            '''silhouette'', ''free_energy'', ''elbow'', ''elbow_sil_combined'', ', ...
-            '''covariance_elbow'', or ''free_energy_covariance'' instead.']);
     end
     
     t_start = tic;
@@ -185,12 +178,16 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     switch lower(strtrim(char(string(criterion))))
         case 'silhouette'
             fprintf('  Silhouette (Koenig): selected K=%d (score=%.4f)\n', K_model_selected, best_score);
+        case {'gev', 'gfp', 'global_explained_variance'}
+            fprintf('  GEV/GFP: selected K=%d (score=%.4f)\n', K_model_selected, best_score);
         case 'free_energy'
             fprintf('  Free Energy: selected K=%d (FE=%.1f)\n', K_model_selected, best_score);
         case {'free_energy_elbow', 'elbow'}
             fprintf('  Free-energy elbow: selected K=%d (score=%.4f)\n', K_model_selected, best_score);
         case 'elbow_sil_combined'
             fprintf('  Combined (Elbow+Silhouette): selected K=%d (score=%.4f)\n', K_model_selected, best_score);
+        case {'covariance', 'covariance_raw', 'covariance_min'}
+            fprintf('  Covariance minimum: selected K=%d (score=%.4f)\n', K_model_selected, best_score);
         case 'covariance_elbow'
             fprintf('  Covariance elbow: selected K=%d (score=%.4f)\n', K_model_selected, best_score);
         case {'free_energy_covariance', 'covariance_free_energy', 'free_energy_covariance_hybrid'}

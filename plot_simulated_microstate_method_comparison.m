@@ -23,7 +23,7 @@ function out = plot_simulated_microstate_method_comparison(varargin)
     addParameter(p, 'results_csv', '', @(x) ischar(x) || isstring(x));
     addParameter(p, 'json_dir', '', @(x) ischar(x) || isstring(x));
     addParameter(p, 'template_file', char(repo_cfg.paths.template_file), @(x) ischar(x) || isstring(x));
-    addParameter(p, 'seed', 67, @(x) isnumeric(x) && isscalar(x) && isfinite(x));
+    addParameter(p, 'seed', 42, @(x) isnumeric(x) && isscalar(x) && isfinite(x));
     addParameter(p, 'montage_type', 'full', @(x) ischar(x) || isstring(x));
     addParameter(p, 'spm_method', 'spm_vb', @(x) ischar(x) || isstring(x));
     addParameter(p, 'kmeans_method', 'kmeans_koenig', @(x) ischar(x) || isstring(x));
@@ -120,11 +120,11 @@ function out = plot_simulated_microstate_method_comparison(varargin)
     [spm_maps, spm_labels_raw] = extract_state_maps(spm_data, 'estimated_microstates');
     [km_maps, km_labels_raw] = extract_state_maps(km_data, 'estimated_microstates');
     [true_maps, true_labels_raw] = extract_state_maps(spm_data, 'true_microstates');
-    common_display_labels = intersect_labels_stable(spm_labels_raw, km_labels_raw);
-    common_display_labels = intersect_labels_stable(common_display_labels, true_labels_raw);
-    [display_labels, chanlocs] = resolve_display_chanlocs(common_display_labels, cfg.template_file);
-    if numel(display_labels) < 4
-        error('Only %d display channels could be matched to scalp locations.', numel(display_labels));
+    common_channel_labels = intersect_labels_stable(spm_labels_raw, km_labels_raw);
+    common_channel_labels = intersect_labels_stable(common_channel_labels, true_labels_raw);
+    [display_channel_labels, chanlocs] = resolve_display_chanlocs(common_channel_labels, cfg.template_file, cfg.template_K);
+    if numel(display_channel_labels) < 4
+        error('Only %d display channels could be matched to scalp locations.', numel(display_channel_labels));
     end
 
     true_alignment = align_microstates_to_template(true_maps, cfg.template_file, ...
@@ -141,9 +141,9 @@ function out = plot_simulated_microstate_method_comparison(varargin)
         'strong_threshold', cfg.strong_threshold);
 
     template_labels = pick_template_labels(true_alignment, spm_alignment, km_alignment);
-    row_true = alignment_to_display_row(true_alignment, true_labels_raw, display_labels, template_labels);
-    row_km = alignment_to_display_row(km_alignment, km_labels_raw, display_labels, template_labels);
-    row_spm = alignment_to_display_row(spm_alignment, spm_labels_raw, display_labels, template_labels);
+    row_true = alignment_to_display_row(true_alignment, true_labels_raw, display_channel_labels, template_labels);
+    row_km = alignment_to_display_row(km_alignment, km_labels_raw, display_channel_labels, template_labels);
+    row_spm = alignment_to_display_row(spm_alignment, spm_labels_raw, display_channel_labels, template_labels);
 
     column_labels = used_template_columns(template_labels, row_true, row_km, row_spm);
     if isempty(column_labels)
@@ -218,8 +218,8 @@ function out = plot_simulated_microstate_method_comparison(varargin)
             end
 
             if r == 1
-                title(ax, strrep(column_labels{c}, '_', '\_'), ...
-                    'FontWeight', 'bold', 'FontSize', 12, 'Interpreter', 'tex');
+                title(ax, column_labels{c}, ...
+                    'FontWeight', 'bold', 'FontSize', 14, 'Interpreter', 'none');
             end
             if c == 1
                 text(ax, -0.24, 0.5, row_defs{r}.title, 'Units', 'normalized', ...
@@ -286,26 +286,23 @@ function json_file = resolve_json_path(raw_path, output_dir, json_dir)
     end
 end
 
-function [display_labels, chanlocs] = resolve_display_chanlocs(source_labels, template_file)
-    [~, ~, ~, chanlocs_all] = load_metamaps_templates(template_file, 'K', 7);
-    [json_idx, set_idx] = match_json_channels_to_set(source_labels, chanlocs_all);
-    display_labels = source_labels(json_idx);
-    chanlocs = chanlocs_all(set_idx);
+function [display_labels, chanlocs] = resolve_display_chanlocs(source_labels, template_file, template_K)
+    [~, ~, template_channel_labels, chanlocs_all] = load_metamaps_templates(template_file, 'K', template_K);
+    [template_idx, ~] = match_source_channels_to_template(source_labels, template_channel_labels);
+    display_labels = template_channel_labels(template_idx);
+    chanlocs = chanlocs_all(template_idx);
 end
 
-function [json_idx, set_idx] = match_json_channels_to_set(json_labels, chanlocs)
-    set_labels = cell(numel(chanlocs), 1);
-    for i = 1:numel(chanlocs)
-        set_labels{i} = lower(strtrim(char(chanlocs(i).labels)));
-    end
-    json_idx = [];
-    set_idx = [];
-    for j = 1:numel(json_labels)
-        label = lower(strtrim(char(json_labels{j})));
-        hit = find(strcmp(label, set_labels), 1, 'first');
+function [template_idx, source_idx] = match_source_channels_to_template(source_labels, template_labels)
+    source_labels_l = cellfun(@(s) lower(strtrim(char(s))), cellstr(source_labels(:)), 'UniformOutput', false);
+    template_labels_l = cellfun(@(s) lower(strtrim(char(s))), cellstr(template_labels(:)), 'UniformOutput', false);
+    template_idx = [];
+    source_idx = [];
+    for t = 1:numel(template_labels_l)
+        hit = find(strcmp(template_labels_l{t}, source_labels_l), 1, 'first');
         if ~isempty(hit)
-            json_idx(end+1) = j; %#ok<AGROW>
-            set_idx(end+1) = hit; %#ok<AGROW>
+            template_idx(end+1) = t; %#ok<AGROW>
+            source_idx(end+1) = hit; %#ok<AGROW>
         end
     end
 end

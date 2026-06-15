@@ -22,9 +22,11 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     
     rng(seed, 'twister');
     
-    % Load channel positions from template file
+    % Load the canonical template maps and channel geometry from the same
+    % shared loader used by the template sense-check plotting code.
     fprintf('Loading channel positions from template...\n');
-    [pos, chanlocs, channel_labels] = load_chanlocs_from_template();
+    [maps_true_normalized, template_labels, pos, chanlocs, channel_labels] = ...
+        load_true_templates_from_template(K_true);
     
     if isempty(pos)
         error('Failed to load channel positions from template file');
@@ -33,15 +35,13 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     C = size(pos, 1);
     fprintf('✓ Loaded %d channels from template\n', C);
     fprintf('✓ Channel labels: %s\n', sprintf('%s ', channel_labels{:}));
+    fprintf('✓ Loaded %d canonical template maps: %s\n', K_true, strjoin(template_labels, ', '));
     
-    % Generate true microstate templates with REALISTIC AMPLITUDE
-    % Real microstate maps: 20-50 µV peak amplitude (let's use 30 µV as default)
+    % Scale the template maps into a realistic microvolt range.
     microstate_amplitude_uv = 30;  % microvolts
-    
+    maps_true = maps_true_normalized * microstate_amplitude_uv;  % Scale to µV
     len_scale = 0.25;
     W = rbf_kernel(pos, len_scale);
-    maps_true_normalized = generate_microstate_templates(K_true, pos, W);
-    maps_true = maps_true_normalized * microstate_amplitude_uv;  % Scale to µV
     
     % Temporal parameters
     T = round(duration_s * sfreq);
@@ -148,6 +148,7 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         'pos', pos, ...
         'chanlocs', chanlocs, ...  % Channel location structure
         'channel_labels', {channel_labels}, ...  % ✅ NEW: Channel labels as cell array
+        'true_template_labels', {template_labels}, ...
         'K_true', K_true, ...
         'SNR_dB', snr_db, ...
         'duration_s', duration_s, ...
@@ -247,18 +248,23 @@ end
 
 % ======================== CHANNEL MONTAGE ========================
 
-function [pos, chanlocs, channel_labels] = load_chanlocs_from_template()
-% LOAD_CHANLOCS_FROM_TEMPLATE: Load channel positions from template SET file
-%
-% Uses the same template file as artifact injection to ensure consistency
+function [template_maps, template_labels, pos, chanlocs, channel_labels] = load_true_templates_from_template(K_true)
+% LOAD_TRUE_TEMPLATES_FROM_TEMPLATE: Load canonical template maps and geometry
+% through the shared MetaMaps loader.
 
+    template_maps = [];
+    template_labels = {};
     pos = [];
     chanlocs = [];
-    channel_labels = {};  % ✅ NEW: Initialize labels
+    channel_labels = {};
     
     try
-        % Find template file
-        template_file = find_template_file();
+        util = microstate_utilities();
+        cfg = util.load_config();
+        template_file = char(cfg.paths.template_file);
+        if ~isfile(template_file)
+            template_file = find_template_file();
+        end
         
         if isempty(template_file)
             fprintf('Error: Template SET file not found\n');
@@ -267,47 +273,48 @@ function [pos, chanlocs, channel_labels] = load_chanlocs_from_template()
         
         fprintf('Loading channel positions from: %s\n', template_file);
         
-        % Load template with EEGLAB
         if ~exist('pop_loadset', 'file')
             fprintf('Error: EEGLAB not found\n');
             return;
         end
-        
-        EEG_template = pop_loadset('filename', template_file);
-        
-        if isempty(EEG_template.chanlocs)
-            fprintf('Error: Template has no channel locations\n');
-            return;
-        end
-        
-        util = microstate_utilities();
-        [chanlocs, keep_idx, pos] = util.prepare_metamaps_chanlocs(EEG_template.chanlocs);
-        n_channels = length(chanlocs);
+
+        [template_maps, template_labels, channel_labels, chanlocs] = ...
+            load_metamaps_templates(template_file, 'K', K_true);
+        n_channels = size(template_maps, 2);
         if n_channels == 0
-            fprintf('Error: Template has no usable channel locations\n');
+            fprintf('Error: Template has no usable loaded channels\n');
             return;
         end
-        
-        % ✅ NEW: Extract channel labels from chanlocs
-        channel_labels = cell(n_channels, 1);
-        for i = 1:n_channels
-            if isfield(chanlocs(i), 'labels') && ~isempty(chanlocs(i).labels)
-                channel_labels{i} = chanlocs(i).labels;
-            else
-                channel_labels{i} = sprintf('Ch%03d', i);  % Fallback
-            end
+        if numel(chanlocs) ~= n_channels
+            fprintf('Error: Template map/channel geometry mismatch (%d maps vs %d chanlocs)\n', ...
+                n_channels, numel(chanlocs));
+            template_maps = [];
+            template_labels = {};
+            pos = [];
+            chanlocs = [];
+            channel_labels = {};
+            return;
         end
-        
-        fprintf('✓ Extracted %d channel labels\n', length(channel_labels));
-        
+
+        pos = util.positions_from_chanlocs(chanlocs, n_channels);
         valid_coords = sum(all(isfinite(pos), 2));
-        if numel(keep_idx) < numel(EEG_template.chanlocs)
-            fprintf('✓ Retained %d/%d usable template channels\n', numel(keep_idx), numel(EEG_template.chanlocs));
+        if valid_coords ~= n_channels
+            fprintf('Error: Template loader returned %d/%d valid coordinates\n', valid_coords, n_channels);
+            template_maps = [];
+            template_labels = {};
+            pos = [];
+            chanlocs = [];
+            channel_labels = {};
+            return;
         end
+
+        fprintf('✓ Extracted %d channel labels\n', length(channel_labels));
         fprintf('✓ Loaded %d channels with valid 3D coordinates\n', valid_coords);
         
     catch ME
         fprintf('Error loading template: %s\n', ME.message);
+        template_maps = [];
+        template_labels = {};
         pos = [];
         chanlocs = [];
         channel_labels = {};

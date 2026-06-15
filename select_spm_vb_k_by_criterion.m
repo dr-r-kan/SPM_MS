@@ -2,6 +2,8 @@ function [K_selected, best_score, score_by_k, details] = select_spm_vb_k_by_crit
 %SELECT_SPM_VB_K_BY_CRITERION Recompute SPM-VB model selection from Results.
 %
 % Supports both the legacy criteria and the covariance-aware additions:
+%   - gev / gfp
+%   - covariance
 %   - covariance_elbow
 %   - free_energy_covariance
 
@@ -29,9 +31,15 @@ function [K_selected, best_score, score_by_k, details] = select_spm_vb_k_by_crit
     K_valid = K_all(valid_mask);
     fe_valid = metrics.free_energy(valid_mask);
     sil_valid = metrics.silhouette(valid_mask);
+    gev_valid = metrics.gev(valid_mask);
     cov_valid = select_primary_covariance_metric_local(metrics, valid_mask);
 
     switch criterion
+        case {'gev', 'gfp', 'global_explained_variance'}
+            [best_score, best_local] = max(gev_valid);
+            K_selected = K_valid(best_local);
+            score_by_k(valid_mask) = gev_valid;
+
         case 'silhouette'
             local_scores = sil_valid;
             if numel(local_scores) > 4
@@ -57,6 +65,15 @@ function [K_selected, best_score, score_by_k, details] = select_spm_vb_k_by_crit
 
         case {'elbow_sil_combined', 'elbow_only'}
             local_scores = elbow_silhouette_score_local(fe_valid, K_valid, sil_valid);
+            [best_score, best_local] = max(local_scores);
+            K_selected = K_valid(best_local);
+            score_by_k(valid_mask) = local_scores;
+
+        case {'covariance', 'covariance_raw', 'covariance_min'}
+            if ~any(isfinite(cov_valid))
+                return;
+            end
+            local_scores = max(cov_valid) - cov_valid;
             [best_score, best_local] = max(local_scores);
             K_selected = K_valid(best_local);
             score_by_k(valid_mask) = local_scores;
@@ -113,6 +130,7 @@ function metrics = extract_selection_metrics_local(Results)
         metrics.free_energy = coerce_numeric_vector_local(field_or_local(Results, 'free_energy', []));
     end
     metrics.silhouette = coerce_numeric_vector_local(field_or_local(Results, 'silhouette_vals', []));
+    metrics.gev = coerce_numeric_vector_local(field_or_local(Results, 'gev_vals', []));
     metrics.covariance_trace_mean = coerce_numeric_vector_local(field_or_local(Results, 'covariance_trace_mean_vals', []));
     metrics.covariance_trace_median = coerce_numeric_vector_local(field_or_local(Results, 'covariance_trace_median_vals', []));
     metrics.covariance_logdet_mean = coerce_numeric_vector_local(field_or_local(Results, 'covariance_logdet_mean_vals', []));
@@ -132,6 +150,7 @@ function metrics = extract_selection_metrics_local(Results)
     nK = numel(metrics.K_candidates);
     metrics.free_energy = resize_vector_local(metrics.free_energy, nK, -Inf);
     metrics.silhouette = resize_vector_local(metrics.silhouette, nK, NaN);
+    metrics.gev = resize_vector_local(metrics.gev, nK, NaN);
     metrics.covariance_trace_mean = resize_vector_local(metrics.covariance_trace_mean, nK, NaN);
     metrics.covariance_trace_median = resize_vector_local(metrics.covariance_trace_median, nK, NaN);
     metrics.covariance_logdet_mean = resize_vector_local(metrics.covariance_logdet_mean, nK, NaN);

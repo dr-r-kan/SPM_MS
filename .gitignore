@@ -29,6 +29,8 @@ meta_microstate_output/
 *.asv
 *.m~
 *.mlx.autosave
+*.pyc
+__pycache__/
 .DS_Store
 .vscode/
 /.idea/
@@ -41,3 +43,6 @@ venv/
 # Legacy scratch folders
 NotNeeded/
 old/
+
+# Local smoke-test / ad hoc manifests
+mini_conditioned_lemon_sets.csv
