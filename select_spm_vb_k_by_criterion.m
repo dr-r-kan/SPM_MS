@@ -3,6 +3,7 @@ function [K_selected, best_score, score_by_k, details] = select_spm_vb_k_by_crit
 %
 % Supports both the legacy criteria and the covariance-aware additions:
 %   - gev / gfp
+%   - calinski_harabasz_score
 %   - covariance
 %   - covariance_elbow
 %   - free_energy_covariance
@@ -32,6 +33,7 @@ function [K_selected, best_score, score_by_k, details] = select_spm_vb_k_by_crit
     fe_valid = metrics.free_energy(valid_mask);
     sil_valid = metrics.silhouette(valid_mask);
     gev_valid = metrics.gev(valid_mask);
+    ch_valid = metrics.calinski_harabasz(valid_mask);
     cov_valid = select_primary_covariance_metric_local(metrics, valid_mask);
 
     switch criterion
@@ -39,6 +41,16 @@ function [K_selected, best_score, score_by_k, details] = select_spm_vb_k_by_crit
             [best_score, best_local] = max(gev_valid);
             K_selected = K_valid(best_local);
             score_by_k(valid_mask) = gev_valid;
+
+        case {'calinski_harabasz', 'calinski_harabasz_score', 'ch'}
+            if ~any(isfinite(ch_valid))
+                return;
+            end
+            local_scores = ch_valid;
+            local_scores(~isfinite(local_scores)) = -Inf;
+            [best_score, best_local] = max(local_scores);
+            K_selected = K_valid(best_local);
+            score_by_k(valid_mask) = ch_valid;
 
         case 'silhouette'
             local_scores = sil_valid;
@@ -131,6 +143,7 @@ function metrics = extract_selection_metrics_local(Results)
     end
     metrics.silhouette = coerce_numeric_vector_local(field_or_local(Results, 'silhouette_vals', []));
     metrics.gev = coerce_numeric_vector_local(field_or_local(Results, 'gev_vals', []));
+    metrics.calinski_harabasz = coerce_numeric_vector_local(field_or_local(Results, 'calinski_harabasz_vals', []));
     metrics.covariance_trace_mean = coerce_numeric_vector_local(field_or_local(Results, 'covariance_trace_mean_vals', []));
     metrics.covariance_trace_median = coerce_numeric_vector_local(field_or_local(Results, 'covariance_trace_median_vals', []));
     metrics.covariance_logdet_mean = coerce_numeric_vector_local(field_or_local(Results, 'covariance_logdet_mean_vals', []));
@@ -151,6 +164,7 @@ function metrics = extract_selection_metrics_local(Results)
     metrics.free_energy = resize_vector_local(metrics.free_energy, nK, -Inf);
     metrics.silhouette = resize_vector_local(metrics.silhouette, nK, NaN);
     metrics.gev = resize_vector_local(metrics.gev, nK, NaN);
+    metrics.calinski_harabasz = resize_vector_local(metrics.calinski_harabasz, nK, NaN);
     metrics.covariance_trace_mean = resize_vector_local(metrics.covariance_trace_mean, nK, NaN);
     metrics.covariance_trace_median = resize_vector_local(metrics.covariance_trace_median, nK, NaN);
     metrics.covariance_logdet_mean = resize_vector_local(metrics.covariance_logdet_mean, nK, NaN);

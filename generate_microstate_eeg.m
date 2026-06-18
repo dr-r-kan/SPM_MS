@@ -17,8 +17,16 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     overlap_defaults = struct( ...
         'prob', 0, ...                % Probability a boundary is overlapped
         'ms_range', [10 40], ...      % Min/max overlap duration in ms
-        'strength', 0.5);             % Weight of the secondary state during overlap
+        'strength', 0.5, ...          % Weight of the secondary state during overlap
+        'clean_sanity_profile', false, ...
+        'map_jitter_fraction', 0.15, ...
+        'inject_artifacts', true, ...
+        'microstate_amplitude_uv', 30, ...
+        'background_noise_rms_uv', 10, ...
+        'mean_dur_ms', 80, ...
+        'gfp_envelope_eta', 0.2);
     overlap_opts = fill_overlap_defaults(overlap_opts, overlap_defaults);
+    overlap_opts = apply_clean_sanity_profile_defaults(overlap_opts);
     
     rng(seed, 'twister');
     
@@ -38,14 +46,14 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     fprintf('✓ Loaded %d canonical template maps: %s\n', K_true, strjoin(template_labels, ', '));
     
     % Scale the template maps into a realistic microvolt range.
-    microstate_amplitude_uv = 30;  % microvolts
+    microstate_amplitude_uv = double(overlap_opts.microstate_amplitude_uv);
     maps_true = maps_true_normalized * microstate_amplitude_uv;  % Scale to µV
     len_scale = 0.25;
     W = rbf_kernel(pos, len_scale);
     
     % Temporal parameters
     T = round(duration_s * sfreq);
-    mean_dur_ms = 80;
+    mean_dur_ms = double(overlap_opts.mean_dur_ms);
     mean_dur_samples = max(1, round((mean_dur_ms/1000)*sfreq));
     
     % Generate clean EEG (store segments for optional overlap)
@@ -62,12 +70,16 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         dwell = min(T - t + 1, geornd(p_switch) + 1);
         
         % Add spatial jitter to maps (~15% of amplitude)
-        map_jitter_sd = 0.15 * microstate_amplitude_uv;
+        map_jitter_sd = max(0, double(overlap_opts.map_jitter_fraction)) * microstate_amplitude_uv;
         jitter = map_jitter_sd * (W * randn(C, 1));
         template = maps_true(cur_state, :)' + jitter;
         
-        % GFP envelope: realistic range 0.3-0.8 (modulates 30-80% of peak)
-        gfp_env = ar1_positive_realistic(dwell, 0.98, 0.2);  % 0.3-0.8 range
+        if overlap_opts.clean_sanity_profile
+            gfp_env = clean_profile_state_trace(dwell, sfreq);
+        else
+            % GFP envelope: realistic range 0.3-0.8 (modulates 30-80% of peak)
+            gfp_env = ar1_positive_realistic(dwell, 0.98, double(overlap_opts.gfp_envelope_eta));  % 0.3-0.8 range
+        end
         
         seg_idx = t:(t + dwell - 1);
         segments(end+1) = struct(...
@@ -105,7 +117,7 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     
     % Generate PINK noise with REALISTIC AMPLITUDE
     % Background EEG: 5-20 µV RMS (let's use 10 µV as baseline)
-    background_noise_rms_uv = 10;
+    background_noise_rms_uv = double(overlap_opts.background_noise_rms_uv);
     
     fprintf('Generating pink noise (%.1f µV RMS)...\n', background_noise_rms_uv);
     N = zeros(C, T);
@@ -130,11 +142,15 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     X_noisy = X_clean + scale * N;
     
     % Inject real artifacts from template file
-    fprintf('Injecting real artifacts...\n');
-    try
-        X_noisy = inject_real_artifacts(X_noisy, sfreq);
-    catch ME
-        fprintf('⚠ Warning: Could not load artifacts (%s). Continuing without real artifacts.\n', ME.message);
+    if overlap_opts.inject_artifacts
+        fprintf('Injecting real artifacts...\n');
+        try
+            X_noisy = inject_real_artifacts(X_noisy, sfreq);
+        catch ME
+            fprintf('⚠ Warning: Could not load artifacts (%s). Continuing without real artifacts.\n', ME.message);
+        end
+    else
+        fprintf('Skipping real artifact injection for clean sanity profile.\n');
     end
     
     % Return structure with amplitude info
@@ -154,6 +170,9 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         'duration_s', duration_s, ...
         'microstate_amplitude_uv', microstate_amplitude_uv, ...
         'background_noise_rms_uv', background_noise_rms_uv, ...
+        'map_jitter_fraction', overlap_opts.map_jitter_fraction, ...
+        'inject_artifacts', logical(overlap_opts.inject_artifacts), ...
+        'clean_sanity_profile', logical(overlap_opts.clean_sanity_profile), ...
         'overlap_prob', overlap_opts.prob, ...
         'overlap_ms_range', overlap_opts.ms_range, ...
         'overlap_strength', overlap_opts.strength, ...
@@ -244,6 +263,45 @@ function [X_out, weights_out, events] = apply_microstate_overlap(X_base, weights
 
     weights_out = max(weights_out, 0);
     weights_out = weights_out ./ max(sum(weights_out, 1), eps);
+end
+
+function opts = apply_clean_sanity_profile_defaults(opts)
+    if ~isfield(opts, 'clean_sanity_profile') || ~opts.clean_sanity_profile
+        return;
+    end
+
+    opts.map_jitter_fraction = 0;
+    opts.inject_artifacts = false;
+    opts.gfp_envelope_eta = min(double(opts.gfp_envelope_eta), 0.05);
+    opts.mean_dur_ms = max(double(opts.mean_dur_ms), 150);
+end
+
+function x = clean_profile_state_trace(T, sfreq)
+    pad = max(16, round(0.25 * T));
+    raw = randn(1, T + 2 * pad);
+    x = fft_bandpass_local(raw, sfreq, [8 20]);
+    x = x((pad + 1):(pad + T));
+    t = (0:(T - 1)) / sfreq;
+    f0 = 12 + 4 * rand();
+    x = x + 0.75 * sin(2 * pi * f0 * t + 2 * pi * rand());
+    x = x - mean(x);
+    s = std(x);
+    if s < eps
+        x = sin(2 * pi * 10 * (0:(T - 1)) / sfreq);
+        s = std(x);
+    end
+    x = 0.6 * (x / max(s, eps));
+end
+
+function Xf = fft_bandpass_local(X, sfreq, bp)
+    X = double(X);
+    F = fft(X, [], 2);
+    n = size(X, 2);
+    freqs = (0:(n - 1)) * (sfreq / n);
+    mask = (freqs >= bp(1) & freqs <= bp(2)) | ...
+        (freqs >= sfreq - bp(2) & freqs <= sfreq - bp(1));
+    F(:, ~mask) = 0;
+    Xf = real(ifft(F, [], 2));
 end
 
 % ======================== CHANNEL MONTAGE ========================

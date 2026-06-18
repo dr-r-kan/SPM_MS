@@ -10,11 +10,11 @@
 function analyze_comparison_results(varargin)
     % ---------- Parse inputs ----------
     default_results_dir = 'outputs/simulations/results/';
-    default_n_boot = 2000;
-    default_n_boot_lmm = 2000;
-    default_n_folds = 20;
+    default_n_boot = 200;
+    default_n_boot_lmm = 200;
+    default_n_folds = 2;
 
-    % ---------- Set up publication-style plot ----------
+    % ---------- Set up plot ----------
     set(0, 'DefaultFigureColor', 'white');
     set(0, 'DefaultTextColor', 'black');
     set(0, 'DefaultAxesColor', 'white');
@@ -285,6 +285,7 @@ function analyze_comparison_results(varargin)
     create_method_criterion_boxplots(T, plots_dir);
     create_vb_covariance_relationship_plots(T, vb_covariance_outcomes, vb_covariance_labels, vb_covariance_results, plots_dir);
     create_vb_covariance_kcorrect_barplots(vb_covariance_results, plots_dir);
+    create_vb_covariance_quintile_topoplots(T, vb_covariance_results, results_dir, plots_dir);
 
     % ---------- Montage-Criterion Comparison (if montage data available) ----------
     montages = unique(T.montage_type);
@@ -1247,6 +1248,161 @@ function create_vb_covariance_kcorrect_barplots(vb_covariance_results, plots_dir
     close(fig);
 end
 
+function create_vb_covariance_quintile_topoplots(T, vb_covariance_results, results_dir, plots_dir)
+    if isempty(fieldnames(vb_covariance_results)) || ~isfield(vb_covariance_results, 'covariates') || ...
+            isempty(vb_covariance_results.covariates)
+        return;
+    end
+    if ~ismember('json_file', T.Properties.VariableNames) || exist('topoplot', 'file') ~= 2
+        return;
+    end
+
+    util = microstate_utilities();
+    cfg = util.load_config();
+    template_file = char(cfg.paths.template_file);
+    if isempty(template_file) || ~isfile(template_file)
+        fprintf('Skipping VB covariance quintile topoplots: template file not found.\n');
+        return;
+    end
+
+    cov_spec = vb_covariance_results.covariates(1);
+    vb_mask = is_vb_method(T.method);
+    T_vb = T(vb_mask, :);
+    if height(T_vb) == 0 || ~ismember(cov_spec.name, T_vb.Properties.VariableNames)
+        return;
+    end
+
+    covariance_vals = coerce_numeric_column(T_vb.(cov_spec.name));
+    json_paths = cellstr(string(T_vb.json_file));
+    output_dir = fileparts(char(results_dir));
+    json_dir = fullfile(output_dir, 'microstates_json');
+    valid_json_mask = false(size(json_paths));
+    resolved_json_paths = cell(size(json_paths));
+    for i = 1:numel(json_paths)
+        resolved_json_paths{i} = resolve_json_path_local(json_paths{i}, output_dir, json_dir);
+        valid_json_mask(i) = ~isempty(resolved_json_paths{i}) && isfile(resolved_json_paths{i});
+    end
+
+    valid_mask = ~isnan(covariance_vals) & valid_json_mask;
+    T_vb = T_vb(valid_mask, :);
+    covariance_vals = covariance_vals(valid_mask);
+    resolved_json_paths = resolved_json_paths(valid_mask);
+    if numel(covariance_vals) < 5
+        fprintf('Skipping VB covariance quintile topoplots: fewer than five valid SPM-VB rows with covariance and JSON output.\n');
+        return;
+    end
+
+    [~, template_labels, template_channel_labels, template_chanlocs] = load_metamaps_templates(template_file, 'K', 7);
+    if numel(template_chanlocs) < 4 || isempty(template_channel_labels)
+        fprintf('Skipping VB covariance quintile topoplots: template scalp geometry is unavailable.\n');
+        return;
+    end
+
+    quintile_idx = rank_based_quintile_groups(covariance_vals, 5);
+    n_quintiles = max(quintile_idx);
+    n_labels = numel(template_labels);
+    avg_maps_by_quintile = cell(n_quintiles, 1);
+    label_counts = zeros(n_quintiles, n_labels);
+    row_counts = zeros(n_quintiles, 1);
+    quintile_ranges = nan(n_quintiles, 2);
+
+    for q = 1:n_quintiles
+        mask_q = quintile_idx == q;
+        quintile_ranges(q, :) = [min(covariance_vals(mask_q)), max(covariance_vals(mask_q))];
+        sum_maps = zeros(n_labels, numel(template_channel_labels));
+        count_maps = zeros(n_labels, numel(template_channel_labels));
+
+        row_indices = find(mask_q);
+        for i = 1:numel(row_indices)
+            row_idx = row_indices(i);
+            json_file = resolved_json_paths{row_idx};
+            try
+                data = jsondecode(fileread(json_file));
+                [maps, channel_labels] = extract_json_state_maps_local(data, 'estimated_microstates');
+                alignment = align_microstates_to_template(maps, template_file, ...
+                    'estimated_channel_labels', channel_labels, 'template_K', 7);
+                projected_maps = project_maps_to_template_channels_local( ...
+                    alignment.aligned_maps, channel_labels, template_channel_labels);
+                added_row = false;
+                for s = 1:numel(alignment.labels)
+                    label_idx = find(strcmp(alignment.labels{s}, template_labels), 1, 'first');
+                    if isempty(label_idx)
+                        continue;
+                    end
+                    vals = projected_maps(s, :);
+                    finite_mask = isfinite(vals);
+                    if ~any(finite_mask)
+                        continue;
+                    end
+                    sum_maps(label_idx, finite_mask) = sum_maps(label_idx, finite_mask) + vals(finite_mask);
+                    count_maps(label_idx, finite_mask) = count_maps(label_idx, finite_mask) + 1;
+                    label_counts(q, label_idx) = label_counts(q, label_idx) + 1;
+                    added_row = true;
+                end
+                if added_row
+                    row_counts(q) = row_counts(q) + 1;
+                end
+            catch ME
+                fprintf('Skipping VB covariance quintile topoplot contribution from %s: %s\n', json_file, ME.message);
+            end
+        end
+
+        avg_maps = nan(size(sum_maps));
+        finite_mask = count_maps > 0;
+        avg_maps(finite_mask) = sum_maps(finite_mask) ./ count_maps(finite_mask);
+        avg_maps_by_quintile{q} = normalize_map_rows_omitnan_local(avg_maps);
+    end
+
+    finite_blocks = cellfun(@(x) x(isfinite(x)), avg_maps_by_quintile, 'UniformOutput', false);
+    finite_blocks = finite_blocks(~cellfun(@isempty, finite_blocks));
+    if isempty(finite_blocks)
+        fprintf('Skipping VB covariance quintile topoplots: no usable aligned maps were found.\n');
+        return;
+    end
+
+    clim = max(abs(cat(1, finite_blocks{:})));
+    if ~isfinite(clim) || clim <= eps
+        clim = 1;
+    end
+
+    fig = figure('Visible', 'off', 'Position', [80 80 1850 1550], 'Color', 'white');
+    tl = tiledlayout(fig, n_quintiles, n_labels, 'TileSpacing', 'compact', 'Padding', 'compact');
+    colormap(fig, 'jet');
+
+    for q = 1:n_quintiles
+        maps_this = avg_maps_by_quintile{q};
+        for k = 1:n_labels
+            ax = nexttile(tl, (q - 1) * n_labels + k);
+            vals = maps_this(k, :);
+            if all(~isfinite(vals))
+                axis(ax, 'off');
+                text(ax, 0.5, 0.55, 'No data', 'Units', 'normalized', ...
+                    'HorizontalAlignment', 'center', 'FontWeight', 'bold', 'Color', [0.45 0.45 0.45]);
+            else
+                topoplot(vals, template_chanlocs, 'electrodes', 'off', 'numcontour', 6, 'maplimits', [-clim clim]);
+                axis(ax, 'off');
+            end
+            if q == 1
+                title(ax, template_labels{k}, 'FontWeight', 'bold', 'FontSize', 14, 'Interpreter', 'none');
+            end
+            text(ax, 0.5, -0.08, sprintf('n=%d', label_counts(q, k)), ...
+                'Units', 'normalized', 'HorizontalAlignment', 'center', ...
+                'FontSize', 9, 'Color', [0.25 0.25 0.25], 'FontWeight', 'bold');
+            if k == 1
+                text(ax, -0.30, 0.5, sprintf(['Q%d\n%s\n[%.3g, %.3g]\n(%d rows)'], ...
+                    q, covariance_quintile_label(q, n_quintiles), quintile_ranges(q, 1), quintile_ranges(q, 2), row_counts(q)), ...
+                    'Units', 'normalized', 'Rotation', 90, 'HorizontalAlignment', 'center', ...
+                    'FontWeight', 'bold', 'FontSize', 11, 'Interpreter', 'none');
+            end
+        end
+    end
+
+    sgtitle(tl, sprintf('SPM-VB microstate topographies by covariance quintile: %s', cov_spec.label), ...
+        'FontSize', 15, 'FontWeight', 'bold');
+    saveas(fig, fullfile(plots_dir, sprintf('vb_covariance_quintile_topoplots_%s.png', cov_spec.name)));
+    close(fig);
+end
+
 function create_backfit_confusion_comparison_plots(T, results_dir, plots_dir)
     if ~istable(T) || height(T) == 0 || ~ismember('backfit_diagnostic_file', T.Properties.VariableNames)
         return;
@@ -1912,6 +2068,8 @@ function s_out = canonicalize_criterion(s_in)
         s = 'silhouette';
     elseif any(strcmp(s, {'covariance raw', 'covariance min'}))
         s = 'covariance';
+    elseif any(strcmp(s, {'calinski harabasz', 'ch'}))
+        s = 'calinski harabasz score';
     end
     s = regexprep(s, '(\b\w+\b)(\s+\1)+', '$1');
     s_out = s;
@@ -1945,6 +2103,141 @@ function label = display_method_label(m_in)
             label = 'Standard k-means';
         otherwise
             label = canonicalize_method(m_in);
+    end
+end
+
+function quintile_idx = rank_based_quintile_groups(values, n_groups)
+    quintile_idx = nan(size(values));
+    if isempty(values)
+        return;
+    end
+    [~, sort_idx] = sort(values(:), 'ascend');
+    n = numel(sort_idx);
+    rank_groups = ceil((1:n) * n_groups / n);
+    rank_groups(rank_groups < 1) = 1;
+    rank_groups(rank_groups > n_groups) = n_groups;
+    quintile_idx(sort_idx) = rank_groups;
+    quintile_idx = reshape(quintile_idx, size(values));
+end
+
+function label = covariance_quintile_label(idx, n_groups)
+    if idx == 1
+        label = 'lowest covariance';
+    elseif idx == n_groups
+        label = 'highest covariance';
+    else
+        label = 'mid covariance';
+    end
+end
+
+function json_file = resolve_json_path_local(raw_path, output_dir, json_dir)
+    raw_path = char(string(raw_path));
+    if isempty(strtrim(raw_path))
+        json_file = '';
+        return;
+    end
+    if isfile(raw_path)
+        json_file = raw_path;
+        return;
+    end
+    candidate = fullfile(output_dir, raw_path);
+    if isfile(candidate)
+        json_file = candidate;
+        return;
+    end
+    candidate = fullfile(json_dir, raw_path);
+    if isfile(candidate)
+        json_file = candidate;
+        return;
+    end
+    [~, base, ext] = fileparts(raw_path);
+    candidate = fullfile(json_dir, [base ext]);
+    if isfile(candidate)
+        json_file = candidate;
+    else
+        json_file = raw_path;
+    end
+end
+
+function [maps, channel_labels] = extract_json_state_maps_local(data, field_name)
+    if ~isfield(data, field_name) || isempty(data.(field_name))
+        error('JSON payload is missing %s.', field_name);
+    end
+    state_struct = data.(field_name);
+    state_names = fieldnames(state_struct);
+    state_order = zeros(numel(state_names), 1);
+    for i = 1:numel(state_names)
+        tok = regexp(state_names{i}, '^state_(\d+)$', 'tokens', 'once');
+        if isempty(tok)
+            state_order(i) = i;
+        else
+            state_order(i) = str2double(tok{1});
+        end
+    end
+    [~, sort_idx] = sort(state_order);
+    state_names = state_names(sort_idx);
+
+    channel_labels = cellstr(string(data.channel_info.labels));
+    if isfield(data.channel_info, 'labels_sanitized')
+        channel_keys = cellstr(string(data.channel_info.labels_sanitized));
+    else
+        channel_keys = sanitize_channel_labels_plot_local(channel_labels);
+    end
+
+    n_states = numel(state_names);
+    n_channels = numel(channel_labels);
+    maps = nan(n_states, n_channels);
+    for s = 1:n_states
+        state_data = state_struct.(state_names{s});
+        for c = 1:n_channels
+            if isfield(state_data, channel_keys{c})
+                maps(s, c) = double(state_data.(channel_keys{c}));
+            end
+        end
+    end
+end
+
+function projected_maps = project_maps_to_template_channels_local(maps, source_channel_labels, template_channel_labels)
+    projected_maps = nan(size(maps, 1), numel(template_channel_labels));
+    source_labels_l = cellfun(@(s) lower(strtrim(char(s))), cellstr(source_channel_labels(:)), 'UniformOutput', false);
+    template_labels_l = cellfun(@(s) lower(strtrim(char(s))), cellstr(template_channel_labels(:)), 'UniformOutput', false);
+    [lia, locb] = ismember(template_labels_l, source_labels_l);
+    for c = 1:numel(template_channel_labels)
+        if lia(c)
+            projected_maps(:, c) = maps(:, locb(c));
+        end
+    end
+end
+
+function maps_out = normalize_map_rows_omitnan_local(maps_in)
+    maps_out = maps_in;
+    for r = 1:size(maps_in, 1)
+        row = maps_in(r, :);
+        finite_mask = isfinite(row);
+        if nnz(finite_mask) < 2
+            continue;
+        end
+        vals = row(finite_mask);
+        vals = vals - mean(vals);
+        denom = norm(vals);
+        if denom > eps
+            maps_out(r, finite_mask) = vals ./ denom;
+        else
+            maps_out(r, finite_mask) = vals;
+        end
+    end
+end
+
+function sanitized = sanitize_channel_labels_plot_local(ch_labels)
+    sanitized = cell(size(ch_labels));
+    for i = 1:length(ch_labels)
+        label = char(ch_labels{i});
+        label = regexprep(label, '[-/\\\s\.\,\(\)\[\]\{\}]', '_');
+        label = regexprep(label, '^_+|_+$', '');
+        if isempty(label) || isempty(regexp(label(1), '[A-Za-z]', 'once'))
+            label = ['Ch' label];
+        end
+        sanitized{i} = matlab.lang.makeValidName(label);
     end
 end
 

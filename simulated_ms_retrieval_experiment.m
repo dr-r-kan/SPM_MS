@@ -5,7 +5,8 @@ function T = simulated_ms_retrieval_experiment(varargin)
 % current retrieval comparison:
 %   - kmeans_koenig: silhouette
 %   - spm_vb: silhouette, free_energy, free_energy_elbow, elbow_sil_combined,
-%             gev/gfp, covariance, covariance_elbow, free_energy_covariance
+%             gev/gfp, calinski_harabasz_score, covariance,
+%             covariance_elbow, free_energy_covariance
 %
 % Requirements:
 % spm on path (development version at spm/spm on github)
@@ -66,10 +67,12 @@ function T = simulated_ms_retrieval_experiment(varargin)
     addParameter(p, 'compute_backfit_diagnostics', logical(util.get_field(sim_defaults, 'compute_backfit_diagnostics', true)), @islogical);
     addParameter(p, 'save_backfit_details', logical(util.get_field(sim_defaults, 'save_backfit_details', true)), @islogical);
     addParameter(p, 'template_alignment_strong_threshold', double(util.get_field(sim_defaults, 'template_alignment_strong_threshold', 0.5)), @isnumeric);
+    addParameter(p, 'clean_sanity_profile', logical(util.get_field(sim_defaults, 'clean_sanity_profile', true)), @islogical);
+    addParameter(p, 'clean_sanity_snr_db_threshold', double(util.get_field(sim_defaults, 'clean_sanity_snr_db_threshold', 40)), @isnumeric);
     addParameter(p, 'validate_simulation', logical(sim_defaults.validate_simulation), @islogical);
     addParameter(p, 'preprocessing', sim_defaults.preprocessing, @isstruct);
     addParameter(p, 'methods', {'spm_vb', 'kmeans_koenig'}, @(x) iscell(x) || isstring(x));
-    addParameter(p, 'criteria', {'silhouette', 'free_energy', 'free_energy_elbow', 'gev', 'covariance', 'covariance_elbow', 'elbow_sil_combined', 'free_energy_covariance'}, @(x) iscell(x) || isstring(x));
+    addParameter(p, 'criteria', {'silhouette', 'free_energy', 'free_energy_elbow', 'gev', 'calinski_harabasz_score', 'covariance', 'covariance_elbow', 'elbow_sil_combined', 'free_energy_covariance'}, @(x) iscell(x) || isstring(x));
     parse(p, varargin{:});
     
     CONFIG = p.Results;
@@ -227,11 +230,9 @@ function T = simulated_ms_retrieval_experiment(varargin)
         % ===== STEP 1: GENERATE one EEG (full montage, 71 channels) =====
         try
             sim_seed = 42 + rep*1000 + K_true*100 + round((SNR_dB+10)*10);
+            sim_opts = build_simulation_options(CONFIG, overlap_prob, SNR_dB);
             [Sim, ~, ~] = generate_microstate_eeg(K_true, SNR_dB, CONFIG.duration_s, ...
-                CONFIG.sfreq, sim_seed, struct(...
-                    'prob', overlap_prob, ...
-                    'ms_range', CONFIG.overlap_ms_range, ...
-                    'strength', CONFIG.overlap_strength));
+                CONFIG.sfreq, sim_seed, sim_opts);
             if CONFIG.validate_simulation && exist('validate_simulated_eeg_representativeness', 'file') == 2
                 Sim.sim_qc = validate_simulated_eeg_representativeness(Sim, 'verbose', false);
             elseif CONFIG.validate_simulation && CONFIG.verbose
@@ -711,6 +712,7 @@ function rows = build_k_candidate_metric_rows(eeg_idx, m_idx, fit_result, Result
     free_energy = resize_numeric_metric(get_result_metric(Results, 'free_energy_vals'), nK, NaN);
     silhouette = resize_numeric_metric(get_result_metric(Results, 'silhouette_vals'), nK, NaN);
     gev_vals = resize_numeric_metric(get_result_metric(Results, 'gev_vals'), nK, NaN);
+    calinski_harabasz = resize_numeric_metric(get_result_metric(Results, 'calinski_harabasz_vals'), nK, NaN);
     within_ss = resize_numeric_metric(get_result_metric(Results, 'within_ss'), nK, NaN);
     cov_trace_mean = resize_numeric_metric(get_result_metric(Results, 'covariance_trace_mean_vals'), nK, NaN);
     cov_trace_median = resize_numeric_metric(get_result_metric(Results, 'covariance_trace_median_vals'), nK, NaN);
@@ -724,6 +726,7 @@ function rows = build_k_candidate_metric_rows(eeg_idx, m_idx, fit_result, Result
     score_free_energy = criterion_score_vector_for_export(Results, 'free_energy');
     score_free_energy_elbow = criterion_score_vector_for_export(Results, 'free_energy_elbow');
     score_gev = criterion_score_vector_for_export(Results, 'gev');
+    score_calinski_harabasz = criterion_score_vector_for_export(Results, 'calinski_harabasz_score');
     score_covariance = criterion_score_vector_for_export(Results, 'covariance');
     score_covariance_elbow = criterion_score_vector_for_export(Results, 'covariance_elbow');
     score_elbow_sil_combined = criterion_score_vector_for_export(Results, 'elbow_sil_combined');
@@ -733,6 +736,7 @@ function rows = build_k_candidate_metric_rows(eeg_idx, m_idx, fit_result, Result
     selected_free_energy = select_K_by_criterion(Results, 'free_energy');
     selected_free_energy_elbow = select_K_by_criterion(Results, 'free_energy_elbow');
     selected_gev = select_K_by_criterion(Results, 'gev');
+    selected_calinski_harabasz = select_K_by_criterion(Results, 'calinski_harabasz_score');
     selected_covariance = select_K_by_criterion(Results, 'covariance');
     selected_covariance_elbow = select_K_by_criterion(Results, 'covariance_elbow');
     selected_elbow_sil_combined = select_K_by_criterion(Results, 'elbow_sil_combined');
@@ -754,15 +758,16 @@ function rows = build_k_candidate_metric_rows(eeg_idx, m_idx, fit_result, Result
     free_energy_norm = normalize_01_export(free_energy);
     silhouette_norm = normalize_01_export(silhouette);
     gev_norm = normalize_01_export(gev_vals);
+    calinski_harabasz_norm = normalize_01_export(calinski_harabasz);
     within_ss_norm = normalize_01_export(invert_metric_for_export(within_ss));
     covariance_primary_norm = normalize_01_export(invert_metric_for_export(cov_primary));
     free_energy_elbow_norm = normalize_01_export(score_free_energy_elbow);
     covariance_elbow_norm = normalize_01_export(score_covariance_elbow);
 
-    rows = repmat(struct(), nK, 1);
+    row_cells = cell(nK, 1);
     for i = 1:nK
         K_candidate = K_candidates(i);
-        rows(i) = struct( ...
+        row_cells{i} = struct( ...
             'fit_group_id', fit_group_id, ...
             'run_group_id', run_group_id, ...
             'k_row_id', sprintf('%s_K%02d', fit_group_id, round(K_candidate)), ...
@@ -800,6 +805,8 @@ function rows = build_k_candidate_metric_rows(eeg_idx, m_idx, fit_result, Result
             'Silhouette', silhouette(i), ...
             'gev', gev_vals(i), ...
             'GEV', gev_vals(i), ...
+            'calinski_harabasz', calinski_harabasz(i), ...
+            'CalinskiHarabasz', calinski_harabasz(i), ...
             'GFP', sim_qc_gfp_median_uv, ...
             'GFP_median_uv', sim_qc_gfp_median_uv, ...
             'within_ss', within_ss(i), ...
@@ -814,12 +821,14 @@ function rows = build_k_candidate_metric_rows(eeg_idx, m_idx, fit_result, Result
             'free_energy_norm', free_energy_norm(i), ...
             'silhouette_norm', silhouette_norm(i), ...
             'gev_norm', gev_norm(i), ...
+            'calinski_harabasz_norm', calinski_harabasz_norm(i), ...
             'within_ss_improvement_norm', within_ss_norm(i), ...
             'covariance_tightness_norm', covariance_primary_norm(i), ...
             'score_silhouette', score_silhouette(i), ...
             'score_free_energy', score_free_energy(i), ...
             'score_free_energy_elbow', score_free_energy_elbow(i), ...
             'score_gev', score_gev(i), ...
+            'score_calinski_harabasz', score_calinski_harabasz(i), ...
             'score_covariance', score_covariance(i), ...
             'score_covariance_elbow', score_covariance_elbow(i), ...
             'score_elbow_sil_combined', score_elbow_sil_combined(i), ...
@@ -832,11 +841,13 @@ function rows = build_k_candidate_metric_rows(eeg_idx, m_idx, fit_result, Result
             'selected_by_free_energy', double(K_candidate == selected_free_energy), ...
             'selected_by_free_energy_elbow', double(K_candidate == selected_free_energy_elbow), ...
             'selected_by_gev', double(K_candidate == selected_gev), ...
+            'selected_by_calinski_harabasz', double(K_candidate == selected_calinski_harabasz), ...
             'selected_by_covariance', double(K_candidate == selected_covariance), ...
             'selected_by_covariance_elbow', double(K_candidate == selected_covariance_elbow), ...
             'selected_by_elbow_sil_combined', double(K_candidate == selected_elbow_sil_combined), ...
             'selected_by_free_energy_covariance', double(K_candidate == selected_free_energy_covariance));
     end
+    rows = vertcat(row_cells{:});
 end
 
 function vec = criterion_score_vector_for_export(Results, criterion)
@@ -855,6 +866,8 @@ function vec = criterion_score_vector_for_export(Results, criterion)
             vec = resize_numeric_metric(get_result_metric(Results, 'free_energy_vals'), nK, NaN);
         case {'gev', 'gfp', 'global_explained_variance'}
             vec = resize_numeric_metric(get_result_metric(Results, 'gev_vals'), nK, NaN);
+        case {'calinski_harabasz', 'calinski_harabasz_score', 'ch'}
+            vec = resize_numeric_metric(get_result_metric(Results, 'calinski_harabasz_vals'), nK, NaN);
         case {'free_energy_elbow', 'elbow'}
             fe_vals = resize_numeric_metric(get_result_metric(Results, 'free_energy_vals'), nK, NaN);
             valid_mask = isfinite(fe_vals) & fe_vals ~= 0;
@@ -995,6 +1008,21 @@ function K_selected = select_K_by_criterion(Results, criterion)
             else
                 K_selected = NaN;
             end
+
+        case {'calinski_harabasz', 'calinski_harabasz_score', 'ch'}
+            if isfield(Results, 'calinski_harabasz_vals') && ~isempty(Results.calinski_harabasz_vals)
+                ch_vals = Results.calinski_harabasz_vals(:);
+                finite_idx = isfinite(ch_vals);
+                if any(finite_idx)
+                    [~, idx_local] = max(ch_vals(finite_idx));
+                    valid_k = find(finite_idx);
+                    K_selected = Results.K_candidates(valid_k(idx_local));
+                else
+                    K_selected = NaN;
+                end
+            else
+                K_selected = NaN;
+            end
             
         case {'elbow_sil_combined', 'elbow_only'}
             K_selected = Results.K_estimated;
@@ -1034,6 +1062,10 @@ function score = criterion_specific_best_score(Results, K_selected, criterion)
         case {'gev', 'gfp', 'global_explained_variance'}
             if isfield(Results, 'gev_vals') && numel(Results.gev_vals) >= idx
                 score = Results.gev_vals(idx);
+            end
+        case {'calinski_harabasz', 'calinski_harabasz_score', 'ch'}
+            if isfield(Results, 'calinski_harabasz_vals') && numel(Results.calinski_harabasz_vals) >= idx
+                score = Results.calinski_harabasz_vals(idx);
             end
         case {'free_energy_elbow', 'elbow'}
             if isfield(Results, 'free_energy_vals') && ~isempty(Results.free_energy_vals)
@@ -1109,7 +1141,7 @@ function [method_names, method_criteria_map, all_criteria, n_pairs] = build_meth
     method_names = cellstr(string(methods_in(:)'));
     requested_criteria = cellstr(string(criteria_in(:)'));
     supported_map = containers.Map('KeyType', 'char', 'ValueType', 'any');
-    supported_map('spm_vb') = {'silhouette', 'free_energy', 'free_energy_elbow', 'gev', 'gfp', 'covariance', 'covariance_elbow', 'elbow_sil_combined', 'free_energy_covariance'};
+    supported_map('spm_vb') = {'silhouette', 'free_energy', 'free_energy_elbow', 'gev', 'gfp', 'calinski_harabasz_score', 'covariance', 'covariance_elbow', 'elbow_sil_combined', 'free_energy_covariance'};
     supported_map('kmeans_koenig') = {'silhouette'};
 
     method_criteria_map = containers.Map('KeyType', 'char', 'ValueType', 'any');
@@ -1211,6 +1243,18 @@ function print_summary(T)
     end
     
     fprintf('\n');
+end
+
+function sim_opts = build_simulation_options(CONFIG, overlap_prob, SNR_dB)
+    sim_opts = struct( ...
+        'prob', overlap_prob, ...
+        'ms_range', CONFIG.overlap_ms_range, ...
+        'strength', CONFIG.overlap_strength);
+
+    if CONFIG.clean_sanity_profile && overlap_prob <= 0 && ...
+            (isinf(SNR_dB) || SNR_dB >= CONFIG.clean_sanity_snr_db_threshold)
+        sim_opts.clean_sanity_profile = true;
+    end
 end
 
 function [ch_labels, montage_pos] = load_eeg_montage(set_file)
@@ -1349,4 +1393,19 @@ function txt = local_which_text(name)
     if isempty(txt)
         txt = '<not found>';
     end
+end
+
+function txt = signed_token(x)
+    if x >= 0
+        txt = sprintf('p%g', x);
+    else
+        txt = sprintf('m%g', abs(x));
+    end
+    txt = strrep(txt, '.', 'p');
+end
+
+function txt = safe_token(txt)
+    txt = regexprep(char(string(txt)), '[^A-Za-z0-9]+', '_');
+    txt = regexprep(txt, '_+', '_');
+    txt = regexprep(txt, '^_|_$', '');
 end

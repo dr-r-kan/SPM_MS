@@ -64,6 +64,8 @@
     "compute_backfit_diagnostics": true,
     "save_backfit_details": true,
     "template_alignment_strong_threshold": 0.5,
+    "clean_sanity_profile": true,
+    "clean_sanity_snr_db_threshold": 40,
     "validate_simulation": false,
     "preprocessing": {
       "apply_average_reference": false,

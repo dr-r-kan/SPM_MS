@@ -2,8 +2,8 @@
 %
 % Sequential runner for the current simulation + meta-selector + dataset plan:
 %   1. simulated_ms_retrieval_experiment (training batch)
-%   2. analyze_comparison_results (training batch)
-%   3. train_spm_vb_meta_selector
+%   2. first-line single-metric summary + analyze_comparison_results (training batch)
+%   3. train_spm_vb_meta_selector (default: no internal holdout)
 %   4. simulated_ms_retrieval_experiment (held-out test batch)
 %   5. analyze_comparison_results (held-out test batch)
 %   6. apply_spm_vb_meta_selector
@@ -178,6 +178,7 @@ end
 meta_selector_model_file = util.resolve_path(char(meta_selector_model_file), util.project_root());
 
 meta_selector_train_args = local_set_default_arg(meta_selector_train_args, 'output_model_file', meta_selector_model_file);
+meta_selector_train_args = local_set_default_arg(meta_selector_train_args, 'holdout_fraction', 0);
 meta_selector_train_args = local_set_default_arg(meta_selector_train_args, 'verbose', verbose);
 
 meta_selector_apply_prefix = fullfile(test_results_dir, 'spm_vb_meta_selector');
@@ -237,8 +238,9 @@ fprintf('          Per-K CSV:   %s\n\n', RunnerResults.simulation_train_k_candid
 % Step 2: training analysis
 if run_training_analysis
     step_idx = step_idx + 1;
-    fprintf('[%d/%d] Running analyze_comparison_results (training batch) ...\n', step_idx, step_total);
+    fprintf('[%d/%d] Running first-line single-metric analysis + analyze_comparison_results (training batch) ...\n', step_idx, step_total);
     t0 = tic;
+    RunnerResults.training_single_metric_summary_csv = summarize_first_line_spm_vb_metrics(train_results_dir, 'verbose', verbose);
     analyze_comparison_results(train_results_dir, analyze_train_args{:});
     train_analysis_elapsed = toc(t0);
     RunnerResults.training_analysis_dir = fullfile(simulation_train_out_dir, 'analysis_plots');

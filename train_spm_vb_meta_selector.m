@@ -9,7 +9,7 @@ function model = train_spm_vb_meta_selector(train_source, varargin)
     p = inputParser;
     addRequired(p, 'train_source');
     addParameter(p, 'output_model_file', 'spm_vb_meta_selector.mat', @(x) ischar(x) || isstring(x));
-    addParameter(p, 'holdout_fraction', 0.2, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x < 1);
+    addParameter(p, 'holdout_fraction', 0, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x < 1);
     addParameter(p, 'ridge_lambda', 1.0, @(x) isnumeric(x) && isscalar(x) && x >= 0);
     addParameter(p, 'max_iter', 200, @(x) isnumeric(x) && isscalar(x) && x >= 1);
     addParameter(p, 'tol', 1e-6, @(x) isnumeric(x) && isscalar(x) && x > 0);
@@ -92,6 +92,8 @@ function model = train_spm_vb_meta_selector(train_source, varargin)
         if any(holdout_mask)
             fprintf('Holdout run-level accuracy: %.3f (%d runs)\n', ...
                 holdout_eval.run_accuracy, holdout_eval.n_runs);
+        else
+            fprintf('Internal holdout disabled; evaluate the combined model on the external test batch.\n');
         end
     end
 end

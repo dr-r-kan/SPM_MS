@@ -5,7 +5,8 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
 %   Sim          - Simulation structure
 %   K_candidates - Vector of K values to test
 %   criterion    - 'silhouette', 'free_energy', 'free_energy_elbow',
-%                  'elbow_sil_combined', 'gev'/'gfp', 'covariance',
+%                  'elbow_sil_combined', 'gev'/'gfp',
+%                  'calinski_harabasz_score', 'covariance',
 %                  'covariance_elbow', or 'free_energy_covariance'
 %
 % OUTPUTS:
@@ -60,6 +61,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     silhouette_score = zeros(nK, 1);
     within_ss = zeros(nK, 1);
     gev_vals = zeros(nK, 1);
+    calinski_harabasz_vals = nan(nK, 1);
     vbmix = cell(nK, 1);
     spm_mix_model_summaries = repmat(empty_spm_mix_summary(size(features, 2)), nK, 1);
     centers_all = cell(nK, 1);
@@ -83,6 +85,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
                 silhouette_score(iK) = -1;
                 within_ss(iK) = Inf;
                 gev_vals(iK) = 0;
+                calinski_harabasz_vals(iK) = NaN;
             else
                 free_energy(iK) = result.fm;
                 vbmix{iK} = result;
@@ -112,6 +115,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
                 % Compute within-cluster sum of squares for elbow method
                 wss = compute_within_ss(maps_norm, labels, K_eff);
                 within_ss(iK) = wss;
+                calinski_harabasz_vals(iK) = compute_calinski_harabasz_score(features, labels, K_eff);
                 
                 dup_count = size(polarity_duplicate_info{iK}.pairs, 1);
                 if dup_count > 0
@@ -127,6 +131,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
             silhouette_score(iK) = -1;
             within_ss(iK) = Inf;
             gev_vals(iK) = 0;
+            calinski_harabasz_vals(iK) = NaN;
             within_ss(iK) = Inf;
             spm_mix_model_summaries(iK) = empty_spm_mix_summary(size(features, 2), K);
         end
@@ -155,6 +160,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
         'K_candidates', K_candidates(:), ...
         'free_energy_vals', free_energy(:), ...
         'silhouette_vals', silhouette_score(:), ...
+        'calinski_harabasz_vals', calinski_harabasz_vals(:), ...
         'covariance_trace_mean_vals', cov_trace_mean_vals(:), ...
         'covariance_trace_median_vals', cov_trace_median_vals(:), ...
         'covariance_logdet_mean_vals', cov_logdet_mean_vals(:), ...
@@ -180,6 +186,8 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
             fprintf('  Silhouette (Koenig): selected K=%d (score=%.4f)\n', K_model_selected, best_score);
         case {'gev', 'gfp', 'global_explained_variance'}
             fprintf('  GEV/GFP: selected K=%d (score=%.4f)\n', K_model_selected, best_score);
+        case {'calinski_harabasz', 'calinski_harabasz_score', 'ch'}
+            fprintf('  Calinski-Harabasz: selected K=%d (score=%.4f)\n', K_model_selected, best_score);
         case 'free_energy'
             fprintf('  Free Energy: selected K=%d (FE=%.1f)\n', K_model_selected, best_score);
         case {'free_energy_elbow', 'elbow'}
@@ -285,7 +293,8 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     'silhouette_vals', silhouette_score, ...  
     'free_energy_vals', free_energy, ...      
     'within_ss', within_ss, ...            
-    'gev_vals', gev_vals, ...             
+    'gev_vals', gev_vals, ...
+    'calinski_harabasz_vals', calinski_harabasz_vals, ...
     'covariance_trace_mean_vals', cov_trace_mean_vals, ...
     'covariance_trace_median_vals', cov_trace_median_vals, ...
     'covariance_logdet_mean_vals', cov_logdet_mean_vals, ...
@@ -1000,6 +1009,42 @@ function wss = compute_within_ss(X, labels, K)
     end
 end
 
+function ch = compute_calinski_harabasz_score(X, labels, K)
+% Compute the Calinski-Harabasz score in the fitted feature space.
+
+    X = double(X);
+    labels = double(labels(:));
+    [N, D] = size(X);
+    if K <= 1 || N <= K || D == 0
+        ch = NaN;
+        return;
+    end
+
+    grand_mean = mean(X, 1);
+    W = 0;
+    B = 0;
+    for k = 1:K
+        cluster_idx = (labels == k);
+        nk = nnz(cluster_idx);
+        if nk == 0
+            continue;
+        end
+        Xk = X(cluster_idx, :);
+        mu_k = mean(Xk, 1);
+        diffs = Xk - mu_k;
+        W = W + sum(diffs(:).^2);
+        mean_diff = mu_k - grand_mean;
+        B = B + nk * sum(mean_diff.^2);
+    end
+
+    if W <= eps
+        ch = Inf;
+        return;
+    end
+
+    ch = (B / max(K - 1, 1)) / (W / max(N - K, 1));
+end
+
 function centers = recover_centers_from_labels(maps, labels, K)
 % Recover cluster centers with Koenig-style polarity-invariant update.
     
@@ -1062,6 +1107,7 @@ function Results = create_empty_results(Sim, K_candidates, n_maps, C_dims, crite
         'silhouette_vals', -ones(numel(K_candidates), 1), ...
         'within_ss', Inf(numel(K_candidates), 1), ...
         'gev_vals', zeros(numel(K_candidates), 1), ...
+        'calinski_harabasz_vals', nan(numel(K_candidates), 1), ...
         'covariance_trace_mean_vals', nan(numel(K_candidates), 1), ...
         'covariance_trace_median_vals', nan(numel(K_candidates), 1), ...
         'covariance_logdet_mean_vals', nan(numel(K_candidates), 1), ...

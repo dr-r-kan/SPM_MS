@@ -1,9 +1,14 @@
 function out = plot_simulated_backfit_confusion_summary(varargin)
-%PLOT_SIMULATED_BACKFIT_CONFUSION_SUMMARY Summarise simulated backfit confusions.
+%PLOT_SIMULATED_BACKFIT_CONFUSION_SUMMARY Summarise simulated method and backfit comparisons.
 %
-% Produces a two-panel figure for the simulated microstate retrieval experiment:
-%   Left: template-label confusion rates averaged across K-gap groups.
-%   Right: mean backfit label accuracy for kmeans and SPM-VB at K_gap = 0:3.
+% Produces a 2x2 figure:
+%   Top-left: K-selection accuracy comparing traditional K-means and SPM-VB
+%             using silhouette for both methods.
+%   Top-right: Backfit accuracy comparing traditional K-means using
+%              silhouette against SPM-VB using its best K-selection
+%              criterion.
+%   Bottom-left: Row-normalized confusion grid for traditional K-means.
+%   Bottom-right: Row-normalized confusion grid for SPM-VB.
 
     util = microstate_utilities();
     repo_cfg = util.load_config();
@@ -15,6 +20,12 @@ function out = plot_simulated_backfit_confusion_summary(varargin)
     addParameter(p, 'template_file', char(repo_cfg.paths.template_file), @(x) ischar(x) || isstring(x));
     addParameter(p, 'methods', {'kmeans_koenig', 'spm_vb'}, @(x) iscell(x) || isstring(x));
     addParameter(p, 'criteria', {}, @(x) iscell(x) || isstring(x));
+    addParameter(p, 'kmeans_method', 'kmeans_koenig', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'spm_method', 'spm_vb', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'kmeans_criterion', 'silhouette', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'spm_comparison_criterion', 'silhouette', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'spm_best_criterion', '', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'selection_metric', 'K_correct', @(x) ischar(x) || isstring(x));
     addParameter(p, 'k_gaps', 0:3, @(x) isnumeric(x) && isvector(x));
     addParameter(p, 'visible', false, @islogical);
     addParameter(p, 'resolution', double(util.get_field(repo_cfg.plotting, 'resolution', 300)), ...
@@ -48,147 +59,229 @@ function out = plot_simulated_backfit_confusion_summary(varargin)
     if ~isfile(cfg.results_csv)
         error('Results manifest not found: %s', cfg.results_csv);
     end
-    if ~isfile(cfg.template_file)
-        error('Template file not found: %s', cfg.template_file);
-    end
 
     T = readtable(cfg.results_csv, 'TextType', 'string');
-    required_vars = {'method', 'criterion', 'K_true', 'K_estimated', 'backfit_diagnostic_file'};
+    required_vars = {'method', 'criterion', 'K_correct', 'backfit_diagnostic_file'};
     missing_vars = required_vars(~ismember(required_vars, T.Properties.VariableNames));
     if ~isempty(missing_vars)
         error('Results manifest is missing required columns: %s', strjoin(missing_vars, ', '));
     end
 
-    method_mask = ismember(strtrim(lower(string(T.method))), strtrim(lower(string(cfg.methods))));
-    if isempty(cfg.criteria)
-        criterion_mask = true(height(T), 1);
-    else
-        criterion_mask = ismember(strtrim(lower(string(T.criterion))), strtrim(lower(string(cfg.criteria))));
+    method_vals = cellfun(@canonicalize_method_token, cellstr(string(T.method)), 'UniformOutput', false);
+    criterion_vals = cellfun(@canonicalize_criterion_token, cellstr(string(T.criterion)), 'UniformOutput', false);
+    selection_metric = char(string(cfg.selection_metric));
+    if ~ismember(selection_metric, T.Properties.VariableNames)
+        selection_metric = 'K_correct';
     end
+
+    kmeans_method = canonicalize_method_token(cfg.kmeans_method);
+    spm_method = canonicalize_method_token(cfg.spm_method);
+    kmeans_criterion = canonicalize_criterion_token(cfg.kmeans_criterion);
+    spm_comparison_criterion = canonicalize_criterion_token(cfg.spm_comparison_criterion);
+
+    if isempty(cfg.criteria)
+        criterion_candidate_mask = true(height(T), 1);
+    else
+        criteria_requested = cellfun(@canonicalize_criterion_token, cfg.criteria, 'UniformOutput', false);
+        criterion_candidate_mask = ismember(criterion_vals, criteria_requested);
+    end
+
+    if isempty(strtrim(char(string(cfg.spm_best_criterion))))
+        spm_best_criterion = select_best_spm_criterion( ...
+            T, method_vals, criterion_vals, spm_method, criterion_candidate_mask, selection_metric);
+    else
+        spm_best_criterion = canonicalize_criterion_token(cfg.spm_best_criterion);
+    end
+
     file_vals = cellstr(string(T.backfit_diagnostic_file));
     valid_file = ~cellfun(@isempty, file_vals) & cellfun(@isfile, file_vals);
-    if ismember('K_gap', T.Properties.VariableNames)
-        gap_vals = double(T.K_gap);
-    else
-        gap_vals = double(T.K_true) - double(T.K_estimated);
-    end
+    gap_vals = compute_k_gap(T);
     gap_mask = ismember(gap_vals, cfg.k_gaps);
-    keep_mask = method_mask & criterion_mask & valid_file & gap_mask;
-    if ~any(keep_mask)
-        error('No valid backfit diagnostic files matched the requested filters.');
+
+    mask_kacc_kmeans = strcmp(method_vals, kmeans_method) & strcmp(criterion_vals, kmeans_criterion);
+    mask_kacc_spm = strcmp(method_vals, spm_method) & strcmp(criterion_vals, spm_comparison_criterion);
+    mask_backfit_kmeans = mask_kacc_kmeans & valid_file & gap_mask;
+    mask_backfit_spm = strcmp(method_vals, spm_method) & strcmp(criterion_vals, spm_best_criterion) & valid_file & gap_mask;
+
+    if ~any(mask_kacc_kmeans)
+        error('No rows found for traditional K-means + %s.', kmeans_criterion);
+    end
+    if ~any(mask_kacc_spm)
+        error('No rows found for SPM-VB + %s.', spm_comparison_criterion);
+    end
+    if ~any(mask_backfit_kmeans)
+        error('No valid backfit diagnostics found for traditional K-means + %s.', kmeans_criterion);
+    end
+    if ~any(mask_backfit_spm)
+        error('No valid backfit diagnostics found for SPM-VB + %s.', spm_best_criterion);
     end
 
-    T_plot = T(keep_mask, :);
-    gap_vals = gap_vals(keep_mask);
-    file_vals = file_vals(keep_mask);
-    method_vals = cellstr(lower(strtrim(string(T_plot.method))));
+    kacc_summary = [ ...
+        mean(to_numeric_vector(T.K_correct(mask_kacc_kmeans)), 'omitnan'), ...
+        mean(to_numeric_vector(T.K_correct(mask_kacc_spm)), 'omitnan')];
+    kacc_counts = [nnz(mask_kacc_kmeans), nnz(mask_kacc_spm)];
 
-    diagnostics = struct('file', {}, 'method', {}, 'k_gap', {}, 'labels', {}, 'counts', {}, ...
-        'accuracy', {}, 'run_name', {});
-    label_order = {};
-    for i = 1:height(T_plot)
-        file_i = char(file_vals{i});
-        S = load(file_i, 'BackfitDiagnostics');
-        if ~isfield(S, 'BackfitDiagnostics') || ~isfield(S.BackfitDiagnostics, 'ok') || ~S.BackfitDiagnostics.ok
-            continue;
-        end
+    diag_kmeans = collect_backfit_diagnostics(file_vals(mask_backfit_kmeans));
+    diag_spm = collect_backfit_diagnostics(file_vals(mask_backfit_spm));
 
-        diag_i = S.BackfitDiagnostics;
-        labels_i = cellstr(string(diag_i.template_labels(:)));
-        counts_i = double(diag_i.confusion_counts);
-        if isempty(labels_i) || isempty(counts_i)
-            continue;
-        end
-
-        label_order = merge_label_order(label_order, labels_i);
-        diagnostics(end + 1) = struct( ...
-            'file', file_i, ...
-            'method', method_vals{i}, ...
-            'k_gap', double(gap_vals(i)), ...
-            'labels', {labels_i}, ...
-            'counts', counts_i, ...
-            'accuracy', local_accuracy(diag_i), ...
-            'run_name', char(string(T_plot.subject(i)))); %#ok<AGROW>
+    if isempty(diag_kmeans) || isempty(diag_spm)
+        error('Backfit diagnostics were present in the table but could not be loaded.');
     end
 
-    if isempty(diagnostics)
-        error('No usable backfit diagnostics were found in the selected rows.');
-    end
+    label_order = merge_label_order({}, extract_all_labels(diag_kmeans));
+    label_order = merge_label_order(label_order, extract_all_labels(diag_spm));
 
-    if isempty(label_order)
-        label_order = diagnostics(1).labels;
-    end
+    confusion_kmeans = mean_confusion_matrix(diag_kmeans, label_order);
+    confusion_spm = mean_confusion_matrix(diag_spm, label_order);
 
-    k_gap_values = cfg.k_gaps;
-    gap_confusion_means = cell(numel(k_gap_values), 1);
-    for g = 1:numel(k_gap_values)
-        gap_mask_g = [diagnostics.k_gap] == k_gap_values(g);
-        if ~any(gap_mask_g)
-            gap_confusion_means{g} = nan(numel(label_order), numel(label_order));
-            continue;
-        end
-
-        matrices = cell(1, sum(gap_mask_g));
-        idx = 0;
-        for d = find(gap_mask_g)
-            idx = idx + 1;
-            matrices{idx} = normalize_confusion_rows(reorder_confusion_matrix( ...
-                diagnostics(d).counts, diagnostics(d).labels, label_order));
-        end
-        gap_confusion_means{g} = mean(cat(3, matrices{:}), 3, 'omitnan');
-    end
-
-    valid_gap_mats = gap_confusion_means(~cellfun(@(x) isempty(x) || all(isnan(x), 'all'), gap_confusion_means));
-    if isempty(valid_gap_mats)
-        overall_confusion = nan(numel(label_order), numel(label_order));
-    else
-        overall_confusion = mean(cat(3, valid_gap_mats{:}), 3, 'omitnan');
-    end
-
-    method_labels = {'kmeans_koenig', 'spm_vb'};
-    method_titles = {'K-means', 'SPM-VB'};
-    accuracy_summary = nan(numel(method_labels), numel(k_gap_values));
-    accuracy_counts = zeros(numel(method_labels), numel(k_gap_values));
-    for m = 1:numel(method_labels)
-        for g = 1:numel(k_gap_values)
-            mask = strcmp({diagnostics.method}, method_labels{m}) & [diagnostics.k_gap] == k_gap_values(g);
-            if ~any(mask)
-                continue;
-            end
-            accuracy_summary(m, g) = mean([diagnostics(mask).accuracy], 'omitnan');
-            accuracy_counts(m, g) = sum(mask);
-        end
-    end
+    backfit_summary = [ ...
+        mean([diag_kmeans.accuracy], 'omitnan'), ...
+        mean([diag_spm.accuracy], 'omitnan')];
+    backfit_counts = [numel(diag_kmeans), numel(diag_spm)];
 
     fig = figure('Name', 'Simulated backfit confusion summary', ...
         'Color', 'white', 'Visible', char(util.on_off_string(cfg.visible)), 'NumberTitle', 'off', ...
-        'Position', [70, 70, 1700, 820]);
+        'Position', [70, 70, 1500, 1100]);
     if ~cfg.visible
         cleaner = onCleanup(@() close_if_valid(fig)); %#ok<NASGU>
     end
 
-    tl = tiledlayout(fig, 1, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
-    sgtitle(tl, 'Simulated backfit confusion summary', 'FontWeight', 'bold', 'FontSize', 15);
+    tl = tiledlayout(fig, 2, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
+    sgtitle(tl, 'Simulated method comparison and backfit confusion summary', ...
+        'FontWeight', 'bold', 'FontSize', 15);
 
-    ax_left = nexttile(tl, 1);
-    render_confusion_panel(ax_left, overall_confusion, label_order, ...
-        sprintf('Template-label confusion rate\n(mean across K-gap groups; n=%d runs)', numel(diagnostics)));
+    ax_kacc = nexttile(tl, 1);
+    render_method_bar_panel(ax_kacc, kacc_summary, kacc_counts, ...
+        {'traditional K-means', 'SPM-VB'}, ...
+        sprintf('K selection accuracy\n(silhouette for both methods)'));
 
-    ax_right = nexttile(tl, 2);
-    render_accuracy_panel(ax_right, accuracy_summary, accuracy_counts, k_gap_values, method_titles);
+    ax_backfit = nexttile(tl, 2);
+    render_method_bar_panel(ax_backfit, backfit_summary, backfit_counts, ...
+        {'traditional K-means', 'SPM-VB'}, ...
+        sprintf(['Backfit accuracy\n(traditional K-means: %s; SPM-VB: %s)'], ...
+        prettify_criterion(kmeans_criterion), prettify_criterion(spm_best_criterion)));
+
+    ax_conf_km = nexttile(tl, 3);
+    render_confusion_panel(ax_conf_km, confusion_kmeans, label_order, ...
+        sprintf('Confusion grid: traditional K-means\n(%s; n=%d runs)', ...
+        prettify_criterion(kmeans_criterion), numel(diag_kmeans)));
+
+    ax_conf_spm = nexttile(tl, 4);
+    render_confusion_panel(ax_conf_spm, confusion_spm, label_order, ...
+        sprintf('Confusion grid: SPM-VB\n(%s; n=%d runs)', ...
+        prettify_criterion(spm_best_criterion), numel(diag_spm)));
 
     exportgraphics(fig, cfg.output_file, 'Resolution', cfg.resolution);
 
     out = struct();
     out.plot_file = cfg.output_file;
     out.results_csv = cfg.results_csv;
-    out.template_file = cfg.template_file;
+    out.kmeans_criterion = kmeans_criterion;
+    out.spm_comparison_criterion = spm_comparison_criterion;
+    out.spm_best_criterion = spm_best_criterion;
     out.label_order = label_order(:);
-    out.k_gap_values = k_gap_values(:)';
-    out.overall_confusion = overall_confusion;
-    out.accuracy_summary = accuracy_summary;
-    out.accuracy_counts = accuracy_counts;
-    out.n_runs = numel(diagnostics);
+    out.kacc_summary = kacc_summary;
+    out.kacc_counts = kacc_counts;
+    out.backfit_summary = backfit_summary;
+    out.backfit_counts = backfit_counts;
+    out.confusion_kmeans = confusion_kmeans;
+    out.confusion_spm = confusion_spm;
+end
+
+function spm_best_criterion = select_best_spm_criterion(T, method_vals, criterion_vals, spm_method, criterion_candidate_mask, metric_name)
+    mask_spm = strcmp(method_vals, spm_method) & criterion_candidate_mask;
+    if ~any(mask_spm)
+        error('No SPM-VB rows were available to choose the best criterion.');
+    end
+
+    criteria = unique(criterion_vals(mask_spm), 'stable');
+    metric_col = to_numeric_vector(T.(metric_name));
+    best_score = -inf;
+    best_n = -inf;
+    spm_best_criterion = '';
+    for i = 1:numel(criteria)
+        crit_i = criteria{i};
+        mask_i = mask_spm & strcmp(criterion_vals, crit_i);
+        vals_i = metric_col(mask_i);
+        vals_i = vals_i(isfinite(vals_i));
+        if isempty(vals_i)
+            continue;
+        end
+        score_i = mean(vals_i, 'omitnan');
+        n_i = numel(vals_i);
+        if score_i > best_score || (abs(score_i - best_score) <= eps && n_i > best_n)
+            best_score = score_i;
+            best_n = n_i;
+            spm_best_criterion = crit_i;
+        end
+    end
+
+    if isempty(spm_best_criterion)
+        error('Could not identify an SPM-VB criterion with finite %s values.', metric_name);
+    end
+end
+
+function gap_vals = compute_k_gap(T)
+    if ismember('K_gap', T.Properties.VariableNames)
+        gap_vals = to_numeric_vector(T.K_gap);
+        return;
+    end
+    if ismember('K_true', T.Properties.VariableNames) && ismember('K_estimated', T.Properties.VariableNames)
+        gap_vals = to_numeric_vector(T.K_true) - to_numeric_vector(T.K_estimated);
+        return;
+    end
+    gap_vals = zeros(height(T), 1);
+end
+
+function diagnostics = collect_backfit_diagnostics(files)
+    diagnostics = struct('labels', {}, 'counts', {}, 'accuracy', {});
+    file_list = cellstr(string(files));
+    for i = 1:numel(file_list)
+        file_i = char(string(file_list{i}));
+        if isempty(file_i) || ~isfile(file_i)
+            continue;
+        end
+        S = load(file_i, 'BackfitDiagnostics');
+        if ~isfield(S, 'BackfitDiagnostics') || ~isfield(S.BackfitDiagnostics, 'ok') || ~S.BackfitDiagnostics.ok
+            continue;
+        end
+        diag_i = S.BackfitDiagnostics;
+        labels_i = cellstr(string(diag_i.template_labels(:)));
+        counts_i = double(diag_i.confusion_counts);
+        if isempty(labels_i) || isempty(counts_i)
+            continue;
+        end
+        diagnostics(end + 1) = struct( ... %#ok<AGROW>
+            'labels', {labels_i}, ...
+            'counts', counts_i, ...
+            'accuracy', local_accuracy(diag_i));
+    end
+end
+
+function labels = extract_all_labels(diagnostics)
+    labels = {};
+    for i = 1:numel(diagnostics)
+        labels = merge_label_order(labels, diagnostics(i).labels);
+    end
+end
+
+function values = mean_confusion_matrix(diagnostics, label_order)
+    values = nan(numel(label_order), numel(label_order));
+    if isempty(diagnostics)
+        return;
+    end
+    mats = cell(1, numel(diagnostics));
+    keep = false(1, numel(diagnostics));
+    for i = 1:numel(diagnostics)
+        mats{i} = normalize_confusion_rows(reorder_confusion_matrix( ...
+            diagnostics(i).counts, diagnostics(i).labels, label_order));
+        keep(i) = ~isempty(mats{i}) && any(isfinite(mats{i}), 'all');
+    end
+    mats = mats(keep);
+    if isempty(mats)
+        return;
+    end
+    values = mean(cat(3, mats{:}), 3, 'omitnan');
 end
 
 function accuracy = local_accuracy(diag_i)
@@ -250,6 +343,34 @@ function rownorm = normalize_confusion_rows(values)
     end
 end
 
+function render_method_bar_panel(ax, values, counts, labels, title_str)
+    axes(ax);
+    cla(ax);
+
+    x = 1:numel(values);
+    b = bar(ax, x, values, 0.6, 'FaceColor', 'flat', 'EdgeColor', 'black', 'LineWidth', 1.2);
+    b.CData = [0.20 0.46 0.70; 0.87 0.48 0.16];
+    ylim(ax, [0 1]);
+    xlim(ax, [0.4, numel(values) + 0.6]);
+    grid(ax, 'on');
+    ax.GridAlpha = 0.25;
+    ax.LineWidth = 1;
+    ax.Color = 'white';
+    ax.XTick = x;
+    ax.XTickLabel = labels;
+    ax.XTickLabelRotation = 15;
+    ylabel(ax, 'Mean accuracy', 'FontWeight', 'bold');
+    title(ax, title_str, 'FontWeight', 'bold', 'FontSize', 12, 'Interpreter', 'none');
+
+    for i = 1:numel(values)
+        if ~isfinite(values(i))
+            continue;
+        end
+        text(ax, x(i), values(i) + 0.03, sprintf('%.2f\n(n=%d)', values(i), counts(i)), ...
+            'HorizontalAlignment', 'center', 'FontSize', 10, 'FontWeight', 'bold');
+    end
+end
+
 function render_confusion_panel(ax, values, label_order, title_str)
     axes(ax);
     cla(ax);
@@ -290,39 +411,55 @@ function render_confusion_panel(ax, values, label_order, title_str)
     end
 end
 
-function render_accuracy_panel(ax, accuracy_summary, accuracy_counts, k_gap_values, method_titles)
-    axes(ax);
-    cla(ax);
-    hold(ax, 'on');
-
-    x = categorical(compose('K_{true}-%d', k_gap_values));
-    x = reordercats(x, cellstr(compose('K_{true}-%d', k_gap_values)));
-    b = bar(ax, x, accuracy_summary', 'grouped', 'LineWidth', 1);
-    b(1).FaceColor = [0.20 0.46 0.70];
-    b(2).FaceColor = [0.87 0.48 0.16];
-
-    ylim(ax, [0 1]);
-    grid(ax, 'on');
-    ax.GridAlpha = 0.25;
-    ax.LineWidth = 1;
-    ax.Color = 'white';
-    ylabel(ax, 'Mean correct backfit proportion', 'FontWeight', 'bold');
-    xlabel(ax, 'K estimated relative to K true', 'FontWeight', 'bold');
-    title(ax, 'Backfit accuracy by K-gap and method', 'FontWeight', 'bold', 'FontSize', 12);
-    legend(ax, b, method_titles, 'Location', 'southoutside', 'Orientation', 'horizontal');
-
-    for m = 1:size(accuracy_summary, 1)
-        for g = 1:size(accuracy_summary, 2)
-            v = accuracy_summary(m, g);
-            if ~isfinite(v)
-                continue;
+function vals = to_numeric_vector(col)
+    if isnumeric(col) || islogical(col)
+        vals = double(col);
+    elseif iscell(col)
+        vals = nan(numel(col), 1);
+        for i = 1:numel(col)
+            v = col{i};
+            if isnumeric(v) || islogical(v)
+                vals(i) = double(v);
+            elseif isstring(v) || ischar(v)
+                vals(i) = str2double(char(string(v)));
             end
-            x_pos = b(m).XEndPoints(g);
-            text(ax, x_pos, v + 0.025, sprintf('%.2f\n(n=%d)', v, accuracy_counts(m, g)), ...
-                'HorizontalAlignment', 'center', 'FontSize', 9, 'FontWeight', 'bold');
         end
+    else
+        vals = str2double(string(col));
     end
-    hold(ax, 'off');
+    vals = vals(:);
+end
+
+function token = canonicalize_method_token(token_in)
+    token = lower(strtrim(char(string(token_in))));
+    token = strrep(token, '_', ' ');
+    token = strrep(token, '-', ' ');
+    token = regexprep(token, '\s+', ' ');
+    if contains(token, 'spm vb')
+        token = 'spm_vb';
+    elseif contains(token, 'traditional kmeans') || contains(token, 'traditional k means') || ...
+            contains(token, 'kmeans koenig') || contains(token, 'koenig kmeans')
+        token = 'kmeans_koenig';
+    end
+end
+
+function token = canonicalize_criterion_token(token_in)
+    token = lower(strtrim(char(string(token_in))));
+    token = strrep(token, '_', ' ');
+    token = regexprep(token, '\s+', ' ');
+    if strcmp(token, 'elbow')
+        token = 'free energy elbow';
+    elseif strcmp(token, 'silhouette only')
+        token = 'silhouette';
+    elseif strcmp(token, 'free energy elbow only')
+        token = 'free energy elbow';
+    elseif contains(token, 'elbow sil') || contains(token, 'free energy elbow sil')
+        token = 'elbow sil combined';
+    end
+end
+
+function txt = prettify_criterion(token)
+    txt = strrep(char(string(token)), '_', ' ');
 end
 
 function close_if_valid(fig)

@@ -1,7 +1,9 @@
 function backfit = backfit_microstate_timecourse(Sim, Results, varargin)
 %BACKFIT_MICROSTATE_TIMECOURSE Backfit full-record microstate weights.
 %
-% Hard backfitting is always available via polarity-invariant correlation.
+% Hard backfitting uses polarity-invariant correlation. For GFP-peak based
+% fits, the Koenig-style path assigns states at full-record GFP peaks and
+% interpolates labels between those peaks.
 % For SPM-VB fits, a proportional Gaussian soft backfit is also computed in
 % topography space. The Gaussian widths are calibrated from each fitted
 % cluster's within-cluster spread over GFP-peak maps, then applied to the
@@ -24,7 +26,7 @@ function backfit = backfit_microstate_timecourse(Sim, Results, varargin)
 
     util = microstate_utilities();
     try
-        X_fit = preprocess_full_record_for_backfit_local(Sim, Results, util);
+        [X_fit, backfit_cfg] = preprocess_full_record_for_backfit_local(Sim, Results, util);
     catch ME
         backfit.message = ME.message;
         return;
@@ -38,9 +40,9 @@ function backfit = backfit_microstate_timecourse(Sim, Results, varargin)
         return;
     end
 
-    hard_similarity = abs(maps_norm * centers_norm');
-    [n_samples, K_est] = size(hard_similarity);
-    [hard_confidence, hard_assignments] = max(hard_similarity, [], 2);
+    [n_samples, K_est] = size(abs(maps_norm * centers_norm'));
+    [hard_assignments, hard_confidence, hard_debug] = koenig_hard_backfit_local( ...
+        X_fit, maps_norm, centers_norm, Results, n_samples, util, backfit_cfg);
     hard_weights = zeros(n_samples, K_est);
     hard_weights(sub2ind([n_samples, K_est], (1:n_samples)', hard_assignments)) = 1;
 
@@ -50,7 +52,13 @@ function backfit = backfit_microstate_timecourse(Sim, Results, varargin)
     backfit.hard = struct( ...
         'weights', hard_weights, ...
         'assignments', hard_assignments, ...
-        'confidence', hard_confidence);
+        'confidence', hard_confidence, ...
+        'mode', hard_debug.mode, ...
+        'peak_sample_index', hard_debug.peak_sample_index, ...
+        'peak_assignments', hard_debug.peak_assignments, ...
+        'peak_confidence', hard_debug.peak_confidence, ...
+        'instantaneous_assignments', hard_debug.instantaneous_assignments, ...
+        'instantaneous_confidence', hard_debug.instantaneous_confidence);
 
     backfit.mixture = struct( ...
         'available', false, ...
@@ -117,17 +125,49 @@ function [tf, peak_maps, peak_labels] = supports_mixture_backfit(Results)
     tf = true;
 end
 
-function X_fit = preprocess_full_record_for_backfit_local(Sim, Results, util)
+function [X_fit, cfg] = preprocess_full_record_for_backfit_local(Sim, Results, util)
     X_fit = remap_full_record_if_needed_local(Sim, Results, util);
-    cfg = struct();
-    if isfield(Sim, 'preprocessing') && isstruct(Sim.preprocessing)
-        cfg = Sim.preprocessing;
-    end
+    cfg = resolve_backfit_preprocessing_cfg_local(Sim, Results);
     if isfield(cfg, 'apply_average_reference') && cfg.apply_average_reference
         X_fit = X_fit - mean(X_fit, 1);
     end
     if isfield(cfg, 'filter_band') && ~isempty(cfg.filter_band)
         X_fit = util.bandpass_filter(X_fit, Sim.sfreq, cfg.filter_band);
+    end
+end
+
+function cfg = resolve_backfit_preprocessing_cfg_local(Sim, Results)
+    cfg = struct();
+    if isfield(Sim, 'preprocessing') && isstruct(Sim.preprocessing)
+        cfg = Sim.preprocessing;
+    end
+    if isfield(Results, 'preprocessing') && isstruct(Results.preprocessing)
+        cfg = merge_structs_local(cfg, Results.preprocessing);
+    end
+    if isfield(Results, 'preprocessing_info') && isstruct(Results.preprocessing_info)
+        info = Results.preprocessing_info;
+        fields = {'apply_average_reference', 'filter_band', 'spatial_filter', ...
+            'gfp_peak_min_distance', 'gfp_peak_threshold_schedule'};
+        for i = 1:numel(fields)
+            f = fields{i};
+            if isfield(info, f) && ~isempty(info.(f))
+                cfg.(f) = info.(f);
+            end
+        end
+    end
+    if ~isfield(cfg, 'gfp_peak_min_distance') || isempty(cfg.gfp_peak_min_distance)
+        cfg.gfp_peak_min_distance = 3;
+    end
+end
+
+function out = merge_structs_local(base, extra)
+    out = base;
+    if ~isstruct(extra)
+        return;
+    end
+    fields = fieldnames(extra);
+    for i = 1:numel(fields)
+        out.(fields{i}) = extra.(fields{i});
     end
 end
 
@@ -278,4 +318,179 @@ function sigmas = cluster_distance_sigmas(peak_maps, peak_labels, centers_norm, 
         end
     end
     sigmas(~isfinite(sigmas) | sigmas < eps) = sigma_floor;
+end
+
+function [assignments, confidence, debug] = koenig_hard_backfit_local(X_fit, full_maps, centers_norm, Results, n_samples, util, cfg)
+    instantaneous_similarity = abs(full_maps * centers_norm');
+    [instantaneous_confidence, instantaneous_assignments] = max(instantaneous_similarity, [], 2);
+
+    debug = struct( ...
+        'mode', 'all_samples_direct', ...
+        'peak_sample_index', nan(0, 1), ...
+        'peak_assignments', nan(0, 1), ...
+        'peak_confidence', nan(0, 1), ...
+        'instantaneous_assignments', instantaneous_assignments, ...
+        'instantaneous_confidence', instantaneous_confidence);
+    assignments = instantaneous_assignments;
+    confidence = instantaneous_confidence;
+
+    [has_peak_fit, peak_maps, peak_sample_index] = full_record_peak_backfit_support_local(X_fit, cfg, util);
+    if ~has_peak_fit
+        [has_peak_fit, peak_maps, peak_sample_index] = supports_peak_backfit_local(Results, n_samples);
+    end
+    if has_peak_fit
+        peak_maps = util.normalize_maps(double(peak_maps));
+        if size(peak_maps, 2) == size(centers_norm, 2)
+            peak_similarity = abs(peak_maps * centers_norm');
+            [peak_confidence, peak_assignments] = max(peak_similarity, [], 2);
+            [assignments, confidence] = interpolate_peak_assignments_local( ...
+                peak_sample_index, peak_assignments, peak_confidence, n_samples);
+
+            debug.mode = 'gfp_peaks_interpolated';
+            debug.peak_sample_index = peak_sample_index(:);
+            debug.peak_assignments = peak_assignments(:);
+            debug.peak_confidence = peak_confidence(:);
+        end
+    end
+end
+
+function [tf, peak_maps, peak_sample_index] = full_record_peak_backfit_support_local(X_fit, cfg, util)
+    tf = false;
+    peak_maps = [];
+    peak_sample_index = [];
+    if isempty(X_fit)
+        return;
+    end
+
+    min_dist = 3;
+    if isfield(cfg, 'gfp_peak_min_distance') && ~isempty(cfg.gfp_peak_min_distance)
+        min_dist = max(1, round(double(cfg.gfp_peak_min_distance)));
+    end
+    gfp = sqrt(mean((double(X_fit) - mean(double(X_fit), 1)).^2, 1));
+    peak_sample_index = local_peak_finder_backfit_local(gfp, min_dist);
+    if isempty(peak_sample_index)
+        return;
+    end
+
+    peak_maps = double(X_fit(:, peak_sample_index))';
+    valid = all(isfinite(peak_maps), 2);
+    peak_maps = peak_maps(valid, :);
+    peak_sample_index = peak_sample_index(valid);
+    if isempty(peak_sample_index)
+        return;
+    end
+
+    peak_maps = util.normalize_maps(peak_maps);
+    tf = true;
+end
+
+function idx = local_peak_finder_backfit_local(x, min_dist)
+    x = double(x(:)');
+    idx = [];
+    if numel(x) < 3
+        return;
+    end
+
+    cand = find(x(2:end-1) >= x(1:end-2) & x(2:end-1) > x(3:end)) + 1;
+    if isempty(cand)
+        [~, best] = max(x);
+        idx = best;
+        return;
+    end
+
+    [~, order] = sort(x(cand), 'descend');
+    cand = cand(order);
+    taken = false(size(x));
+    keep = false(size(cand));
+    for i = 1:numel(cand)
+        c = cand(i);
+        left = max(1, c - min_dist);
+        right = min(numel(x), c + min_dist);
+        if any(taken(left:right))
+            continue;
+        end
+        keep(i) = true;
+        taken(left:right) = true;
+    end
+    idx = sort(cand(keep), 'ascend');
+end
+
+function [tf, peak_maps, peak_sample_index] = supports_peak_backfit_local(Results, n_samples)
+    tf = false;
+    peak_maps = [];
+    peak_sample_index = [];
+    if ~isstruct(Results) || ~isfield(Results, 'maps_nc') || isempty(Results.maps_nc)
+        return;
+    end
+
+    peak_maps = double(Results.maps_nc);
+    if isfield(Results, 'idx_peaks') && ~isempty(Results.idx_peaks)
+        peak_sample_index = double(Results.idx_peaks(:));
+    elseif isfield(Results, 'backfit_support') && isstruct(Results.backfit_support) && ...
+            isfield(Results.backfit_support, 'peak_sample') && ~isempty(Results.backfit_support.peak_sample)
+        peak_sample_index = double(Results.backfit_support.peak_sample(:));
+    else
+        peak_sample_index = [];
+    end
+
+    if isempty(peak_sample_index)
+        peak_maps = [];
+        return;
+    end
+
+    n_keep = min(numel(peak_sample_index), size(peak_maps, 1));
+    peak_sample_index = peak_sample_index(1:n_keep);
+    peak_maps = peak_maps(1:n_keep, :);
+    valid = isfinite(peak_sample_index) & peak_sample_index >= 1 & peak_sample_index <= n_samples;
+    peak_sample_index = round(peak_sample_index(valid));
+    peak_maps = peak_maps(valid, :);
+    if isempty(peak_sample_index) || isempty(peak_maps)
+        peak_maps = [];
+        peak_sample_index = [];
+        return;
+    end
+
+    [peak_sample_index, sort_idx] = sort(peak_sample_index(:), 'ascend');
+    peak_maps = peak_maps(sort_idx, :);
+    [peak_sample_index, unique_idx] = unique(peak_sample_index, 'stable');
+    peak_maps = peak_maps(unique_idx, :);
+    tf = ~isempty(peak_sample_index) && ~isempty(peak_maps);
+end
+
+function [assignments, confidence] = interpolate_peak_assignments_local(peak_idx, peak_assignments, peak_confidence, n_samples)
+    assignments = nan(n_samples, 1);
+    confidence = nan(n_samples, 1);
+    if isempty(peak_idx)
+        return;
+    end
+
+    peak_idx = peak_idx(:);
+    peak_assignments = peak_assignments(:);
+    peak_confidence = peak_confidence(:);
+
+    if numel(peak_idx) == 1
+        assignments(:) = peak_assignments(1);
+        confidence(:) = peak_confidence(1);
+        return;
+    end
+
+    assignments(1:peak_idx(1)) = peak_assignments(1);
+    confidence(1:peak_idx(1)) = peak_confidence(1);
+    for i = 1:(numel(peak_idx) - 1)
+        left = peak_idx(i);
+        right = peak_idx(i + 1);
+        midpoint = floor((left + right) / 2);
+        assignments(left:min(midpoint, n_samples)) = peak_assignments(i);
+        confidence(left:min(midpoint, n_samples)) = peak_confidence(i);
+        assignments((midpoint + 1):min(right, n_samples)) = peak_assignments(i + 1);
+        confidence((midpoint + 1):min(right, n_samples)) = peak_confidence(i + 1);
+    end
+    assignments(peak_idx(end):n_samples) = peak_assignments(end);
+    confidence(peak_idx(end):n_samples) = peak_confidence(end);
+
+    if any(~isfinite(assignments))
+        missing = find(~isfinite(assignments));
+        assignments(missing) = peak_assignments(end);
+        confidence(missing) = peak_confidence(end);
+    end
 end

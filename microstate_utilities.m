@@ -123,6 +123,8 @@ function cfg = default_config_internal()
         'compute_backfit_diagnostics', true, ...
         'save_backfit_details', true, ...
         'template_alignment_strong_threshold', 0.5, ...
+        'clean_sanity_profile', true, ...
+        'clean_sanity_snr_db_threshold', 40, ...
         'validate_simulation', false, ...
         'preprocessing', struct('apply_average_reference', false, 'spatial_filter', 'none', 'reject_gfp_peak_outliers', false));
     cfg.plotting = struct( ...
@@ -405,6 +407,8 @@ function [maps_norm, idx_peaks, gfp_vec, n_maps, C_dims, maps_original, preproc_
     preproc_info.filter_band = cfg.filter_band;
     preproc_info.spatial_filter = cfg.spatial_filter;
     preproc_info.spatial_filter_info = spatial_filter_info;
+    preproc_info.gfp_peak_min_distance = cfg.gfp_peak_min_distance;
+    preproc_info.gfp_peak_threshold_schedule = cfg.gfp_peak_threshold_schedule;
     preproc_info.n_maps = n_maps;
     preproc_info.n_channels = C_dims;
 end
@@ -1125,12 +1129,16 @@ function display_name = format_criterion_name_internal(criterion_code)
             display_name = 'Free Energy Elbow';
         case 'elbow_sil_combined'
             display_name = 'Elbow+Silhouette';
+        case 'covariance'
+            display_name = 'Covariance';
         case 'covariance_elbow'
             display_name = 'Covariance Elbow';
         case 'free_energy_covariance'
             display_name = 'Free Energy+Covariance';
         case 'gev'
             display_name = 'GEV';
+        case {'calinski_harabasz_score', 'calinski_harabasz'}
+            display_name = 'Calinski-Harabasz';
         otherwise
             display_name = criterion_code;  % Fallback to original
     end
