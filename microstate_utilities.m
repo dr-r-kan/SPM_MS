@@ -3,6 +3,13 @@ function utils = microstate_utilities()
 %
 % Returns struct of function handles to avoid duplication
 
+    if exist('pop_loadset', 'file') ~= 2
+        eeglab_file = which('eeglab');
+        if ~isempty(eeglab_file)
+            addpath(genpath(fileparts(eeglab_file)));
+        end
+    end
+
     utils.preprocess_maps = @preprocess_maps_internal;
     utils.normalize_maps = @normalize_maps_internal;
     utils.bandpass_filter = @bandpass_fft_zero_phase_internal;

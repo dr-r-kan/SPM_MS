@@ -47,6 +47,71 @@ This loads an EEGLAB `.set` or MATLAB `.mat` file, applies the configured prepro
 
 The manifest must include `file_path`; `participant`, `condition`, and `group` are optional. The dataset workflow fits per-file solutions, clusters those solutions into dataset-level meta-microstates, and also writes pooled GFP-peak fits and subset summaries.
 
+### Hierarchical Dataset-Wise SPM-VB Fit
+
+```matlab
+[HResults, results_mat] = fit_microstate_hierarchical_dataset('LEMON', ...
+    'output_dir', 'outputs/lemon_hierarchical_spm_vb_all_peaks');
+```
+
+This is the direct dataset-wise hierarchy for participants, conditions, and groups. It accepts either a folder of `.set`/`.mat` files or a CSV manifest. A manifest must contain `file_path`; `participant`, `condition`, and `group` are optional. If no manifest is supplied, participant IDs are inferred from names such as `sub-032389_EC.set`, and LEMON-style condition labels are inferred as `EC` and `EO`.
+
+How it works:
+
+1. Loads each EEG file with EEGLAB or MATLAB loading.
+2. Keeps scalp channels when `use_scalp_channels=true`.
+3. Excludes channels in `exclude_channels`, default `{'PO9','PO10'}` for LEMON.
+4. Builds the fitting montage. By default, `interpolate_missing_channels=false`, so only channels common to all files are used. If `interpolate_missing_channels=true`, the densest retained montage is used and missing channels are filled by inverse-distance weighted interpolation from observed channel positions.
+5. Applies preprocessing before GFP extraction: average reference, optional spatial filter, temporal bandpass, GFP peak finding, and optional GFP outlier rejection.
+6. Keeps all GFP peaks by default. Use `max_maps_per_file` only for fast smoke runs.
+7. Pools the GFP peak maps across the whole dataset and fits the global model with SPM `spm_mix` over polarity-invariant PCA/projective features.
+8. Selects global `K` from `K_candidates` using `criterion`; the selected global `K` is then fixed for child fits.
+9. Fits groups, if a non-default `group` column exists, using the global templates as parent pseudo-prior maps.
+10. Fits conditions, if a non-default `condition` column exists, using the global templates as parent pseudo-prior maps.
+11. Fits pooled participants using the matching group templates when present, plus matching condition templates when present; otherwise it falls back to the global templates.
+12. Fits participant-condition nodes, so a LEMON participant with both recordings gets separate EC and EO fits. These are stored in `HResults.participant_conditions` and under `participant_conditions/<participant>/<condition>/`.
+13. Aligns every fitted solution to the MetaMaps template file, flips polarity where needed, and writes template-correlation quality columns.
+14. Backfits each participant-condition template to its matching full EEG record by default with `backfit_microstate_timecourse`, falling back to the pooled participant template only if the exact participant-condition node is missing.
+15. Optionally runs per-state axis-dynamics analysis on hard-backfit active samples.
+16. Writes backfit state, pairwise, record-summary, and optional axis-dynamics metric CSVs.
+
+The parent priors are passed to SPM by adding parent template maps to the peak-map bank `spm_prior_pseudocount` times before calling `spm_mix`. This keeps the implementation small and avoids forking SPM; it is a pseudo-prior over the fitted samples, not a modification of SPM's internal Dirichlet or mean-prior code.
+
+Useful switches:
+
+```matlab
+% Fast check: fixed K, capped peaks, no interpolation
+test_fit_microstate_hierarchical_dataset_smoke
+
+% Disable full-record backfitting and metric CSV export
+H = fit_microstate_hierarchical_dataset('LEMON', ...
+    'run_backfit', false);
+
+% Use densest montage and interpolate missing channels
+H = fit_microstate_hierarchical_dataset('LEMON', ...
+    'interpolate_missing_channels', true);
+
+% Add per-state active-axis PCA/precession metrics
+H = fit_microstate_hierarchical_dataset('LEMON', ...
+    'run_backfit_axis_dynamics', true);
+
+% Full LEMON sample run with all GFP peaks
+H = fit_microstate_hierarchical_dataset('LEMON', ...
+    'output_dir', 'outputs/lemon_hierarchical_spm_vb_all_peaks');
+```
+
+Main outputs under `output_dir`:
+
+- `hierarchical_microstate_results.mat`: full `HResults` structure.
+- `hierarchical_fit_summary.csv`: global/group/condition/participant/participant-condition rows with `K_estimated`, map counts, and template alignment scores.
+- `common_channels.csv`: final montage after scalp filtering, exclusions, and optional interpolation target selection.
+- `pooled_gfp_peak_manifest.csv`: every retained GFP peak with participant, condition, group, file, sample, and GFP value.
+- `participant_condition_state_backfit_metrics.csv`: per-record, per-state hard and Gaussian-mixture backfit metrics, including occupancy, percent present, mean GFP, occurrences, rate, and template match.
+- `participant_condition_state_pairwise_backfit_metrics.csv`: per-record, per-state-pair mutual information metrics for hard and Gaussian-mixture backfit traces.
+- `participant_condition_record_backfit_summary.csv`: per-record hard and Gaussian-mixture backfit availability plus entropy summaries.
+- `participant_condition_state_axis_dynamics.csv`: optional per-record, per-state hard-backfit active-axis metrics. For each participant/condition/state it takes the EEG samples assigned to that state, projects them onto the fitted microstate axis, reports projection energy/RMS/zero-crossing rate, runs PCA on the active maps, and estimates precession from the phase of the perpendicular residual in its first two-PC plane. Direction is reported with signed phase-speed columns plus `precession_directionality_index`; the sign depends on the residual PCA-plane convention, while the index is invariant to axis flips.
+- `global/`, `groups/`, `conditions/`, `participants/`, `participant_conditions/`: `.mat`, center `.csv`, model-comparison `.csv`, peak manifests, and topographic `.png` plots for each fitted node.
+
 ### Simulation Benchmark
 
 ```matlab
@@ -79,14 +144,16 @@ Important keys:
 
 - `run_benchmark_then_lemon_vb_pipeline.m`: public three-stage runner for simulation, simulation analysis, and LEMON SPM-VB.
 - `analyze_single_eeg_file.m`: single-file real EEG workflow.
+- `fit_microstate_hierarchical_dataset.m`: direct dataset-wise global/group/condition/participant/participant-condition SPM-VB hierarchy.
 - `metamicrostate_dataset_pipeline.m`: multi-file meta-microstate workflow.
+- `test_fit_microstate_hierarchical_dataset_smoke.m`: fast LEMON smoke check for the hierarchical SPM-VB fitter.
 - `simulated_ms_retrieval_experiment.m`: synthetic benchmark.
 - `analyze_comparison_results.m`: simulation-result analysis and plotting.
 - `summarize_first_line_spm_vb_metrics.m`: compact criterion summary for raw SPM-VB selectors.
 - `fit_microstate_*.m`: low-level microstate fitting engines.
 - `microstate_utilities.m`: shared preprocessing, geometry, config, sanitisation, and utility functions.
 - `plot_microstate_*.m`: plotting helpers for global/group/condition summaries.
-- `run_microstate_hierarchical_tanova.m`: non-parametric condition/group topography testing for dataset outputs.
+- `run_microstate_hierarchical_tanova.m`: non-parametric and Bayesian bootstrap condition/group topography testing for aligned dataset outputs.
 - `Koenig_code/`: exact vendored upstream files from Thomas Koenig's MICROSTATELAB repository, kept separate from locally adapted code.
 - `config/`: repository defaults.
 - `build_lemon_manifest.py`: manifest builder for LEMON-style `.set` collections.

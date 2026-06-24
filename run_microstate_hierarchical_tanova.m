@@ -45,12 +45,20 @@ function [TANOVA, results_csv] = run_microstate_hierarchical_tanova(results_mat,
 %                                      before computing dGFP. Default: true.
 %   'run_posthoc'                      Pairwise and simple-effect tests.
 %                                      Default: true.
+%   'run_bayesian'                     Bayesian bootstrap TANOVA summaries.
+%                                      Default: true.
+%   'n_posterior'                      Bayesian bootstrap draws. Default:
+%                                      same as n_permutations.
+%   'bayesian_rope'                    Region of practical equivalence for
+%                                      dGFP/RMS map-difference statistics.
+%                                      Default: 0.05.
 %   'save_plots'                       Save heatmap and topographic summaries.
 %                                      Default: true.
 %   'verbose'                          Print progress. Default: true.
 %
 % Outputs written:
 %   tanova_results.csv
+%   bayesian_tanova_results.csv
 %   tanova_participant_template_manifest.csv
 %   tanova_summary.mat
 %   tanova_methods_notes.txt
@@ -72,6 +80,10 @@ function [TANOVA, results_csv] = run_microstate_hierarchical_tanova(results_mat,
     addParameter(p, 'require_complete_within_subject', true, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'renormalise_factor_means', true, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'run_posthoc', true, @(x) islogical(x) && isscalar(x));
+    addParameter(p, 'run_bayesian', true, @(x) islogical(x) && isscalar(x));
+    addParameter(p, 'n_posterior', NaN, @(x) isnumeric(x) && isscalar(x) && (isnan(x) || x >= 1));
+    addParameter(p, 'bayesian_rope', 0.05, @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    addParameter(p, 'bayesian_results_csv', 'bayesian_tanova_results.csv', @(x) ischar(x) || isstring(x));
     addParameter(p, 'save_plots', true, @(x) islogical(x) && isscalar(x));
     addParameter(p, 'verbose', true, @(x) islogical(x) && isscalar(x));
     parse(p, results_mat, varargin{:});
@@ -79,6 +91,11 @@ function [TANOVA, results_csv] = run_microstate_hierarchical_tanova(results_mat,
     cfg.results_mat = char(cfg.results_mat);
     cfg.config_file = char(cfg.config_file);
     cfg.n_permutations = round(cfg.n_permutations);
+    if isnan(cfg.n_posterior)
+        cfg.n_posterior = cfg.n_permutations;
+    end
+    cfg.n_posterior = round(cfg.n_posterior);
+    cfg.bayesian_results_csv = char(cfg.bayesian_results_csv);
 
     if ~isfile(cfg.results_mat)
         error('Results MAT file not found: %s', cfg.results_mat);
@@ -142,32 +159,32 @@ function [TANOVA, results_csv] = run_microstate_hierarchical_tanova(results_mat,
 
     if D.has_group
         R = run_group_test(D, cfg, 'group', true(size(D.unit)), 'omnibus_group');
-        all_tables{end+1} = result_to_table(R); %#ok<AGROW>
-        notes{end+1} = R.note; %#ok<AGROW>
+        all_tables{end+1} = result_to_table(R);
+        notes{end+1} = R.note;
     else
-        notes{end+1} = 'No valid group factor detected; group TANOVA skipped.'; %#ok<AGROW>
+        notes{end+1} = 'No valid group factor detected; group TANOVA skipped.';
     end
 
     if D.has_condition
         R = run_condition_test(D, cfg, 'condition', true(size(D.unit)), 'omnibus_condition');
-        all_tables{end+1} = result_to_table(R); %#ok<AGROW>
-        notes{end+1} = R.note; %#ok<AGROW>
+        all_tables{end+1} = result_to_table(R);
+        notes{end+1} = R.note;
     else
-        notes{end+1} = 'No valid condition factor detected; condition TANOVA skipped.'; %#ok<AGROW>
+        notes{end+1} = 'No valid condition factor detected; condition TANOVA skipped.';
     end
 
     if D.has_group && D.has_condition
         R = run_interaction_test(D, cfg, 'group_x_condition', true(size(D.unit)), 'omnibus_interaction');
-        all_tables{end+1} = result_to_table(R); %#ok<AGROW>
-        notes{end+1} = R.note; %#ok<AGROW>
+        all_tables{end+1} = result_to_table(R);
+        notes{end+1} = R.note;
     else
-        notes{end+1} = 'Interaction TANOVA skipped because group and/or condition is absent.'; %#ok<AGROW>
+        notes{end+1} = 'Interaction TANOVA skipped because group and/or condition is absent.';
     end
 
     if cfg.run_posthoc
         posthoc_tables = run_posthoc_tests(D, cfg);
         for i = 1:numel(posthoc_tables)
-            all_tables{end+1} = posthoc_tables{i}; %#ok<AGROW>
+            all_tables{end+1} = posthoc_tables{i};
         end
     end
 
@@ -179,13 +196,23 @@ function [TANOVA, results_csv] = run_microstate_hierarchical_tanova(results_mat,
     results_csv = fullfile(cfg.output_dir, 'tanova_results.csv');
     writetable(results_table, results_csv);
 
+    bayesian_table = table();
+    bayesian_csv = '';
+    if cfg.run_bayesian
+        bayesian_table = run_bayesian_tanova_tests(D, cfg);
+        bayesian_csv = output_path(cfg.output_dir, cfg.bayesian_results_csv);
+        writetable(bayesian_table, bayesian_csv);
+    end
+
     TANOVA = struct();
     TANOVA.config = cfg;
     TANOVA.results = results_table;
+    TANOVA.bayesian_results = bayesian_table;
     TANOVA.participant_template_manifest = D.manifest;
     TANOVA.data = rmfield_if_present(D, {'X'});
     TANOVA.notes = notes(:);
     TANOVA.results_csv = results_csv;
+    TANOVA.bayesian_results_csv = bayesian_csv;
     TANOVA.manifest_csv = manifest_csv;
     TANOVA.created = datestr(now, 30);
 
@@ -200,6 +227,9 @@ function [TANOVA, results_csv] = run_microstate_hierarchical_tanova(results_mat,
     if cfg.verbose
         fprintf('\nDone.\n');
         fprintf('Results:  %s\n', results_csv);
+        if ~isempty(bayesian_csv)
+            fprintf('Bayesian: %s\n', bayesian_csv);
+        end
         fprintf('Manifest: %s\n', manifest_csv);
     end
 end
@@ -210,7 +240,9 @@ end
 
 function D = extract_participant_template_data(H, cfg)
     nodes = [];
-    if isfield(H, 'participants') && ~isempty(H.participants)
+    if isfield(H, 'participant_conditions') && ~isempty(H.participant_conditions) && nodes_have_nonempty_field(H.participant_conditions, 'condition')
+        nodes = H.participant_conditions;
+    elseif isfield(H, 'participants') && ~isempty(H.participants)
         nodes = H.participants;
     elseif isfield(H, 'participant_conditions') && ~isempty(H.participant_conditions)
         nodes = H.participant_conditions;
@@ -603,7 +635,7 @@ function posthoc_tables = run_posthoc_tests(D, cfg)
                 mask = D.group == gl(i) | D.group == gl(j);
                 name = sprintf('group_pair_%s_vs_%s', safe_label(gl(i)), safe_label(gl(j)));
                 R = run_group_test(D, cfg, name, mask, 'posthoc_group_pairwise');
-                posthoc_tables{end+1} = result_to_table(R); %#ok<AGROW>
+                posthoc_tables{end+1} = result_to_table(R);
             end
         end
     end
@@ -615,7 +647,7 @@ function posthoc_tables = run_posthoc_tests(D, cfg)
                 mask = D.condition == cl(i) | D.condition == cl(j);
                 name = sprintf('condition_pair_%s_vs_%s', safe_label(cl(i)), safe_label(cl(j)));
                 R = run_condition_test(D, cfg, name, mask, 'posthoc_condition_pairwise');
-                posthoc_tables{end+1} = result_to_table(R); %#ok<AGROW>
+                posthoc_tables{end+1} = result_to_table(R);
             end
         end
     end
@@ -627,15 +659,155 @@ function posthoc_tables = run_posthoc_tests(D, cfg)
             mask = D.group == gl(i);
             name = sprintf('condition_simple_effect_within_%s', safe_label(gl(i)));
             R = run_condition_test(D, cfg, name, mask, 'posthoc_simple_condition_within_group');
-            posthoc_tables{end+1} = result_to_table(R); %#ok<AGROW>
+            posthoc_tables{end+1} = result_to_table(R);
         end
         for i = 1:numel(cl)
             mask = D.condition == cl(i);
             name = sprintf('group_simple_effect_at_%s', safe_label(cl(i)));
             R = run_group_test(D, cfg, name, mask, 'posthoc_simple_group_within_condition');
-            posthoc_tables{end+1} = result_to_table(R); %#ok<AGROW>
+            posthoc_tables{end+1} = result_to_table(R);
         end
     end
+end
+
+% ======================================================================
+% Bayesian bootstrap TANOVA
+% ======================================================================
+
+function T = run_bayesian_tanova_tests(D, cfg)
+    tables = {};
+
+    if D.has_group
+        tables{end+1} = bayesian_group_test(D, cfg, 'group', true(size(D.unit)), 'bayesian_omnibus_group');
+    end
+    if D.has_condition
+        tables{end+1} = bayesian_condition_test(D, cfg, 'condition', true(size(D.unit)), 'bayesian_omnibus_condition');
+    end
+    if D.has_group && D.has_condition
+        tables{end+1} = bayesian_interaction_test(D, cfg, 'group_x_condition', true(size(D.unit)), 'bayesian_omnibus_interaction');
+    end
+
+    if cfg.run_posthoc
+        if D.has_group
+            gl = unique(D.group(D.group ~= ""));
+            for i = 1:numel(gl)
+                for j = i+1:numel(gl)
+                    mask = D.group == gl(i) | D.group == gl(j);
+                    name = sprintf('group_pair_%s_vs_%s', safe_label(gl(i)), safe_label(gl(j)));
+                    tables{end+1} = bayesian_group_test(D, cfg, name, mask, 'bayesian_posthoc_group_pairwise');
+                end
+            end
+        end
+        if D.has_condition
+            cl = unique(D.condition(D.condition ~= ""));
+            for i = 1:numel(cl)
+                for j = i+1:numel(cl)
+                    mask = D.condition == cl(i) | D.condition == cl(j);
+                    name = sprintf('condition_pair_%s_vs_%s', safe_label(cl(i)), safe_label(cl(j)));
+                    tables{end+1} = bayesian_condition_test(D, cfg, name, mask, 'bayesian_posthoc_condition_pairwise');
+                end
+            end
+        end
+        if D.has_group && D.has_condition
+            gl = unique(D.group(D.group ~= ""));
+            cl = unique(D.condition(D.condition ~= ""));
+            for i = 1:numel(gl)
+                mask = D.group == gl(i);
+                name = sprintf('condition_simple_effect_within_%s', safe_label(gl(i)));
+                tables{end+1} = bayesian_condition_test(D, cfg, name, mask, 'bayesian_simple_condition_within_group');
+            end
+            for i = 1:numel(cl)
+                mask = D.condition == cl(i);
+                name = sprintf('group_simple_effect_at_%s', safe_label(cl(i)));
+                tables{end+1} = bayesian_group_test(D, cfg, name, mask, 'bayesian_simple_group_within_condition');
+            end
+        end
+    end
+
+    T = vertcat_nonempty_tables(tables);
+    if isempty(T)
+        T = empty_bayesian_table();
+    end
+end
+
+function T = bayesian_group_test(D, cfg, effect_name, mask, test_kind)
+    note = '';
+    D2 = subset_D(D, mask);
+    if D2.has_condition && cfg.require_complete_within_subject
+        complete_units = units_with_all_conditions(D2.unit, D2.condition);
+        D2 = subset_D(D2, ismember(D2.unit, complete_units));
+        note = sprintf('Bayesian group test uses condition-complete units only: %d units retained.', numel(unique(D2.unit)));
+    end
+    if isempty(D2.X) || numel(unique(D2.group(D2.group ~= ""))) < 2
+        T = empty_bayesian_result(effect_name, test_kind, D.K, 'Insufficient group levels.', cfg);
+        return;
+    end
+
+    [Xu, group_u, unit_u] = collapse_to_unit(D2.X, D2.unit, D2.group, D2.global_ref);
+    if size(Xu, 1) < 3 || numel(unique(group_u)) < 2
+        T = empty_bayesian_result(effect_name, test_kind, D.K, 'Insufficient independent units after collapse.', cfg);
+        return;
+    end
+
+    obs = stat_main_effect(Xu, group_u, cfg.renormalise_factor_means);
+    draws = nan(cfg.n_posterior, D.K);
+    for b = 1:cfg.n_posterior
+        row_weights = bayesian_group_row_weights(group_u);
+        draws(b, :) = stat_main_effect_weighted(Xu, group_u, row_weights, cfg.renormalise_factor_means);
+    end
+    T = bayesian_result_to_table(effect_name, test_kind, 'bayesian_bootstrap_between_group', obs, draws, ...
+        unique(group_u), numel(unit_u), size(Xu, 1), cfg, note);
+end
+
+function T = bayesian_condition_test(D, cfg, effect_name, mask, test_kind)
+    D2 = subset_D(D, mask);
+    if cfg.require_complete_within_subject
+        complete_units = units_with_all_conditions(D2.unit, D2.condition);
+        D2 = subset_D(D2, ismember(D2.unit, complete_units));
+        note = sprintf('Bayesian condition test uses condition-complete units only: %d units retained.', numel(unique(D2.unit)));
+    else
+        keep_units = units_with_at_least_n_conditions(D2.unit, D2.condition, 2);
+        D2 = subset_D(D2, ismember(D2.unit, keep_units));
+        note = sprintf('Bayesian condition test uses units with at least two conditions: %d units retained.', numel(unique(D2.unit)));
+    end
+    if isempty(D2.X) || numel(unique(D2.condition(D2.condition ~= ""))) < 2
+        T = empty_bayesian_result(effect_name, test_kind, D.K, 'Insufficient within-unit condition data after filtering.', cfg);
+        return;
+    end
+
+    obs = stat_main_effect(D2.X, D2.condition, cfg.renormalise_factor_means);
+    draws = nan(cfg.n_posterior, D.K);
+    units = unique(D2.unit, 'stable');
+    for b = 1:cfg.n_posterior
+        row_weights = row_weights_from_unit_weights(D2.unit, units, draw_dirichlet(numel(units)));
+        draws(b, :) = stat_main_effect_weighted(D2.X, D2.condition, row_weights, cfg.renormalise_factor_means);
+    end
+    T = bayesian_result_to_table(effect_name, test_kind, 'bayesian_bootstrap_within_unit_condition', obs, draws, ...
+        unique(D2.condition), numel(units), size(D2.X, 1), cfg, note);
+end
+
+function T = bayesian_interaction_test(D, cfg, effect_name, mask, test_kind)
+    D2 = subset_D(D, mask);
+    if cfg.require_complete_within_subject
+        complete_units = units_with_all_conditions(D2.unit, D2.condition);
+        D2 = subset_D(D2, ismember(D2.unit, complete_units));
+        note = sprintf('Bayesian interaction test uses condition-complete units only: %d units retained.', numel(unique(D2.unit)));
+    else
+        note = 'Bayesian interaction test allows incomplete within-unit condition data; interpret cautiously.';
+    end
+    if isempty(D2.X) || numel(unique(D2.group(D2.group ~= ""))) < 2 || numel(unique(D2.condition(D2.condition ~= ""))) < 2 || ~all_cells_present(D2.group, D2.condition)
+        T = empty_bayesian_result(effect_name, test_kind, D.K, 'Insufficient group-by-condition cells.', cfg);
+        return;
+    end
+
+    obs = stat_interaction(D2.X, D2.group, D2.condition, cfg.renormalise_factor_means);
+    draws = nan(cfg.n_posterior, D.K);
+    for b = 1:cfg.n_posterior
+        row_weights = bayesian_grouped_unit_row_weights(D2.unit, D2.group);
+        draws(b, :) = stat_interaction_weighted(D2.X, D2.group, D2.condition, row_weights, cfg.renormalise_factor_means);
+    end
+    T = bayesian_result_to_table(effect_name, test_kind, 'bayesian_bootstrap_grouped_units', obs, draws, ...
+        unique(D2.group + " x " + D2.condition), numel(unique(D2.unit)), size(D2.X, 1), cfg, note);
 end
 
 % ======================================================================
@@ -705,10 +877,106 @@ function stat = stat_interaction(X, group_labels, condition_labels, renorm_level
                     continue;
                 end
                 r = cell_map - squeeze(row_mean(g, k, :))' - squeeze(col_mean(c, k, :))' + squeeze(grand(k, :));
-                residuals = [residuals, r]; %#ok<AGROW>
+                residuals = [residuals, r];
             end
         end
         stat(k) = sqrt(mean(residuals .^ 2, 'omitnan'));
+    end
+end
+
+function stat = stat_main_effect_weighted(X, labels, row_weights, renorm_level_means)
+    labels = string(labels(:));
+    row_weights = double(row_weights(:));
+    levels = unique(labels(labels ~= ""), 'stable');
+    K = size(X, 2);
+    C = size(X, 3);
+    M = nan(numel(levels), K, C);
+    for l = 1:numel(levels)
+        idx = labels == levels(l);
+        M(l, :, :) = weighted_mean_maps(X(idx, :, :), row_weights(idx));
+    end
+    if renorm_level_means
+        M = normalise_level_maps(M);
+    end
+    G = squeeze(mean(M, 1, 'omitnan'));
+    stat = nan(1, K);
+    for k = 1:K
+        A = squeeze(M(:, k, :));
+        g = G(k, :);
+        D = A - repmat(g, size(A, 1), 1);
+        stat(k) = sqrt(mean(D(:) .^ 2, 'omitnan'));
+    end
+end
+
+function stat = stat_interaction_weighted(X, group_labels, condition_labels, row_weights, renorm_level_means)
+    group_labels = string(group_labels(:));
+    condition_labels = string(condition_labels(:));
+    row_weights = double(row_weights(:));
+    groups = unique(group_labels(group_labels ~= ""), 'stable');
+    conds = unique(condition_labels(condition_labels ~= ""), 'stable');
+    K = size(X, 2);
+    C = size(X, 3);
+    Cell = nan(numel(groups), numel(conds), K, C);
+
+    for g = 1:numel(groups)
+        for c = 1:numel(conds)
+            idx = group_labels == groups(g) & condition_labels == conds(c);
+            if any(idx)
+                Cell(g, c, :, :) = weighted_mean_maps(X(idx, :, :), row_weights(idx));
+            end
+        end
+    end
+    if renorm_level_means
+        for g = 1:numel(groups)
+            for c = 1:numel(conds)
+                M = squeeze(Cell(g, c, :, :));
+                Cell(g, c, :, :) = normalise_maps_2d(M);
+            end
+        end
+    end
+
+    row_mean = squeeze(mean(Cell, 2, 'omitnan'));
+    col_mean = squeeze(mean(Cell, 1, 'omitnan'));
+    grand = squeeze(mean(mean(Cell, 1, 'omitnan'), 2, 'omitnan'));
+
+    stat = nan(1, K);
+    for k = 1:K
+        residuals = [];
+        for g = 1:numel(groups)
+            for c = 1:numel(conds)
+                cell_map = squeeze(Cell(g, c, k, :))';
+                if any(~isfinite(cell_map))
+                    continue;
+                end
+                r = cell_map - squeeze(row_mean(g, k, :))' - squeeze(col_mean(c, k, :))' + squeeze(grand(k, :));
+                residuals = [residuals, r];
+            end
+        end
+        stat(k) = sqrt(mean(residuals .^ 2, 'omitnan'));
+    end
+end
+
+function M = weighted_mean_maps(X, weights)
+    if isempty(X)
+        M = nan(size(X, 2), size(X, 3));
+        return;
+    end
+    weights = double(weights(:));
+    weights(~isfinite(weights) | weights < 0) = 0;
+    if sum(weights) <= eps
+        weights = ones(size(weights));
+    end
+    weights = weights ./ sum(weights);
+    W = reshape(weights, [], 1, 1);
+    valid = isfinite(X);
+    X0 = X;
+    X0(~valid) = 0;
+    num = squeeze(sum(bsxfun(@times, X0, W), 1));
+    den = squeeze(sum(bsxfun(@times, double(valid), W), 1));
+    den(den <= eps) = NaN;
+    M = num ./ den;
+    if isvector(M)
+        M = reshape(M, size(X, 2), size(X, 3));
     end
 end
 
@@ -855,6 +1123,84 @@ function T = result_to_table(R)
         permutation_scheme, levels, n_units, n_observations, n_permutations, note);
 end
 
+function T = bayesian_result_to_table(effect_name, test_kind, bootstrap_scheme, obs, draws, levels, n_units, n_observations, cfg, note)
+    K = numel(obs);
+    rope = double(cfg.bayesian_rope);
+    effect = repmat({char(effect_name)}, K, 1);
+    test_kind_col = repmat({char(test_kind)}, K, 1);
+    state = (1:K)';
+    statistic = obs(:);
+    posterior_mean = mean(draws, 1, 'omitnan')';
+    posterior_sd = std(draws, 0, 1, 'omitnan')';
+    posterior_median = median(draws, 1, 'omitnan')';
+    posterior_ci_lower = percentile_cols(draws, 2.5)';
+    posterior_ci_upper = percentile_cols(draws, 97.5)';
+    bayesian_rope = repmat(rope, K, 1);
+    posterior_prob_gt_rope = mean(draws > rope, 1, 'omitnan')';
+    posterior_prob_le_rope = mean(draws <= rope, 1, 'omitnan')';
+    evidence_ratio_gt_rope = safe_ratio(posterior_prob_gt_rope, posterior_prob_le_rope);
+    bootstrap_scheme_col = repmat({char(bootstrap_scheme)}, K, 1);
+    levels_col = repmat({strjoin(cellstr(string(levels(:))), '|')}, K, 1);
+    n_units_col = repmat(n_units, K, 1);
+    n_observations_col = repmat(n_observations, K, 1);
+    n_posterior = repmat(size(draws, 1), K, 1);
+    note_col = repmat({char(note)}, K, 1);
+
+    T = table(effect, test_kind_col, state, statistic, posterior_mean, posterior_sd, ...
+        posterior_median, posterior_ci_lower, posterior_ci_upper, bayesian_rope, ...
+        posterior_prob_gt_rope, posterior_prob_le_rope, evidence_ratio_gt_rope, ...
+        bootstrap_scheme_col, levels_col, n_units_col, n_observations_col, n_posterior, note_col, ...
+        'VariableNames', {'effect', 'test_kind', 'state', 'statistic', 'posterior_mean', 'posterior_sd', ...
+        'posterior_median', 'posterior_ci_lower', 'posterior_ci_upper', 'bayesian_rope', ...
+        'posterior_prob_gt_rope', 'posterior_prob_le_rope', 'evidence_ratio_gt_rope', ...
+        'bootstrap_scheme', 'levels', 'n_units', 'n_observations', 'n_posterior', 'note'});
+end
+
+function T = empty_bayesian_result(effect_name, test_kind, K, note, cfg)
+    draws = nan(cfg.n_posterior, K);
+    obs = nan(1, K);
+    T = bayesian_result_to_table(effect_name, test_kind, 'not_run', obs, draws, strings(0, 1), 0, 0, cfg, note);
+end
+
+function T = empty_bayesian_table()
+    T = table(cell(0,1), cell(0,1), zeros(0,1), zeros(0,1), zeros(0,1), zeros(0,1), ...
+        zeros(0,1), zeros(0,1), zeros(0,1), zeros(0,1), zeros(0,1), zeros(0,1), zeros(0,1), ...
+        cell(0,1), cell(0,1), zeros(0,1), zeros(0,1), zeros(0,1), cell(0,1), ...
+        'VariableNames', {'effect', 'test_kind', 'state', 'statistic', 'posterior_mean', 'posterior_sd', ...
+        'posterior_median', 'posterior_ci_lower', 'posterior_ci_upper', 'bayesian_rope', ...
+        'posterior_prob_gt_rope', 'posterior_prob_le_rope', 'evidence_ratio_gt_rope', ...
+        'bootstrap_scheme', 'levels', 'n_units', 'n_observations', 'n_posterior', 'note'});
+end
+
+function p = percentile_cols(X, pct)
+    p = nan(1, size(X, 2));
+    for k = 1:size(X, 2)
+        x = X(:, k);
+        x = sort(x(isfinite(x)));
+        if isempty(x)
+            continue;
+        end
+        pos = 1 + (numel(x) - 1) * pct / 100;
+        lo = floor(pos);
+        hi = ceil(pos);
+        if lo == hi
+            p(k) = x(lo);
+        else
+            p(k) = x(lo) * (hi - pos) + x(hi) * (pos - lo);
+        end
+    end
+end
+
+function r = safe_ratio(num, den)
+    r = nan(size(num));
+    for i = 1:numel(num)
+        if ~isfinite(num(i)) || ~isfinite(den(i))
+            continue;
+        end
+        r(i) = (num(i) + eps) ./ (den(i) + eps);
+    end
+end
+
 function T = vertcat_nonempty_tables(tables)
     keep = false(numel(tables), 1);
     for i = 1:numel(tables)
@@ -867,7 +1213,7 @@ function T = vertcat_nonempty_tables(tables)
     tables = tables(keep);
     T = tables{1};
     for i = 2:numel(tables)
-        T = [T; tables{i}]; %#ok<AGROW>
+        T = [T; tables{i}];
     end
 end
 
@@ -1034,6 +1380,8 @@ function write_methods_notes(file_path, TANOVA, H)
         fprintf(fid, 'Hierarchy: %s\n', H.hierarchy.description);
     end
     fprintf(fid, 'Permutations: %d\n', cfg.n_permutations);
+    fprintf(fid, 'Bayesian bootstrap draws: %d\n', cfg.n_posterior);
+    fprintf(fid, 'Bayesian ROPE: %.6f dGFP/RMS units\n', cfg.bayesian_rope);
     fprintf(fid, 'Alpha: %.4f\n', cfg.alpha);
     fprintf(fid, 'Exclude inherited participant nodes: %s\n', tf(cfg.exclude_inherited_nodes));
     fprintf(fid, 'Require complete within-subject condition data: %s\n', tf(cfg.require_complete_within_subject));
@@ -1043,6 +1391,13 @@ function write_methods_notes(file_path, TANOVA, H)
     fprintf(fid, '- Because the analysed objects are microstate templates, polarity was aligned to the global template before testing.\n');
     fprintf(fid, '- p_max_state controls each effect across the selected K microstate classes using a max-statistic.\n');
     fprintf(fid, '- q_bh_* columns are provided as secondary summaries and should not replace the permutation max-statistic for the primary claim.\n\n');
+    fprintf(fid, 'Bayesian bootstrap interpretation:\n');
+    fprintf(fid, '- bayesian_tanova_results.csv uses the same aligned dGFP/RMS statistics as TANOVA.\n');
+    fprintf(fid, '- Posterior uncertainty is estimated by Bayesian bootstrap weights over independent units.\n');
+    fprintf(fid, '- Condition effects share one bootstrap weight across each participant/unit, preserving pairing.\n');
+    fprintf(fid, '- Group effects bootstrap units within groups; interactions bootstrap units within groups and preserve condition pairing.\n');
+    fprintf(fid, '- posterior_prob_gt_rope is the posterior probability that the topographic effect exceeds the configured ROPE.\n');
+    fprintf(fid, '- evidence_ratio_gt_rope is posterior_prob_gt_rope / posterior_prob_le_rope, an evidence ratio against practical equivalence rather than a marginal-likelihood Bayes factor.\n\n');
     fprintf(fid, 'Runtime notes:\n');
     for i = 1:numel(TANOVA.notes)
         fprintf(fid, '- %s\n', TANOVA.notes{i});
@@ -1069,10 +1424,74 @@ function D2 = subset_D(D, mask)
     D2.has_condition = valid_factor_present(D2.condition) && numel(unique(D2.condition(D2.condition ~= ""))) >= 2;
 end
 
+function weights = bayesian_group_row_weights(labels)
+    labels = string(labels(:));
+    weights = zeros(numel(labels), 1);
+    levels = unique(labels(labels ~= ""), 'stable');
+    for i = 1:numel(levels)
+        idx = find(labels == levels(i));
+        weights(idx) = draw_dirichlet(numel(idx));
+    end
+end
+
+function weights = bayesian_grouped_unit_row_weights(units, groups)
+    units = string(units(:));
+    groups = string(groups(:));
+    weights = zeros(numel(units), 1);
+    group_levels = unique(groups(groups ~= ""), 'stable');
+    for g = 1:numel(group_levels)
+        units_g = unique(units(groups == group_levels(g)), 'stable');
+        unit_weights = draw_dirichlet(numel(units_g));
+        weights = weights + row_weights_from_unit_weights(units, units_g, unit_weights);
+    end
+end
+
+function weights = row_weights_from_unit_weights(units, unit_levels, unit_weights)
+    units = string(units(:));
+    unit_levels = string(unit_levels(:));
+    unit_weights = double(unit_weights(:));
+    weights = zeros(numel(units), 1);
+    for i = 1:numel(unit_levels)
+        idx = find(units == unit_levels(i));
+        if isempty(idx)
+            continue;
+        end
+        weights(idx) = unit_weights(i);
+    end
+end
+
+function w = draw_dirichlet(n)
+    if n <= 0
+        w = zeros(0, 1);
+        return;
+    end
+    x = -log(max(rand(n, 1), realmin));
+    s = sum(x);
+    if s <= eps
+        w = ones(n, 1) ./ n;
+    else
+        w = x ./ s;
+    end
+end
+
 function present = valid_factor_present(x)
     x = string(x(:));
     x = x(strlength(x) > 0 & x ~= "" & ~ismissing(x));
     present = numel(unique(x)) >= 1;
+end
+
+function present = nodes_have_nonempty_field(nodes, field_name)
+    present = false;
+    if ~isstruct(nodes) || ~isfield(nodes, field_name)
+        return;
+    end
+    for i = 1:numel(nodes)
+        val = string(get_field_or(nodes(i), field_name, ''));
+        if strlength(strtrim(val)) > 0 && ~ismissing(val)
+            present = true;
+            return;
+        end
+    end
 end
 
 function varies = participant_factor_varies(participant, factor)
@@ -1151,5 +1570,14 @@ function out_dir = default_output_dir(results_mat, config_file)
     end
     if isempty(out_dir)
         out_dir = fullfile(fileparts(results_mat), 'tanova');
+    end
+end
+
+function path_out = output_path(output_dir, file_name)
+    file_name = char(string(file_name));
+    if startsWith(file_name, filesep) || ~isempty(regexp(file_name, '^[A-Za-z]:[\\/]', 'once'))
+        path_out = file_name;
+    else
+        path_out = fullfile(output_dir, file_name);
     end
 end
