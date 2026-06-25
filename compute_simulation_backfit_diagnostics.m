@@ -66,13 +66,14 @@ function diagnostics = compute_simulation_backfit_diagnostics(Sim, Results, temp
     true_top_idx = dominant_state_index(true_state_weights);
     overlap_mask = sum(true_state_weights > 1e-6, 2) > 1;
 
-    true_state_labels = alignment_labels_or_fallback(true_alignment, size(Sim.maps_true, 1), 'T');
+    true_state_labels = true_labels_from_sim_or_alignment(Sim, true_alignment, size(Sim.maps_true, 1));
     est_state_labels = alignment_labels_or_fallback(estimated_alignment, size(Results.centers, 1), 'E');
     template_order = template_order_union(true_alignment, estimated_alignment, true_state_labels, est_state_labels);
 
     est_to_true_idx = estimated_to_true_state_map(Sim.maps_true, Results.centers, util);
     true_label_weights = aggregate_weights_by_label(true_state_weights, true_state_labels, template_order);
     true_top_label_idx = dominant_state_index(true_label_weights);
+    cluster = summarise_cluster_identity(Sim, Results, true_state_labels, est_state_labels, template_order);
 
     hard = summarise_backfit_mode(backfit.hard.weights, est_to_true_idx, est_state_labels, ...
         true_state_weights, true_top_idx, true_label_weights, true_top_label_idx, template_order, overlap_mask);
@@ -103,8 +104,11 @@ function diagnostics = compute_simulation_backfit_diagnostics(Sim, Results, temp
     diagnostics.estimated_to_true_state_index = est_to_true_idx(:);
     diagnostics.true_alignment = true_alignment;
     diagnostics.estimated_alignment = estimated_alignment;
+    diagnostics.cluster = cluster;
     diagnostics.hard = hard;
     diagnostics.mixture = mixture;
+    diagnostics.cluster_confusion_counts = cluster.label_confusion_counts;
+    diagnostics.cluster_confusion_row_normalized = cluster.label_confusion_row_normalized;
 
     % Preserve legacy top-level fields for existing consumers.
     diagnostics.coverage_true = hard.coverage_true(:);
@@ -157,6 +161,8 @@ function summary = summarise_backfit_mode(est_cluster_weights, est_to_true_idx, 
     summary.label_weight_mae = mean(abs(pred_label_weights - true_label_weights), 'all');
     summary.cluster_weight_mae_overlap = masked_weight_mae(pred_true_weights, true_state_weights, overlap_mask);
     summary.label_weight_mae_overlap = masked_weight_mae(pred_label_weights, true_label_weights, overlap_mask);
+    summary.cluster_pair_accuracy_overlap = masked_pair_accuracy(pred_true_weights, true_state_weights, overlap_mask);
+    summary.label_pair_accuracy_overlap = masked_pair_accuracy(pred_label_weights, true_label_weights, overlap_mask);
     summary.coverage_true = coverage_true(:);
     summary.coverage_estimated = coverage_est(:);
     summary.coverage_difference = coverage_est(:) - coverage_true(:);
@@ -185,6 +191,8 @@ function summary = empty_mode_summary(n_labels, K_true)
         'label_weight_mae', NaN, ...
         'cluster_weight_mae_overlap', NaN, ...
         'label_weight_mae_overlap', NaN, ...
+        'cluster_pair_accuracy_overlap', NaN, ...
+        'label_pair_accuracy_overlap', NaN, ...
         'coverage_true', nan(n_labels, 1), ...
         'coverage_estimated', nan(n_labels, 1), ...
         'coverage_difference', nan(n_labels, 1), ...
@@ -260,6 +268,69 @@ function labels = alignment_labels_or_fallback(alignment, n_states, prefix)
     end
 end
 
+function labels = true_labels_from_sim_or_alignment(Sim, alignment, n_states)
+    if isfield(Sim, 'true_template_labels') && numel(Sim.true_template_labels) >= n_states
+        raw = cellstr(string(Sim.true_template_labels));
+        labels = raw(1:n_states);
+        labels = labels(:);
+        return;
+    end
+    labels = alignment_labels_or_fallback(alignment, n_states, 'T');
+end
+
+function summary = summarise_cluster_identity(Sim, Results, true_labels, est_labels, label_order)
+    K_true = numel(true_labels);
+    K_est = numel(est_labels);
+    metrics = [];
+    if isfield(Results, 'recovery_metrics') && isstruct(Results.recovery_metrics)
+        metrics = Results.recovery_metrics;
+    elseif isfield(Sim, 'maps_true') && isfield(Results, 'centers') && ~isempty(Sim.maps_true) && ~isempty(Results.centers)
+        metrics = microstate_partial_alignment(Sim.maps_true, Results.centers, ...
+            'distance_type', 'cosine', 'threshold', 0.0, 'polarity', true);
+    end
+
+    pairs = zeros(0, 2);
+    if isstruct(metrics) && isfield(metrics, 'match_assignment') && ~isempty(metrics.match_assignment)
+        pairs = double(metrics.match_assignment(:, 1:2));
+    end
+
+    counts = zeros(numel(label_order), numel(label_order));
+    is_label_match = false(size(pairs, 1), 1);
+    similarities = nan(size(pairs, 1), 1);
+    for i = 1:size(pairs, 1)
+        est_idx = pairs(i, 1);
+        true_idx = pairs(i, 2);
+        if true_idx < 1 || true_idx > K_true || est_idx < 1 || est_idx > K_est
+            continue;
+        end
+        row = find(strcmp(label_order, true_labels{true_idx}), 1, 'first');
+        col = find(strcmp(label_order, est_labels{est_idx}), 1, 'first');
+        if ~isempty(row) && ~isempty(col)
+            counts(row, col) = counts(row, col) + 1;
+        end
+        is_label_match(i) = strcmp(true_labels{true_idx}, est_labels{est_idx});
+        if isstruct(metrics) && isfield(metrics, 'similarity_matrix') && ...
+                size(metrics.similarity_matrix, 1) >= est_idx && size(metrics.similarity_matrix, 2) >= true_idx
+            similarities(i) = metrics.similarity_matrix(est_idx, true_idx);
+        end
+    end
+
+    row_sums = sum(counts, 2);
+    denom = max([K_true, K_est, 1]);
+    summary = struct();
+    summary.identity_accuracy = sum(is_label_match) / denom;
+    summary.identity_accuracy_matched = mean(double(is_label_match), 'omitnan');
+    summary.n_label_matches = sum(is_label_match);
+    summary.n_matched = size(pairs, 1);
+    summary.n_unmatched_true = K_true - numel(unique(pairs(:, 2)));
+    summary.n_unmatched_estimated = K_est - numel(unique(pairs(:, 1)));
+    summary.mean_matched_similarity = mean(similarities, 'omitnan');
+    summary.label_confusion_counts = counts;
+    summary.label_confusion_row_normalized = counts ./ max(row_sums, 1);
+    summary.matched_pairs = pairs;
+    summary.match_similarities = similarities;
+end
+
 function order = template_order_union(true_alignment, est_alignment, true_labels, est_labels)
     order = {};
     if isstruct(true_alignment) && isfield(true_alignment, 'template_labels') && ~isempty(true_alignment.template_labels)
@@ -295,4 +366,34 @@ function val = masked_weight_mae(pred_weights, true_weights, mask)
         return;
     end
     val = mean(abs(pred_weights(mask, :) - true_weights(mask, :)), 'all');
+end
+
+function acc = masked_pair_accuracy(pred_weights, true_weights, mask)
+    rows = find(mask(:));
+    if isempty(rows)
+        acc = NaN;
+        return;
+    end
+    correct = false(numel(rows), 1);
+    usable = false(numel(rows), 1);
+    for i = 1:numel(rows)
+        r = rows(i);
+        true_active = find(true_weights(r, :) > 1e-6);
+        n_active = numel(true_active);
+        if n_active < 2
+            continue;
+        end
+        [pred_vals, pred_order] = sort(pred_weights(r, :), 'descend');
+        if numel(pred_order) < n_active || pred_vals(n_active) <= 1e-6
+            usable(i) = true;
+            continue;
+        end
+        usable(i) = true;
+        correct(i) = isequal(sort(true_active), sort(pred_order(1:n_active)));
+    end
+    if ~any(usable)
+        acc = NaN;
+    else
+        acc = mean(correct(usable));
+    end
 end

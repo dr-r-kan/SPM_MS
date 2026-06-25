@@ -96,6 +96,9 @@ function [tf, peak_maps, peak_labels] = supports_mixture_backfit(Results)
     if ~isstruct(Results) || ~isfield(Results, 'centers') || isempty(Results.centers)
         return;
     end
+    if ~isfield(Results, 'method') || ~strcmpi(char(string(Results.method)), 'spm_vb')
+        return;
+    end
     if ~isfield(Results, 'maps_nc') || isempty(Results.maps_nc)
         return;
     end

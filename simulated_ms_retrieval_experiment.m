@@ -67,6 +67,8 @@ function T = simulated_ms_retrieval_experiment(varargin)
     addParameter(p, 'compute_backfit_diagnostics', logical(util.get_field(sim_defaults, 'compute_backfit_diagnostics', true)), @islogical);
     addParameter(p, 'save_backfit_details', logical(util.get_field(sim_defaults, 'save_backfit_details', true)), @islogical);
     addParameter(p, 'template_alignment_strong_threshold', double(util.get_field(sim_defaults, 'template_alignment_strong_threshold', 0.5)), @isnumeric);
+    addParameter(p, 'randomize_true_templates', logical(util.get_field(sim_defaults, 'randomize_true_templates', true)), @islogical);
+    addParameter(p, 'true_template_pool_K', double(util.get_field(sim_defaults, 'true_template_pool_K', 7)), @isnumeric);
     addParameter(p, 'clean_sanity_profile', logical(util.get_field(sim_defaults, 'clean_sanity_profile', true)), @islogical);
     addParameter(p, 'clean_sanity_snr_db_threshold', double(util.get_field(sim_defaults, 'clean_sanity_snr_db_threshold', 40)), @isnumeric);
     addParameter(p, 'validate_simulation', logical(sim_defaults.validate_simulation), @islogical);
@@ -230,7 +232,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
         % ===== STEP 1: GENERATE one EEG (full montage, 71 channels) =====
         try
             sim_seed = 42 + rep*1000 + K_true*100 + round((SNR_dB+10)*10);
-            sim_opts = build_simulation_options(CONFIG, overlap_prob, SNR_dB);
+            sim_opts = build_simulation_options(CONFIG, overlap_prob, SNR_dB, rep, K_true);
             [Sim, ~, ~] = generate_microstate_eeg(K_true, SNR_dB, CONFIG.duration_s, ...
                 CONFIG.sfreq, sim_seed, sim_opts);
             if CONFIG.validate_simulation && exist('validate_simulated_eeg_representativeness', 'file') == 2
@@ -421,6 +423,14 @@ function T = simulated_ms_retrieval_experiment(varargin)
                     backfit_mix_label_top1_accuracy_overlap = NaN;
                     backfit_mix_label_weight_mae = NaN;
                     backfit_mix_label_weight_mae_overlap = NaN;
+                    cluster_identity_accuracy = NaN;
+                    cluster_identity_accuracy_matched = NaN;
+                    cluster_n_label_matches = NaN;
+                    cluster_mean_matched_similarity = NaN;
+                    backfit_hard_cluster_pair_accuracy_overlap = NaN;
+                    backfit_hard_label_pair_accuracy_overlap = NaN;
+                    backfit_mix_cluster_pair_accuracy_overlap = NaN;
+                    backfit_mix_label_pair_accuracy_overlap = NaN;
                     selected_cov_trace_mean = NaN;
                     selected_cov_trace_median = NaN;
                     selected_cov_logdet_mean = NaN;
@@ -463,6 +473,10 @@ function T = simulated_ms_retrieval_experiment(varargin)
                                 backfit_hard_label_top1_accuracy_overlap = BackfitDiagnostics.hard.label_top1_accuracy_overlap;
                                 backfit_hard_label_weight_mae = BackfitDiagnostics.hard.label_weight_mae;
                                 backfit_hard_label_weight_mae_overlap = BackfitDiagnostics.hard.label_weight_mae_overlap;
+                                if isfield(BackfitDiagnostics.hard, 'cluster_pair_accuracy_overlap')
+                                    backfit_hard_cluster_pair_accuracy_overlap = BackfitDiagnostics.hard.cluster_pair_accuracy_overlap;
+                                    backfit_hard_label_pair_accuracy_overlap = BackfitDiagnostics.hard.label_pair_accuracy_overlap;
+                                end
                             end
                             if isfield(BackfitDiagnostics, 'mixture') && isstruct(BackfitDiagnostics.mixture)
                                 backfit_mix_available = isfield(BackfitDiagnostics.mixture, 'available') && BackfitDiagnostics.mixture.available;
@@ -472,6 +486,16 @@ function T = simulated_ms_retrieval_experiment(varargin)
                                 backfit_mix_label_top1_accuracy_overlap = BackfitDiagnostics.mixture.label_top1_accuracy_overlap;
                                 backfit_mix_label_weight_mae = BackfitDiagnostics.mixture.label_weight_mae;
                                 backfit_mix_label_weight_mae_overlap = BackfitDiagnostics.mixture.label_weight_mae_overlap;
+                                if isfield(BackfitDiagnostics.mixture, 'cluster_pair_accuracy_overlap')
+                                    backfit_mix_cluster_pair_accuracy_overlap = BackfitDiagnostics.mixture.cluster_pair_accuracy_overlap;
+                                    backfit_mix_label_pair_accuracy_overlap = BackfitDiagnostics.mixture.label_pair_accuracy_overlap;
+                                end
+                            end
+                            if isfield(BackfitDiagnostics, 'cluster') && isstruct(BackfitDiagnostics.cluster)
+                                cluster_identity_accuracy = BackfitDiagnostics.cluster.identity_accuracy;
+                                cluster_identity_accuracy_matched = BackfitDiagnostics.cluster.identity_accuracy_matched;
+                                cluster_n_label_matches = BackfitDiagnostics.cluster.n_label_matches;
+                                cluster_mean_matched_similarity = BackfitDiagnostics.cluster.mean_matched_similarity;
                             end
                             if CONFIG.save_backfit_details
                                 backfit_diagnostic_file = fullfile(backfit_dir, [subj_name '_backfit.mat']);
@@ -496,7 +520,15 @@ function T = simulated_ms_retrieval_experiment(varargin)
                             sim_qc_mean_dwell_ms = Sim.sim_qc.microstate_dynamics.mean_dwell_ms;
                         end
                     end
-                    
+                    true_template_labels_str = '';
+                    true_template_indices_str = '';
+                    if isfield(Sim, 'true_template_labels') && ~isempty(Sim.true_template_labels)
+                        true_template_labels_str = strjoin(cellstr(string(Sim.true_template_labels)), '|');
+                    end
+                    if isfield(Sim, 'true_template_indices') && ~isempty(Sim.true_template_indices)
+                        true_template_indices_str = mat2str(double(Sim.true_template_indices));
+                    end
+
                     result_row = struct( ...
                         'fit_id', 0, ... % Placeholder
                         'subject', subj_name, ...
@@ -509,6 +541,8 @@ function T = simulated_ms_retrieval_experiment(varargin)
                         'overlap_strength', Sim.overlap_strength, ...
                         'overlap_ms_min', Sim.overlap_ms_range(1), ...
                         'overlap_ms_max', Sim.overlap_ms_range(end), ...
+                        'true_template_labels', true_template_labels_str, ...
+                        'true_template_indices', true_template_indices_str, ...
                         'montage_type', montage_name, ...
                         'n_leads', fit_result.n_leads, ...
                         'sim_qc_status', sim_qc_status, ...
@@ -529,6 +563,10 @@ function T = simulated_ms_retrieval_experiment(varargin)
                         'recovery_01', recovery_corr(1), ...
                         'recovery_02', recovery_corr(2), ...
                         'recovery_03', recovery_corr(3), ...
+                        'cluster_identity_accuracy', cluster_identity_accuracy, ...
+                        'cluster_identity_accuracy_matched', cluster_identity_accuracy_matched, ...
+                        'cluster_n_label_matches', cluster_n_label_matches, ...
+                        'cluster_mean_matched_similarity', cluster_mean_matched_similarity, ...
                         'selected_spm_cov_trace_mean', selected_cov_trace_mean, ...
                         'selected_spm_cov_trace_median', selected_cov_trace_median, ...
                         'selected_spm_cov_logdet_mean', selected_cov_logdet_mean, ...
@@ -545,6 +583,8 @@ function T = simulated_ms_retrieval_experiment(varargin)
                         'backfit_hard_label_top1_accuracy_overlap', backfit_hard_label_top1_accuracy_overlap, ...
                         'backfit_hard_label_weight_mae', backfit_hard_label_weight_mae, ...
                         'backfit_hard_label_weight_mae_overlap', backfit_hard_label_weight_mae_overlap, ...
+                        'backfit_hard_cluster_pair_accuracy_overlap', backfit_hard_cluster_pair_accuracy_overlap, ...
+                        'backfit_hard_label_pair_accuracy_overlap', backfit_hard_label_pair_accuracy_overlap, ...
                         'backfit_mix_available', backfit_mix_available, ...
                         'backfit_mix_cluster_top1_accuracy', backfit_mix_cluster_top1_accuracy, ...
                         'backfit_mix_label_top1_accuracy', backfit_mix_label_top1_accuracy, ...
@@ -552,6 +592,8 @@ function T = simulated_ms_retrieval_experiment(varargin)
                         'backfit_mix_label_top1_accuracy_overlap', backfit_mix_label_top1_accuracy_overlap, ...
                         'backfit_mix_label_weight_mae', backfit_mix_label_weight_mae, ...
                         'backfit_mix_label_weight_mae_overlap', backfit_mix_label_weight_mae_overlap, ...
+                        'backfit_mix_cluster_pair_accuracy_overlap', backfit_mix_cluster_pair_accuracy_overlap, ...
+                        'backfit_mix_label_pair_accuracy_overlap', backfit_mix_label_pair_accuracy_overlap, ...
                         'backfit_diagnostic_file', backfit_diagnostic_file, ...
                         'best_score', SelectedResults.best_criterion_value, ...
                         'json_file', json_file, ...
@@ -577,6 +619,12 @@ function T = simulated_ms_retrieval_experiment(varargin)
                             META.overlap_ms_range = Sim.overlap_ms_range;
                             META.overlap_strength = Sim.overlap_strength;
                             META.n_overlap_events = Sim.n_overlap_events;
+                            if isfield(Sim, 'true_template_labels')
+                                META.true_template_labels = Sim.true_template_labels;
+                            end
+                            if isfield(Sim, 'true_template_indices')
+                                META.true_template_indices = Sim.true_template_indices;
+                            end
                             META.sim_qc_status = sim_qc_status;
                             META.sim_qc_psd_slope_2_40hz = sim_qc_psd_slope;
                             META.sim_qc_gfp_median_uv = sim_qc_gfp_median_uv;
@@ -1245,11 +1293,24 @@ function print_summary(T)
     fprintf('\n');
 end
 
-function sim_opts = build_simulation_options(CONFIG, overlap_prob, SNR_dB)
+function sim_opts = build_simulation_options(CONFIG, overlap_prob, SNR_dB, rep, K_true)
     sim_opts = struct( ...
         'prob', overlap_prob, ...
         'ms_range', CONFIG.overlap_ms_range, ...
         'strength', CONFIG.overlap_strength);
+
+    if CONFIG.randomize_true_templates
+        pool_K = round(double(CONFIG.true_template_pool_K));
+        if K_true > pool_K
+            error('K_true=%d exceeds true_template_pool_K=%d.', K_true, pool_K);
+        end
+        template_seed = 42 + rep * 1000 + K_true * 100;
+        old_rng = rng;
+        rng(template_seed, 'twister');
+        sim_opts.template_pool_K = pool_K;
+        sim_opts.template_indices = sort(randperm(pool_K, K_true));
+        rng(old_rng);
+    end
 
     if CONFIG.clean_sanity_profile && overlap_prob <= 0 && ...
             (isinf(SNR_dB) || SNR_dB >= CONFIG.clean_sanity_snr_db_threshold)

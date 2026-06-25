@@ -63,7 +63,7 @@ function [TANOVA, results_csv] = run_microstate_hierarchical_tanova(results_mat,
 %   tanova_summary.mat
 %   tanova_methods_notes.txt
 %   plots/tanova_pmax_heatmap.png
-%   plots/mean_maps_*.png, if EEGLAB topoplot and chanlocs are available.
+%   plots/mean_maps_*.png, if EEGLAB topoplot and chanlocs are available/on path.
 
     if nargin < 1 || isempty(results_mat)
         results_mat = default_results_mat();

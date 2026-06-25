@@ -24,7 +24,9 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         'microstate_amplitude_uv', 30, ...
         'background_noise_rms_uv', 10, ...
         'mean_dur_ms', 80, ...
-        'gfp_envelope_eta', 0.2);
+        'gfp_envelope_eta', 0.2, ...
+        'template_pool_K', K_true, ...
+        'template_indices', []);
     overlap_opts = fill_overlap_defaults(overlap_opts, overlap_defaults);
     overlap_opts = apply_clean_sanity_profile_defaults(overlap_opts);
     
@@ -34,7 +36,7 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     % shared loader used by the template sense-check plotting code.
     fprintf('Loading channel positions from template...\n');
     [maps_true_normalized, template_labels, pos, chanlocs, channel_labels] = ...
-        load_true_templates_from_template(K_true);
+        load_true_templates_from_template(K_true, overlap_opts.template_pool_K, overlap_opts.template_indices);
     
     if isempty(pos)
         error('Failed to load channel positions from template file');
@@ -165,6 +167,8 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         'chanlocs', chanlocs, ...  % Channel location structure
         'channel_labels', {channel_labels}, ...  % ✅ NEW: Channel labels as cell array
         'true_template_labels', {template_labels}, ...
+        'true_template_pool_K', overlap_opts.template_pool_K, ...
+        'true_template_indices', overlap_opts.template_indices, ...
         'K_true', K_true, ...
         'SNR_dB', snr_db, ...
         'duration_s', duration_s, ...
@@ -306,9 +310,16 @@ end
 
 % ======================== CHANNEL MONTAGE ========================
 
-function [template_maps, template_labels, pos, chanlocs, channel_labels] = load_true_templates_from_template(K_true)
+function [template_maps, template_labels, pos, chanlocs, channel_labels] = load_true_templates_from_template(K_true, template_pool_K, template_indices)
 % LOAD_TRUE_TEMPLATES_FROM_TEMPLATE: Load canonical template maps and geometry
 % through the shared MetaMaps loader.
+
+    if nargin < 2 || isempty(template_pool_K)
+        template_pool_K = K_true;
+    end
+    if nargin < 3
+        template_indices = [];
+    end
 
     template_maps = [];
     template_labels = {};
@@ -337,7 +348,18 @@ function [template_maps, template_labels, pos, chanlocs, channel_labels] = load_
         end
 
         [template_maps, template_labels, channel_labels, chanlocs] = ...
-            load_metamaps_templates(template_file, 'K', K_true);
+            load_metamaps_templates(template_file, 'K', template_pool_K);
+        if ~isempty(template_indices)
+            template_indices = double(template_indices(:)');
+            if numel(template_indices) ~= K_true || any(template_indices < 1) || any(template_indices > numel(template_labels))
+                error('template_indices must contain %d valid indices from the K=%d canonical template set.', K_true, template_pool_K);
+            end
+            template_maps = template_maps(template_indices, :);
+            template_labels = template_labels(template_indices);
+        elseif size(template_maps, 1) ~= K_true
+            template_maps = template_maps(1:K_true, :);
+            template_labels = template_labels(1:K_true);
+        end
         n_channels = size(template_maps, 2);
         if n_channels == 0
             fprintf('Error: Template has no usable loaded channels\n');
