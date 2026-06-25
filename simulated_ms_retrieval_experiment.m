@@ -13,7 +13,7 @@ function T = simulated_ms_retrieval_experiment(varargin)
 % matlab (version R2025a used for this - other versions not tested)
 % Dr Rohan Kandasamy 8-11-2025
 % 
-% Experimental data run on 25-11-2025
+% Experimental data run on 25-6-2026
 %
 % Using code from Thomas Koenig (MICROSTATELAB group)
 % (the "microstates" repository at: ThomasKoenigBern/microstates on github)
@@ -66,6 +66,8 @@ function T = simulated_ms_retrieval_experiment(varargin)
     addParameter(p, 'overlap_strength', double(sim_defaults.overlap_strength), @isnumeric);
     addParameter(p, 'compute_backfit_diagnostics', logical(util.get_field(sim_defaults, 'compute_backfit_diagnostics', true)), @islogical);
     addParameter(p, 'save_backfit_details', logical(util.get_field(sim_defaults, 'save_backfit_details', true)), @islogical);
+    addParameter(p, 'backfit_downsample_factor', double(util.get_field(sim_defaults, 'backfit_downsample_factor', 5)), ...
+        @(x) isnumeric(x) && isscalar(x) && x >= 1);
     addParameter(p, 'template_alignment_strong_threshold', double(util.get_field(sim_defaults, 'template_alignment_strong_threshold', 0.5)), @isnumeric);
     addParameter(p, 'randomize_true_templates', logical(util.get_field(sim_defaults, 'randomize_true_templates', true)), @islogical);
     addParameter(p, 'true_template_pool_K', double(util.get_field(sim_defaults, 'true_template_pool_K', 7)), @isnumeric);
@@ -391,7 +393,8 @@ function T = simulated_ms_retrieval_experiment(varargin)
                         if CONFIG.compute_backfit_diagnostics
                             try
                                 BackfitDiagnostics = compute_simulation_backfit_diagnostics(Sim, SelectedResults, CONFIG.set_file, ...
-                                    'strong_threshold', CONFIG.template_alignment_strong_threshold);
+                                    'strong_threshold', CONFIG.template_alignment_strong_threshold, ...
+                                    'downsample_factor', CONFIG.backfit_downsample_factor);
                                 SelectedResults.backfit_diagnostics = BackfitDiagnostics;
                             catch
                             end
@@ -410,6 +413,9 @@ function T = simulated_ms_retrieval_experiment(varargin)
                     backfit_coverage_rmse = NaN;
                     backfit_coverage_l1 = NaN;
                     backfit_overlap_fraction = NaN;
+                    backfit_downsample_factor = CONFIG.backfit_downsample_factor;
+                    backfit_n_samples = NaN;
+                    backfit_n_samples_original = NaN;
                     backfit_hard_cluster_top1_accuracy = NaN;
                     backfit_hard_label_top1_accuracy = NaN;
                     backfit_hard_cluster_top1_accuracy_overlap = NaN;
@@ -465,6 +471,15 @@ function T = simulated_ms_retrieval_experiment(varargin)
                             backfit_coverage_l1 = BackfitDiagnostics.coverage_l1;
                             if isfield(BackfitDiagnostics, 'overlap_sample_fraction')
                                 backfit_overlap_fraction = BackfitDiagnostics.overlap_sample_fraction;
+                            end
+                            if isfield(BackfitDiagnostics, 'downsample_factor')
+                                backfit_downsample_factor = BackfitDiagnostics.downsample_factor;
+                            end
+                            if isfield(BackfitDiagnostics, 'n_samples')
+                                backfit_n_samples = BackfitDiagnostics.n_samples;
+                            end
+                            if isfield(BackfitDiagnostics, 'n_samples_original')
+                                backfit_n_samples_original = BackfitDiagnostics.n_samples_original;
                             end
                             if isfield(BackfitDiagnostics, 'hard') && isstruct(BackfitDiagnostics.hard)
                                 backfit_hard_cluster_top1_accuracy = BackfitDiagnostics.hard.cluster_top1_accuracy;
@@ -577,6 +592,9 @@ function T = simulated_ms_retrieval_experiment(varargin)
                         'backfit_coverage_rmse', backfit_coverage_rmse, ...
                         'backfit_coverage_l1', backfit_coverage_l1, ...
                         'backfit_overlap_fraction', backfit_overlap_fraction, ...
+                        'backfit_downsample_factor', backfit_downsample_factor, ...
+                        'backfit_n_samples', backfit_n_samples, ...
+                        'backfit_n_samples_original', backfit_n_samples_original, ...
                         'backfit_hard_cluster_top1_accuracy', backfit_hard_cluster_top1_accuracy, ...
                         'backfit_hard_label_top1_accuracy', backfit_hard_label_top1_accuracy, ...
                         'backfit_hard_cluster_top1_accuracy_overlap', backfit_hard_cluster_top1_accuracy_overlap, ...

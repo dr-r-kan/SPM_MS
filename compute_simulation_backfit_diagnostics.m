@@ -12,6 +12,7 @@ function diagnostics = compute_simulation_backfit_diagnostics(Sim, Results, temp
     addRequired(p, 'template_file', @(x) ischar(x) || isstring(x));
     addParameter(p, 'template_K', 7, @(x) isnumeric(x) && isscalar(x) && x >= 1);
     addParameter(p, 'strong_threshold', 0.5, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x <= 1);
+    addParameter(p, 'downsample_factor', 1, @(x) isnumeric(x) && isscalar(x) && x >= 1);
     parse(p, Sim, Results, template_file, varargin{:});
 
     diagnostics = struct('ok', false, 'message', '');
@@ -63,6 +64,19 @@ function diagnostics = compute_simulation_backfit_diagnostics(Sim, Results, temp
     end
 
     true_state_weights = true_state_weight_matrix(Sim);
+    n_samples_original = size(true_state_weights, 1);
+    downsample_factor = max(1, round(double(p.Results.downsample_factor)));
+    mixture_available = isfield(backfit, 'mixture') && isfield(backfit.mixture, 'available') && backfit.mixture.available;
+    n_samples_aligned = min(n_samples_original, size(backfit.hard.weights, 1));
+    if mixture_available
+        n_samples_aligned = min(n_samples_aligned, size(backfit.mixture.weights, 1));
+    end
+    sample_idx = 1:downsample_factor:n_samples_aligned;
+    true_state_weights = true_state_weights(sample_idx, :);
+    backfit.hard.weights = backfit.hard.weights(sample_idx, :);
+    if mixture_available
+        backfit.mixture.weights = backfit.mixture.weights(sample_idx, :);
+    end
     true_top_idx = dominant_state_index(true_state_weights);
     overlap_mask = sum(true_state_weights > 1e-6, 2) > 1;
 
@@ -78,7 +92,7 @@ function diagnostics = compute_simulation_backfit_diagnostics(Sim, Results, temp
     hard = summarise_backfit_mode(backfit.hard.weights, est_to_true_idx, est_state_labels, ...
         true_state_weights, true_top_idx, true_label_weights, true_top_label_idx, template_order, overlap_mask);
 
-    if isfield(backfit, 'mixture') && isfield(backfit.mixture, 'available') && backfit.mixture.available
+    if mixture_available
         mixture = summarise_backfit_mode(backfit.mixture.weights, est_to_true_idx, est_state_labels, ...
             true_state_weights, true_top_idx, true_label_weights, true_top_label_idx, template_order, overlap_mask);
         mixture.available = true;
@@ -96,6 +110,9 @@ function diagnostics = compute_simulation_backfit_diagnostics(Sim, Results, temp
     diagnostics.ok = true;
     diagnostics.message = 'ok';
     diagnostics.n_samples = size(true_state_weights, 1);
+    diagnostics.n_samples_original = n_samples_original;
+    diagnostics.n_samples_aligned = n_samples_aligned;
+    diagnostics.downsample_factor = downsample_factor;
     diagnostics.n_overlap_samples = sum(overlap_mask);
     diagnostics.overlap_sample_fraction = mean(overlap_mask);
     diagnostics.template_labels = template_order(:);
