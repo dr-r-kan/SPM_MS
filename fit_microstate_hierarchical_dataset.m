@@ -35,9 +35,11 @@ function [HResults, results_mat] = fit_microstate_hierarchical_dataset(input_pat
     addParameter(p, 'spatial_filter_strength', double(pre_defaults.spatial_filter_strength), @isnumeric);
     addParameter(p, 'filter_band', double(pre_defaults.filter_band(:)'), @(x) isempty(x) || isnumeric(x));
     addParameter(p, 'use_scalp_channels', true, @islogical);
+    addParameter(p, 'scalp_channel_max_radius', 0.60, @(x) isnumeric(x) && isscalar(x) && x > 0 && x <= 1);
     addParameter(p, 'exclude_channels', {'PO9', 'PO10'}, @(x) iscell(x) || isstring(x));
     addParameter(p, 'interpolate_missing_channels', true, @islogical);
     addParameter(p, 'localizer_dir', '', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'infer_localizer_dir', true, @islogical);
     addParameter(p, 'gfp_peak_min_distance', 3, @isnumeric);
     addParameter(p, 'gfp_peak_threshold_schedule', [0.50 0.60 0.70 0.80 0.90], @isnumeric);
     addParameter(p, 'min_gfp_peaks_per_file', 20, @isnumeric);
@@ -70,7 +72,7 @@ function [HResults, results_mat] = fit_microstate_hierarchical_dataset(input_pat
     cfg.criterion = lower(char(cfg.criterion));
     cfg.spatial_filter = char(cfg.spatial_filter);
     cfg.exclude_channels = cellstr(string(cfg.exclude_channels));
-    cfg.localizer_dir = resolve_localizer_dir(cfg.localizer_dir, cfg.input_path, util);
+    cfg.localizer_dir = resolve_localizer_dir(cfg.localizer_dir, cfg.input_path, util, cfg.infer_localizer_dir);
     cfg.backfit_state_metrics_csv = char(cfg.backfit_state_metrics_csv);
     cfg.backfit_pairwise_metrics_csv = char(cfg.backfit_pairwise_metrics_csv);
     cfg.backfit_record_summary_csv = char(cfg.backfit_record_summary_csv);
@@ -91,7 +93,7 @@ function [HResults, results_mat] = fit_microstate_hierarchical_dataset(input_pat
     end
 
     manifest = read_or_build_manifest(cfg.input_path);
-    if isempty(cfg.localizer_dir)
+    if isempty(cfg.localizer_dir) && cfg.infer_localizer_dir
         cfg.localizer_dir = infer_localizer_dir_from_manifest(manifest);
     end
     writetable(manifest, fullfile(cfg.output_dir, 'normalised_input_manifest.csv'));
@@ -157,7 +159,7 @@ function [HResults, results_mat] = fit_microstate_hierarchical_dataset(input_pat
         fprintf('\nGlobal SPM-VB fit...\n');
     end
     global_fit = fit_spm_vb_peak_maps(global_maps, global_gfp, cfg.K_candidates, cfg, 'global', []);
-    global_fit = attach_template_alignment_if_available(global_fit, cfg, common_labels);
+    global_fit = attach_template_alignment_if_available(global_fit, cfg, common_labels, common_chanlocs);
     global_rows = pooled_rows(fit_idx, :);
     global_rows.cluster_label = assign_by_abs_correlation(global_maps, global_fit.centers);
     save_fit_bundle(dirs.global, 'global', global_fit, global_rows, common_labels, common_chanlocs, cfg);
@@ -291,10 +293,15 @@ function tf = is_parameter_name(value, parser)
     tf = any(strcmpi(strtrim(char(value)), parser.Parameters));
 end
 
-function localizer_dir = resolve_localizer_dir(localizer_dir, input_path, util)
+function localizer_dir = resolve_localizer_dir(localizer_dir, input_path, util, infer_when_empty)
+    if nargin < 4 || isempty(infer_when_empty)
+        infer_when_empty = true;
+    end
     localizer_dir = char(string(localizer_dir));
     if isempty(localizer_dir)
-        localizer_dir = infer_localizer_dir(input_path);
+        if infer_when_empty
+            localizer_dir = infer_localizer_dir(input_path);
+        end
     else
         base = char(input_path);
         if isfile(base)
@@ -343,7 +350,7 @@ function manifest = read_or_build_manifest(input_path)
     if isfolder(input_path)
         files = discover_eeg_files(input_path);
         if isempty(files)
-            error('No .set or .mat files found under %s.', input_path);
+            error('No supported EEG files found under %s.', input_path);
         end
         file_path = strings(numel(files), 1);
         participant = strings(numel(files), 1);
@@ -370,9 +377,15 @@ function manifest = read_or_build_manifest(input_path)
             if ~is_absolute_path(file_path(i))
                 file_path(i) = string(fullfile(base_dir, file_path(i)));
             end
+            if ~isfile(file_path(i))
+                local_path = fullfile(base_dir, path_basename(file_path(i)));
+                if isfile(local_path)
+                    file_path(i) = string(local_path);
+                end
+            end
         end
         p_col = find_first(names, ["participant", "subject", "sub", "id", "subjectid", "participantid"]);
-        c_col = find_first(names, ["condition", "state", "task", "eyes", "session"]);
+        c_col = find_first(names, ["condition", "dreaming", "state", "task", "eyes", "session"]);
         g_col = find_first(names, ["group", "diagnosis", "cohort", "class"]);
         participant = column_or_infer(T, p_col, file_path, "participant");
         condition = column_or_default(T, c_col, "condition", numel(file_path));
@@ -399,11 +412,14 @@ function delimiter = manifest_delimiter(input_path)
 end
 
 function files = discover_eeg_files(input_path)
+    eeg_extensions = {'.set', '.mat', '.fif', '.fiff', '.edf', '.bdf', '.gdf', '.cnt', '.vhdr', '.mff'};
     scan_roots = eeg_scan_roots(input_path);
     files = [];
     for i = 1:numel(scan_roots)
         root = char(scan_roots(i));
-        files = [files; dir(fullfile(root, '**', '*.set')); dir(fullfile(root, '**', '*.mat'))]; %#ok<AGROW>
+        for j = 1:numel(eeg_extensions)
+            files = [files; dir(fullfile(root, '**', ['*' eeg_extensions{j}]))]; %#ok<AGROW>
+        end
     end
     if isempty(files)
         return;
@@ -489,6 +505,11 @@ function tf = is_absolute_path(pth)
     tf = startsWith(pth, filesep) || ~isempty(regexp(pth, '^[A-Za-z]:[\\/]', 'once'));
 end
 
+function name = path_basename(pth)
+    parts = regexp(char(pth), '[\\/]', 'split');
+    name = parts{end};
+end
+
 function pid = infer_participant(file_path, row_index)
     [parent, stem] = fileparts(char(file_path));
     hit = regexp(stem, '(sub-[A-Za-z0-9]+)', 'match', 'once');
@@ -521,7 +542,7 @@ function meta = inspect_files(manifest, cfg, util)
         n = size(data, 1);
         keep = true(n, 1);
         if cfg.use_scalp_channels
-            keep = util.scalp_channel_mask(chanlocs, n);
+            keep = util.scalp_channel_mask(chanlocs, n, cfg.scalp_channel_max_radius);
         end
         can = util.canonical_channel_labels(labels);
         exclude_can = util.canonical_channel_labels(cfg.exclude_channels);
@@ -732,11 +753,19 @@ function [data, sfreq, chanlocs, labels, pos, chanloc_source] = load_eeg_file(fi
                 chanloc_source = 'file';
             end
         otherwise
-            error('Unsupported EEG extension: %s', ext);
+            [data, sfreq, chanlocs] = load_external_eeg_file(file_path, ext);
+            chanloc_source = 'file';
     end
     data = squeeze(data);
+    if ~ismatrix(data)
+        data = reshape(data, size(data, 1), []);
+    end
     if size(data, 1) > size(data, 2) && size(data, 2) < 128
         data = data';
+    end
+    [chanlocs, used_sidecar] = apply_chanloc_sidecar(chanlocs, file_path, size(data, 1), util);
+    if used_sidecar
+        chanloc_source = 'sidecar';
     end
     if ~isempty(chanlocs)
         [chanlocs, used_localizer] = apply_localizer_chanlocs(chanlocs, file_path, cfg, util);
@@ -746,6 +775,332 @@ function [data, sfreq, chanlocs, labels, pos, chanloc_source] = load_eeg_file(fi
     end
     labels = util.channel_labels_from_chanlocs(chanlocs, size(data, 1));
     pos = util.positions_from_chanlocs(chanlocs, size(data, 1));
+end
+
+function [data, sfreq, chanlocs] = load_external_eeg_file(file_path, ext)
+    errors = {};
+    if exist('ft_read_header', 'file') == 2 && exist('ft_read_data', 'file') == 2
+        try
+            [data, sfreq, chanlocs] = load_fieldtrip_file(file_path);
+            return;
+        catch ME
+            errors{end+1} = sprintf('FieldTrip: %s', ME.message);
+        end
+    end
+    if any(strcmpi(ext, {'.fif', '.fiff'})) && exist('fiff_setup_read_raw', 'file') == 2
+        try
+            [data, sfreq, chanlocs] = load_mne_fif_file(file_path);
+            return;
+        catch ME
+            errors{end+1} = sprintf('MNE-MATLAB: %s', ME.message);
+        end
+    end
+    if exist('pop_fileio', 'file') == 2
+        try
+            [data, sfreq, chanlocs] = load_eeglab_import(file_path, @pop_fileio);
+            return;
+        catch ME
+            errors{end+1} = sprintf('EEGLAB pop_fileio: %s', ME.message);
+        end
+    end
+    if exist('pop_biosig', 'file') == 2
+        try
+            [data, sfreq, chanlocs] = load_eeglab_import(file_path, @pop_biosig);
+            return;
+        catch ME
+            errors{end+1} = sprintf('EEGLAB pop_biosig: %s', ME.message);
+        end
+    end
+
+    detail = '';
+    if ~isempty(errors)
+        detail = sprintf(' Reader errors: %s', strjoin(errors, ' | '));
+    end
+    error(['Unsupported EEG extension or missing reader for %s.%s ', ...
+        'Install FieldTrip, EEGLAB FileIO/Biosig, or MNE-MATLAB, or convert to .set while preserving EEG.chanlocs.'], ...
+        ext, detail);
+end
+
+function [data, sfreq, chanlocs] = load_fieldtrip_file(file_path)
+    hdr = ft_read_header(file_path);
+    data = double(ft_read_data(file_path));
+    sfreq = field_value_or_default(hdr, 'Fs', 250);
+    labels = field_value_or_default(hdr, 'label', {});
+    labels = cellstr(string(labels(:)));
+    keep = fieldtrip_eeg_channel_mask(hdr, numel(labels));
+    if any(keep) && numel(keep) == numel(labels)
+        data = data(keep, :, :);
+        labels = labels(keep);
+    end
+    chanlocs = chanlocs_from_fieldtrip_header(hdr, labels);
+end
+
+function keep = fieldtrip_eeg_channel_mask(hdr, n)
+    keep = true(n, 1);
+    if n == 0 || ~isfield(hdr, 'chantype') || numel(hdr.chantype) < n
+        return;
+    end
+    types = lower(string(hdr.chantype(:)));
+    eeg = types(1:n) == "eeg" | contains(types(1:n), "eeg");
+    if any(eeg)
+        keep = eeg;
+    end
+end
+
+function chanlocs = chanlocs_from_fieldtrip_header(hdr, labels)
+    chanlocs = blank_chanlocs(labels);
+    pos = nan(numel(labels), 3);
+    if isfield(hdr, 'elec') && ~isempty(hdr.elec)
+        pos = labelled_positions(hdr.elec, labels);
+    end
+    chanlocs = apply_chanloc_positions(chanlocs, pos);
+end
+
+function [data, sfreq, chanlocs] = load_mne_fif_file(file_path)
+    raw = fiff_setup_read_raw(file_path);
+    [data, ~] = fiff_read_raw_segment(raw, raw.first_samp, raw.last_samp);
+    sfreq = double(raw.info.sfreq);
+    labels = mne_channel_labels(raw.info);
+    keep = mne_eeg_channel_mask(raw.info, numel(labels));
+    chanlocs_all = chanlocs_from_mne_info(raw.info, labels);
+    if any(keep)
+        data = data(keep, :);
+        labels = labels(keep); %#ok<NASGU>
+        chanlocs = chanlocs_all(keep);
+    else
+        chanlocs = chanlocs_all;
+    end
+end
+
+function keep = mne_eeg_channel_mask(info, n)
+    keep = true(n, 1);
+    if ~isfield(info, 'chs') || numel(info.chs) < n || exist('fiff_define_constants', 'file') ~= 2
+        return;
+    end
+    FIFF = fiff_define_constants();
+    if ~isfield(FIFF, 'FIFFV_EEG_CH')
+        return;
+    end
+    kinds = nan(n, 1);
+    for i = 1:n
+        if isfield(info.chs(i), 'kind') && ~isempty(info.chs(i).kind)
+            kinds(i) = double(info.chs(i).kind);
+        end
+    end
+    eeg = kinds == double(FIFF.FIFFV_EEG_CH);
+    if any(eeg)
+        keep = eeg;
+    end
+end
+
+function labels = mne_channel_labels(info)
+    if isfield(info, 'ch_names') && ~isempty(info.ch_names)
+        labels = cellstr(string(info.ch_names(:)));
+        return;
+    end
+    n = numel(info.chs);
+    labels = cell(n, 1);
+    for i = 1:n
+        if isfield(info.chs(i), 'ch_name') && ~isempty(info.chs(i).ch_name)
+            labels{i} = char(info.chs(i).ch_name);
+        else
+            labels{i} = sprintf('Ch%03d', i);
+        end
+    end
+end
+
+function chanlocs = chanlocs_from_mne_info(info, labels)
+    chanlocs = blank_chanlocs(labels);
+    pos = nan(numel(labels), 3);
+    if isfield(info, 'chs')
+        n = min(numel(labels), numel(info.chs));
+        for i = 1:n
+            if isfield(info.chs(i), 'loc') && numel(info.chs(i).loc) >= 3
+                pos(i, :) = double(info.chs(i).loc(1:3));
+            end
+        end
+    end
+    chanlocs = apply_chanloc_positions(chanlocs, pos);
+end
+
+function [data, sfreq, chanlocs] = load_eeglab_import(file_path, loader)
+    EEG = loader(file_path);
+    data = double(EEG.data);
+    sfreq = field_value_or_default(EEG, 'srate', 250);
+    if isfield(EEG, 'chanlocs') && ~isempty(EEG.chanlocs)
+        chanlocs = EEG.chanlocs;
+    else
+        chanlocs = blank_chanlocs({});
+    end
+end
+
+function chanlocs = blank_chanlocs(labels)
+    labels = cellstr(string(labels(:)));
+    chanlocs = repmat(struct('labels', '', 'X', [], 'Y', [], 'Z', []), 1, numel(labels));
+    for i = 1:numel(labels)
+        chanlocs(i).labels = labels{i};
+    end
+end
+
+function chanlocs = apply_chanloc_positions(chanlocs, pos)
+    n = min(numel(chanlocs), size(pos, 1));
+    for i = 1:n
+        xyz = double(pos(i, :));
+        if numel(xyz) == 3 && all(isfinite(xyz)) && norm(xyz) > eps
+            chanlocs(i).X = xyz(1);
+            chanlocs(i).Y = xyz(2);
+            chanlocs(i).Z = xyz(3);
+        end
+    end
+end
+
+function pos = labelled_positions(geom, labels)
+    pos = nan(numel(labels), 3);
+    geom_labels = field_value_or_default(geom, 'label', {});
+    geom_labels = cellstr(string(geom_labels(:)));
+    coords = [];
+    for field_name = {'chanpos', 'elecpos', 'pnt'}
+        if isfield(geom, field_name{1}) && size(geom.(field_name{1}), 2) >= 3
+            coords = double(geom.(field_name{1})(:, 1:3));
+            break;
+        end
+    end
+    if isempty(coords)
+        return;
+    end
+    if isempty(geom_labels) && size(coords, 1) == numel(labels)
+        pos = coords(1:numel(labels), :);
+        return;
+    end
+    can_geom = simple_canonical_labels(geom_labels);
+    can_labels = simple_canonical_labels(labels);
+    for i = 1:numel(labels)
+        idx = find(strcmp(can_geom, can_labels{i}), 1, 'first');
+        if ~isempty(idx) && idx <= size(coords, 1)
+            pos(i, :) = coords(idx, :);
+        end
+    end
+end
+
+function can = simple_canonical_labels(labels)
+    labels = cellstr(string(labels(:)));
+    can = cell(size(labels));
+    for i = 1:numel(labels)
+        s = lower(strtrim(labels{i}));
+        s = regexprep(s, '\s+', '');
+        s = regexprep(s, '^eeg', '');
+        can{i} = regexprep(s, '[^a-z0-9]', '');
+    end
+end
+
+function value = field_value_or_default(S, field_name, default_value)
+    value = default_value;
+    if isstruct(S) && isfield(S, field_name) && ~isempty(S.(field_name))
+        value = S.(field_name);
+    end
+end
+
+function [chanlocs_out, used_sidecar] = apply_chanloc_sidecar(chanlocs_in, file_path, n_channels, util)
+    chanlocs_out = chanlocs_in;
+    used_sidecar = false;
+
+    sidecar = load_chanloc_sidecar(file_path);
+    if isempty(sidecar) || ~has_usable_chanloc_positions(sidecar, numel(sidecar), util)
+        return;
+    end
+
+    current_labels = util.channel_labels_from_chanlocs(chanlocs_in, n_channels);
+    side_labels = util.channel_labels_from_chanlocs(sidecar, numel(sidecar));
+    current_can = util.canonical_channel_labels(current_labels);
+    side_can = util.canonical_channel_labels(side_labels);
+
+    if isempty(chanlocs_out) || numel(chanlocs_out) < n_channels
+        chanlocs_out = blank_chanlocs(current_labels);
+    end
+    chanlocs_out = ensure_xyz_fields(chanlocs_out);
+
+    n_hit = 0;
+    for i = 1:n_channels
+        j = find(strcmp(side_can, current_can{i}), 1, 'first');
+        if isempty(j) && numel(sidecar) == n_channels
+            j = i;
+        end
+        if isempty(j)
+            continue;
+        end
+        [chanlocs_out(i), ok] = copy_chanloc_position(sidecar(j), chanlocs_out(i));
+        if ok
+            n_hit = n_hit + 1;
+        end
+    end
+    used_sidecar = n_hit >= max(4, ceil(0.5 * n_channels));
+    if ~used_sidecar
+        chanlocs_out = chanlocs_in;
+    end
+end
+
+function tf = has_usable_chanloc_positions(chanlocs, n_channels, util)
+    tf = false;
+    if isempty(chanlocs)
+        return;
+    end
+    pos = util.positions_from_chanlocs(chanlocs, n_channels);
+    good = all(isfinite(pos), 2);
+    if sum(good) < 4
+        return;
+    end
+    tf = norm(max(pos(good, :), [], 1) - min(pos(good, :), [], 1)) > eps;
+end
+
+function chanlocs = load_chanloc_sidecar(file_path)
+    chanlocs = [];
+    [folder, stem] = fileparts(file_path);
+    candidates = { ...
+        fullfile(folder, [stem '_chanlocs.mat']), ...
+        fullfile(folder, [stem '_montage.mat'])};
+    for i = 1:numel(candidates)
+        if ~isfile(candidates{i})
+            continue;
+        end
+        S = load(candidates{i});
+        if isfield(S, 'chanlocs') && ~isempty(S.chanlocs)
+            chanlocs = S.chanlocs;
+            return;
+        end
+        if isfield(S, 'labels') && isfield(S, 'pos')
+            chanlocs = blank_chanlocs(cellstr(string(S.labels)));
+            chanlocs = apply_chanloc_positions(chanlocs, double(S.pos));
+            return;
+        end
+    end
+end
+
+function [dst, ok] = copy_chanloc_position(src, dst)
+    for field_name = {'X', 'Y', 'Z'}
+        f = field_name{1};
+        if isfield(src, f) && ~isempty(src.(f))
+            dst.(f) = src.(f);
+        end
+    end
+    xyz = [field_double(dst, 'X'), field_double(dst, 'Y'), field_double(dst, 'Z')];
+    ok = all(isfinite(xyz)) && norm(xyz) > eps;
+    if ok
+        for field_name = {'theta', 'radius', 'sph_theta', 'sph_phi', 'sph_radius'}
+            f = field_name{1};
+            if isfield(dst, f)
+                dst.(f) = [];
+            end
+        end
+    end
+end
+
+function chanlocs = ensure_xyz_fields(chanlocs)
+    for field_name = {'X', 'Y', 'Z'}
+        f = field_name{1};
+        if ~isfield(chanlocs, f)
+            [chanlocs.(f)] = deal([]);
+        end
+    end
 end
 
 function [chanlocs_out, used_localizer] = apply_localizer_chanlocs(chanlocs_in, file_path, cfg, util)
@@ -849,7 +1204,7 @@ function [nodes, summary] = fit_group_nodes(pooled_maps, pooled_gfp, pooled_rows
         out_dir = fullfile(out_root, clean_key(level));
         ensure_dir(out_dir);
         Fit = fit_spm_vb_peak_maps(pooled_maps(mask, :), pooled_gfp(mask), cfg.K_candidates, cfg, ['group_' char(level)], global_fit.centers);
-        Fit = attach_template_alignment_if_available(Fit, cfg, common_labels);
+        Fit = attach_template_alignment_if_available(Fit, cfg, common_labels, common_chanlocs);
         rows = pooled_rows(mask, :);
         rows.cluster_label = assign_by_abs_correlation(pooled_maps(mask, :), Fit.centers);
         save_fit_bundle(out_dir, 'group', Fit, rows, common_labels, common_chanlocs, cfg);
@@ -869,7 +1224,7 @@ function [nodes, summary] = fit_condition_nodes(pooled_maps, pooled_gfp, pooled_
         out_dir = fullfile(out_root, clean_key(level));
         ensure_dir(out_dir);
         Fit = fit_spm_vb_peak_maps(pooled_maps(mask, :), pooled_gfp(mask), cfg.K_candidates, cfg, ['condition_' char(level)], global_fit.centers);
-        Fit = attach_template_alignment_if_available(Fit, cfg, common_labels);
+        Fit = attach_template_alignment_if_available(Fit, cfg, common_labels, common_chanlocs);
         rows = pooled_rows(mask, :);
         rows.cluster_label = assign_by_abs_correlation(pooled_maps(mask, :), Fit.centers);
         save_fit_bundle(out_dir, 'condition', Fit, rows, common_labels, common_chanlocs, cfg);
@@ -893,7 +1248,7 @@ function [nodes, summary] = fit_participant_nodes(pooled_maps, pooled_gfp, poole
         out_dir = fullfile(out_root, clean_key(participant));
         ensure_dir(out_dir);
         Fit = fit_spm_vb_peak_maps(pooled_maps(mask, :), pooled_gfp(mask), cfg.K_candidates, cfg, ['participant_' char(participant)], prior_maps);
-        Fit = attach_template_alignment_if_available(Fit, cfg, common_labels);
+        Fit = attach_template_alignment_if_available(Fit, cfg, common_labels, common_chanlocs);
         rows = pooled_rows(mask, :);
         rows.cluster_label = assign_by_abs_correlation(pooled_maps(mask, :), Fit.centers);
         save_fit_bundle(out_dir, 'participant', Fit, rows, common_labels, common_chanlocs, cfg);
@@ -944,7 +1299,7 @@ function [nodes, summary] = fit_participant_condition_nodes(pooled_maps, pooled_
         ensure_dir(out_dir);
         fit_name = ['participant_condition_' char(participant) '_' char(condition)];
         Fit = fit_spm_vb_peak_maps(pooled_maps(mask, :), pooled_gfp(mask), cfg.K_candidates, cfg, fit_name, prior_maps);
-        Fit = attach_template_alignment_if_available(Fit, cfg, common_labels);
+        Fit = attach_template_alignment_if_available(Fit, cfg, common_labels, common_chanlocs);
         rows = pooled_rows(mask, :);
         rows.cluster_label = assign_by_abs_correlation(pooled_maps(mask, :), Fit.centers);
         save_fit_bundle(out_dir, 'participant_condition', Fit, rows, common_labels, common_chanlocs, cfg);
@@ -2025,13 +2380,14 @@ function s = summarise_mix(mix, K, feature_dim, feature_info)
     end
 end
 
-function Fit = attach_template_alignment_if_available(Fit, cfg, common_labels)
+function Fit = attach_template_alignment_if_available(Fit, cfg, common_labels, common_chanlocs)
     if isempty(cfg.template_file) || ~isfile(cfg.template_file)
         return;
     end
     try
         alignment = align_microstates_to_template(Fit.centers, cfg.template_file, ...
             'estimated_channel_labels', common_labels, ...
+            'estimated_chanlocs', common_chanlocs, ...
             'strong_threshold', 0.5);
         Fit.template_alignment = alignment;
         Fit.centers = alignment.aligned_maps;
@@ -2099,17 +2455,23 @@ function [chanlocs_out, keep_idx] = prepare_fit_topoplot_chanlocs(chanlocs, n_ch
     chanlocs_out = chanlocs(1:n);
     keep = false(1, n);
     for i = 1:n
+        chanlocs_out = set_mne_topoplot_location_fields(chanlocs_out, i);
         theta = field_double(chanlocs_out(i), 'theta');
         radius = field_double(chanlocs_out(i), 'radius');
-        if ~(isfinite(theta) && isfinite(radius))
-            chanlocs_out = set_topoplot_location_fields(chanlocs_out, i);
-            theta = field_double(chanlocs_out(i), 'theta');
-            radius = field_double(chanlocs_out(i), 'radius');
-        end
         keep(i) = isfinite(theta) && isfinite(radius) && radius >= 0 && radius <= 1;
     end
     keep_idx = find(keep);
     chanlocs_out = chanlocs_out(keep_idx);
+end
+
+function chanlocs = set_mne_topoplot_location_fields(chanlocs, idx)
+    xyz = [field_double(chanlocs(idx), 'X'), field_double(chanlocs(idx), 'Y'), field_double(chanlocs(idx), 'Z')];
+    if all(isfinite(xyz)) && norm(xyz) > eps
+        xyz = xyz ./ norm(xyz);
+        [~, el] = cart2sph(xyz(1), xyz(2), xyz(3));
+        chanlocs(idx).theta = atan2d(xyz(2), xyz(1));
+        chanlocs(idx).radius = 0.5 - rad2deg(el) / 180;
+    end
 end
 
 function write_matrix_csv(file_path, X)

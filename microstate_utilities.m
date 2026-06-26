@@ -131,6 +131,7 @@ function cfg = default_config_internal()
         'save_backfit_details', true, ...
         'backfit_downsample_factor', 5, ...
         'template_alignment_strong_threshold', 0.5, ...
+        'ecological_profile', true, ...
         'clean_sanity_profile', true, ...
         'clean_sanity_snr_db_threshold', 40, ...
         'validate_simulation', false, ...
@@ -814,7 +815,7 @@ function pos = positions_from_chanlocs_internal(chanlocs, n_channels)
                 ~isempty(chanlocs(i).theta) && ~isempty(chanlocs(i).radius)
             theta = deg2rad(double_or_nan_internal(chanlocs(i).theta));
             radius = double_or_nan_internal(chanlocs(i).radius);
-            if isfinite(theta) && isfinite(radius)
+            if isfinite(theta) && isfinite(radius) && radius > 0
                 x = radius * cos(theta);
                 y = radius * sin(theta);
                 z = sqrt(max(0, 1 - min(1, radius / 0.5) .^ 2));
@@ -870,10 +871,8 @@ end
 function [chanlocs_out, keep_idx, pos_out] = prepare_metamaps_chanlocs_internal(chanlocs, n_channels)
 %PREPARE_METAMAPS_CHANLOCS_INTERNAL Canonicalise MetaMaps geometry once.
 %
-% The MetaMaps template file is stored in a frame that renders 90 degrees
-% clockwise relative to the intended scalp orientation. Rotate the
-% channel geometry anticlockwise here while preserving the raw chanloc
-% structure so topoplot sees the same geometry as the original template.
+% MetaMaps stores X/Y as anterior/left; rotate to the same right/anterior
+% Cartesian frame used by FIF/MNE sidecars, then rebuild topoplot polar fields.
 
     if nargin < 2 || isempty(n_channels)
         n_channels = numel(chanlocs);
@@ -896,6 +895,7 @@ function [chanlocs_out, keep_idx, pos_out] = prepare_metamaps_chanlocs_internal(
     end
 
     chanlocs_out = rotate_chanlocs_xy_internal(chanlocs_out, 90);
+    chanlocs_out = set_mne_topoplot_location_fields_internal(chanlocs_out);
     pos_out = positions_from_chanlocs_internal(chanlocs_out, numel(chanlocs_out));
 end
 
@@ -918,13 +918,23 @@ function chanlocs_out = rotate_chanlocs_xy_internal(chanlocs_in, angle_deg)
             chanlocs_out(i).Z = xyz(3);
         end
 
-        has_theta_radius = isfield(chanlocs_out(i), 'theta') && ~isempty(chanlocs_out(i).theta) && ...
-            isfield(chanlocs_out(i), 'radius') && ~isempty(chanlocs_out(i).radius) && ...
-            isfinite(double(chanlocs_out(i).theta)) && isfinite(double(chanlocs_out(i).radius));
-        if has_theta_radius
-            chanlocs_out(i).theta = wrap_display_angle_internal(double(chanlocs_out(i).theta) + angle_deg);
-        elseif all(isfinite(xyz(1:2)))
-            chanlocs_out(i).theta = wrap_display_angle_internal(atan2d(chanlocs_out(i).Y, chanlocs_out(i).X));
+        if isfield(chanlocs_out(i), 'theta'), chanlocs_out(i).theta = []; end
+        if isfield(chanlocs_out(i), 'radius'), chanlocs_out(i).radius = []; end
+    end
+end
+
+function chanlocs_out = set_mne_topoplot_location_fields_internal(chanlocs_in)
+    chanlocs_out = chanlocs_in;
+    for i = 1:numel(chanlocs_out)
+        xyz = [ ...
+            double_or_nan_internal(get_field_or_empty_local(chanlocs_out(i), 'X')), ...
+            double_or_nan_internal(get_field_or_empty_local(chanlocs_out(i), 'Y')), ...
+            double_or_nan_internal(get_field_or_empty_local(chanlocs_out(i), 'Z'))];
+        if all(isfinite(xyz)) && norm(xyz) > eps
+            xyz = xyz ./ norm(xyz);
+            [~, elev] = cart2sph(xyz(1), xyz(2), xyz(3));
+            chanlocs_out(i).theta = wrap_display_angle_internal(atan2d(xyz(2), xyz(1)));
+            chanlocs_out(i).radius = 0.5 - rad2deg(elev) / 180;
         end
     end
 end
@@ -957,7 +967,10 @@ function value = get_field_or_empty_local(S, field_name)
     end
 end
 
-function mask = scalp_channel_mask_internal(chanlocs, n_channels)
+function mask = scalp_channel_mask_internal(chanlocs, n_channels, max_radius)
+    if nargin < 3 || isempty(max_radius)
+        max_radius = 0.5;
+    end
     mask = false(n_channels, 1);
     if isempty(chanlocs)
         mask(:) = true;
@@ -978,11 +991,23 @@ function mask = scalp_channel_mask_internal(chanlocs, n_channels)
             continue;
         end
         if has_any_geometry
-            mask(i) = all(isfinite(pos(i, :)));
+            topo_radius = topoplot_radius_from_pos_internal(pos(i, :));
+            mask(i) = all(isfinite(pos(i, :))) && isfinite(topo_radius) && topo_radius <= max_radius + eps;
         else
             mask(i) = true;
         end
     end
+end
+
+function radius = topoplot_radius_from_pos_internal(xyz)
+    radius = NaN;
+    if numel(xyz) < 3 || any(~isfinite(xyz)) || norm(xyz) <= eps
+        return;
+    end
+    xyz = double(xyz(:));
+    xyz = xyz ./ norm(xyz);
+    [~, elev] = cart2sph(xyz(1), xyz(2), xyz(3));
+    radius = 0.5 - rad2deg(elev) / 180;
 end
 
 function can = canonical_channel_labels_internal(labels)
@@ -992,7 +1017,15 @@ function can = canonical_channel_labels_internal(labels)
         s = lower(strtrim(labels{i}));
         s = regexprep(s, '\s+', '');
         s = regexprep(s, '^eeg', '');
+        s = regexprep(s, '^channel', '');
+        s = regexprep(s, '^chan', '');
         s = regexprep(s, '[^a-z0-9]', '');
+        if ~isempty(regexp(s, '^\d+$', 'once'))
+            s = regexprep(s, '^0+', '');
+            if isempty(s)
+                s = '0';
+            end
+        end
         can{i} = s;
     end
 end

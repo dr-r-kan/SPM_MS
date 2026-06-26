@@ -19,6 +19,8 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         'ms_range', [10 40], ...      % Min/max overlap duration in ms
         'strength', 0.5, ...          % Weight of the secondary state during overlap
         'clean_sanity_profile', false, ...
+        'ecological_profile', true, ...
+        'real_background_file', '', ...
         'map_jitter_fraction', 0.15, ...
         'inject_artifacts', true, ...
         'microstate_amplitude_uv', 30, ...
@@ -76,7 +78,9 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         jitter = map_jitter_sd * (W * randn(C, 1));
         template = maps_true(cur_state, :)' + jitter;
         
-        if overlap_opts.clean_sanity_profile
+        if overlap_opts.ecological_profile
+            gfp_env = ecological_gfp_packet(dwell, sfreq);
+        elseif overlap_opts.clean_sanity_profile
             gfp_env = clean_profile_state_trace(dwell, sfreq);
         else
             % GFP envelope: realistic range 0.3-0.8 (modulates 30-80% of peak)
@@ -121,19 +125,24 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     % Background EEG: 5-20 µV RMS (let's use 10 µV as baseline)
     background_noise_rms_uv = double(overlap_opts.background_noise_rms_uv);
     
-    fprintf('Generating pink noise (%.1f µV RMS)...\n', background_noise_rms_uv);
-    N = zeros(C, T);
-    for c = 1:C
-        N(c, :) = generate_pink_noise(T) * background_noise_rms_uv;
+    if overlap_opts.ecological_profile
+        [N, background_source] = ecological_background_noise(C, T, pos, sfreq, background_noise_rms_uv, overlap_opts);
+    else
+        fprintf('Generating pink noise (%.1f µV RMS)...\n', background_noise_rms_uv);
+        N = zeros(C, T);
+        for c = 1:C
+            N(c, :) = generate_pink_noise(T) * background_noise_rms_uv;
+        end
+        
+        % Spatially correlate noise through RBF kernel
+        for t = 1:T
+            N(:, t) = W * (randn(C, 1) .* N(:, t) / (norm(N(:, t)) + eps));
+        end
+        
+        % Normalize to target noise level
+        N = N / (std(N(:)) + eps) * background_noise_rms_uv;
+        background_source = 'synthetic_pink_rbf';
     end
-    
-    % Spatially correlate noise through RBF kernel
-    for t = 1:T
-        N(:, t) = W * (randn(C, 1) .* N(:, t) / (norm(N(:, t)) + eps));
-    end
-    
-    % Normalize to target noise level
-    N = N / (std(N(:)) + eps) * background_noise_rms_uv;
     
     % Scale by SNR
     Ps = mean(X_clean(:).^2);
@@ -159,9 +168,13 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
     Sim = struct( ...
         'X_clean', X_clean, ...
         'X_noisy', X_noisy, ...
+        'clean_gfp', sqrt(mean((X_clean - mean(X_clean, 1)) .^ 2, 1)), ...
         'maps_true', maps_true, ...  % In µV
         'z_true', z, ...
         'state_weights_true', state_weights_true, ...
+        'segment_state', [segments.state], ...
+        'segment_start', [segments.start], ...
+        'segment_len', [segments.len], ...
         'sfreq', sfreq, ...
         'pos', pos, ...
         'chanlocs', chanlocs, ...  % Channel location structure
@@ -177,6 +190,8 @@ function [Sim, maps_true, pos] = generate_microstate_eeg(K_true, snr_db, duratio
         'map_jitter_fraction', overlap_opts.map_jitter_fraction, ...
         'inject_artifacts', logical(overlap_opts.inject_artifacts), ...
         'clean_sanity_profile', logical(overlap_opts.clean_sanity_profile), ...
+        'ecological_profile', logical(overlap_opts.ecological_profile), ...
+        'background_source', background_source, ...
         'overlap_prob', overlap_opts.prob, ...
         'overlap_ms_range', overlap_opts.ms_range, ...
         'overlap_strength', overlap_opts.strength, ...
@@ -295,6 +310,99 @@ function x = clean_profile_state_trace(T, sfreq)
         s = std(x);
     end
     x = 0.6 * (x / max(s, eps));
+end
+
+function x = ecological_gfp_packet(T, sfreq)
+%ECOLOGICAL_GFP_PACKET Smooth GFP bursts with valleys at state boundaries.
+
+    if T <= 0
+        x = [];
+        return;
+    end
+    t = 1:T;
+    dwell_s = T / max(sfreq, eps);
+    n_peaks = max(1, 1 + poissrnd(max(0, 3 * dwell_s - 0.4)));
+    x = zeros(1, T);
+    lo = max(1, round(0.15 * T));
+    hi = max(lo, min(T, round(0.85 * T)));
+    for p = 1:n_peaks
+        center = lo + rand() * max(0, hi - lo);
+        width = max(1.5, (0.018 + 0.025 * rand()) * sfreq);
+        amp = exp(0.25 * randn());
+        x = x + amp * exp(-0.5 * ((t - center) / width) .^ 2);
+    end
+    taper = sin(pi * t / (T + 1)) .^ 0.8;
+    alpha = 1 + 0.12 * sin(2 * pi * (8 + 4 * rand()) * (t / sfreq) + 2 * pi * rand());
+    x = x .* taper .* max(alpha, 0.25);
+    if max(abs(x)) > eps
+        x = x / max(abs(x));
+    end
+    x = (0.08 + 0.95 * x) * (0.7 + 0.6 * rand());
+    if rand() < 0.5
+        x = -x;
+    end
+end
+
+function [N, source] = ecological_background_noise(C, T, pos, sfreq, target_rms, opts)
+    bg_file = '';
+    if isfield(opts, 'real_background_file') && ~isempty(opts.real_background_file)
+        bg_file = char(string(opts.real_background_file));
+    end
+    if ~isempty(bg_file) && isfile(bg_file)
+        try
+            N = real_background_snippet(bg_file, C, T, sfreq);
+            N = N / (std(N(:)) + eps) * target_rms;
+            source = bg_file;
+            fprintf('Using real EEG background snippet: %s\n', bg_file);
+            return;
+        catch ME
+            fprintf('⚠ Real background failed (%s). Falling back to ecological synthetic noise.\n', ME.message);
+        end
+    end
+
+    fprintf('Generating ecological synthetic background (%.1f µV RMS)...\n', target_rms);
+    latent = zeros(C, T);
+    for c = 1:C
+        pink = generate_pink_noise(T);
+        alpha = fft_bandpass_local(randn(1, T + 256), sfreq, [8 13]);
+        alpha = alpha(129:(128 + T));
+        slow = fft_bandpass_local(randn(1, T + 256), sfreq, [1 4]);
+        slow = slow(129:(128 + T));
+        latent(c, :) = 0.75 * pink + 0.35 * alpha / (std(alpha) + eps) + 0.15 * slow / (std(slow) + eps);
+    end
+
+    D = pdist2(pos, pos);
+    R = exp(-(D .^ 2) / (2 * 0.35 ^ 2)) + 0.03 * eye(C);
+    R = (R + R') / 2;
+    [V, S] = eig(R);
+    mixer = V * diag(sqrt(max(diag(S), 0))) * V';
+    N = mixer * latent;
+    N = N - mean(N, 1);
+    N = N / (std(N(:)) + eps) * target_rms;
+    source = 'synthetic_1f_alpha_spatial';
+end
+
+function X = real_background_snippet(file_path, C, T, sfreq)
+    if exist('pop_loadset', 'file') ~= 2
+        error('EEGLAB pop_loadset is not on the MATLAB path.');
+    end
+    EEG = pop_loadset('filename', file_path);
+    X = double(EEG.data);
+    if ndims(X) > 2
+        X = reshape(X, size(X, 1), []);
+    end
+    if isfield(EEG, 'srate') && ~isempty(EEG.srate) && double(EEG.srate) ~= sfreq
+        X = resample_eeg_data(X, double(EEG.srate), sfreq);
+    end
+    if size(X, 1) ~= C
+        X = interpolate_channels(X, C);
+    end
+    if size(X, 2) < T
+        X = repmat(X, 1, ceil(T / size(X, 2)));
+    end
+    start_idx = randi(size(X, 2) - T + 1);
+    X = X(:, start_idx:(start_idx + T - 1));
+    X = X - mean(X, 1);
 end
 
 function Xf = fft_bandpass_local(X, sfreq, bp)

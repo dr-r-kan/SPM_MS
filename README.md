@@ -54,14 +54,33 @@ The manifest must include `file_path`; `participant`, `condition`, and `group` a
     'output_dir', 'outputs/lemon_hierarchical_spm_vb_all_peaks');
 ```
 
-This is the direct dataset-wise hierarchy for participants, conditions, and groups. It accepts either a folder of `.set`/`.mat` files or a CSV manifest. A manifest must contain `file_path`; `participant`, `condition`, and `group` are optional. If no manifest is supplied, participant IDs are inferred from names such as `sub-032389_EC.set`, and LEMON-style condition labels are inferred as `EC` and `EO`.
+This is the direct dataset-wise hierarchy for participants, conditions, and groups. It accepts either a folder of supported EEG files or a CSV manifest. A manifest must contain `file_path`; `participant`, `condition`, and `group` are optional. If no manifest is supplied, participant IDs are inferred from names such as `sub-032389_EC.set`, and LEMON-style condition labels are inferred as `EC` and `EO`.
+
+For general preprocessed EEG datasets, use the CSV entrypoint:
+
+```matlab
+% Columns: participant, condition, file path; group is optional
+[HResults, results_mat] = fit_microstate_hierarchical_csv('manifest.csv', ...
+    'output_dir', 'outputs/my_hierarchical_microstates');
+```
+
+This route keeps the same fitting machinery but treats the montage embedded in each EEG file as the source of truth. The condition column may also be named `Dreaming`. `.set` files load through EEGLAB; `.fif` and other EEG formats load when FieldTrip, EEGLAB FileIO/Biosig, or MNE-MATLAB is available on the MATLAB path. If `.fif` loading is unavailable locally, convert to `.set` first and preserve `EEG.chanlocs`.
+Use `scalp_channel_max_radius` to include lower skirt electrodes in high-density nets; the default is `0.60`.
+
+If MATLAB cannot load `.fif` directly, convert a manifest with:
+
+```bash
+python3 convert_fif_manifest_to_set.py labelled_eeg_files.csv outputs/dreams_set --overwrite
+```
+
+The converter writes a converted manifest, `.set` files, and `*_chanlocs.mat`/`*_electrodes.tsv` sidecars. The hierarchy loader uses `*_chanlocs.mat` when the `.set` has missing or degenerate channel positions. If the manifest was transferred from another machine and only the filenames are still right, pass `--input-dir /path/to/local/files`. If some FIF rows contain a montage object with NaN channel coordinates, the converter fills those rows from finite same-manifest montage coordinates matched by channel number. If no finite reference exists, pass `--montage` with an MNE montage name or custom montage file when you have the correct external montage.
 
 How it works:
 
-1. Loads each EEG file with EEGLAB or MATLAB loading.
+1. Loads each EEG file with EEGLAB/MATLAB loading, or FieldTrip/MNE-MATLAB when available for formats such as `.fif`.
 2. Keeps scalp channels when `use_scalp_channels=true`.
 3. Excludes channels in `exclude_channels`, default `{'PO9','PO10'}` for LEMON.
-4. Builds the fitting montage. By default, `interpolate_missing_channels=false`, so only channels common to all files are used. If `interpolate_missing_channels=true`, the densest retained montage is used and missing channels are filled by inverse-distance weighted interpolation from observed channel positions.
+4. Builds the fitting montage. By default, `interpolate_missing_channels=true`, so the densest retained montage is used and missing channels are filled by inverse-distance weighted interpolation from observed channel positions. If set to `false`, only channels common to all files are used.
 5. Applies preprocessing before GFP extraction: average reference, optional spatial filter, temporal bandpass, GFP peak finding, and optional GFP outlier rejection.
 6. Keeps all GFP peaks by default. Use `max_maps_per_file` only for fast smoke runs.
 7. Pools the GFP peak maps across the whole dataset and fits the global model with SPM `spm_mix` over polarity-invariant PCA/projective features.
@@ -181,15 +200,7 @@ Upstream source:
 - MATLAB R2020a or newer; developed with R2025a.
 - EEGLAB for `.set` loading and `topoplot`.
 - SPM mixture toolbox (`spm_mix`) for SPM/VB methods. This is included in the development version of SPM.
-- Vendored MICROSTATELAB functions in `Koenig_code/` for the traditional K-means implementation.
-
-## Development Notes
-
-- Keep public workflows thin and put reusable logic in `microstate_utilities.m`.
-- If an upstream MICROSTATELAB function is copied verbatim, place it in `Koenig_code/` and add it to the list above in this `README`.
-- Prefer `run_benchmark_then_lemon_vb_pipeline.m` for shareable batch runs rather than the older meta-selector runner.
-- Do not commit subject-level EEG data, generated `.mat` outputs, diagnostic folders, local manifests with absolute paths, or anything placed under `old/`.
-- Prefer adding new defaults to `config/microstate_config.json` and reading them through `microstate_utilities().load_config()`.
+- Vendored MICROSTATELAB functions in `Koenig_code/` for the traditional K-means implementation. For comparison with current state of the art we leverage this mature repository.
 
 ## License
 

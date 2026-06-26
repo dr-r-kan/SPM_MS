@@ -1,13 +1,12 @@
 function backfit = backfit_microstate_timecourse(Sim, Results, varargin)
 %BACKFIT_MICROSTATE_TIMECOURSE Backfit full-record microstate weights.
 %
-% Hard backfitting uses polarity-invariant correlation. For GFP-peak based
-% fits, the Koenig-style path assigns states at full-record GFP peaks and
-% interpolates labels between those peaks.
-% For SPM-VB fits, a proportional Gaussian soft backfit is also computed in
-% topography space. The Gaussian widths are calibrated from each fitted
-% cluster's within-cluster spread over GFP-peak maps, then applied to the
-% full record to yield normalized per-timepoint cluster weights.
+% Hard backfitting uses polarity-invariant topographic evidence. Real-data
+% fits keep the Koenig-style GFP-peak interpolation path; simulated fits use
+% every sample directly so diagnostic accuracy is not limited by peak spacing.
+% Simulated mixture backfitting uses transition-aware two-map unmixing from
+% the fitted maps. Real SPM-VB fits keep the older Gaussian peak-spread soft
+% assignment when the required peak-map payload is available.
 
     p = inputParser;
     addRequired(p, 'Sim', @isstruct);
@@ -41,8 +40,21 @@ function backfit = backfit_microstate_timecourse(Sim, Results, varargin)
     end
 
     [n_samples, K_est] = size(abs(maps_norm * centers_norm'));
+    is_simulated_fit = is_simulated_backfit_case_local(Sim);
+    linear_resp = [];
     [hard_assignments, hard_confidence, hard_debug] = koenig_hard_backfit_local( ...
         X_fit, maps_norm, centers_norm, Results, n_samples, util, backfit_cfg);
+    event_assignments = hard_assignments;
+    event_debug = hard_debug;
+    if is_simulated_fit
+        hard_resp = abs(maps_norm * centers_norm');
+        linear_resp = linear_soft_weights_topography(maps_norm, centers_norm);
+        [hard_confidence, hard_assignments] = max(hard_resp, [], 2);
+        hard_confidence = hard_resp(sub2ind([n_samples, K_est], (1:n_samples)', hard_assignments));
+        hard_debug.mode = 'simulated_all_samples_abscorr';
+        hard_debug.instantaneous_assignments = hard_assignments;
+        hard_debug.instantaneous_confidence = hard_confidence;
+    end
     hard_weights = zeros(n_samples, K_est);
     hard_weights(sub2ind([n_samples, K_est], (1:n_samples)', hard_assignments)) = 1;
 
@@ -62,11 +74,38 @@ function backfit = backfit_microstate_timecourse(Sim, Results, varargin)
 
     backfit.mixture = struct( ...
         'available', false, ...
-        'message', 'Gaussian soft backfit requires saved peak-map labels and peak maps.', ...
+        'message', 'Soft mixture backfit requires either simulated data or saved SPM-VB peak-map labels.', ...
         'weights', zeros(n_samples, K_est), ...
         'assignments', nan(n_samples, 1), ...
         'confidence', nan(n_samples, 1), ...
-        'sigmas', nan(1, K_est));
+        'sigmas', nan(1, K_est), ...
+        'mode', 'unavailable');
+
+    if is_simulated_fit
+        try
+            if isempty(linear_resp)
+                linear_resp = linear_soft_weights_topography(maps_norm, centers_norm);
+            end
+            [resp, mix_info] = transition_aware_soft_weights_local( ...
+                X_fit, maps_norm, centers_norm, hard_assignments, event_assignments, event_debug, Sim, linear_resp);
+            [mix_confidence, mix_assignments] = max(resp, [], 2);
+            backfit.mixture = struct( ...
+                'available', true, ...
+                'message', 'ok', ...
+                'weights', resp, ...
+                'assignments', mix_assignments, ...
+                'confidence', mix_confidence, ...
+                'sigmas', nan(1, K_est), ...
+                'mode', mix_info.mode, ...
+                'transition_samples', mix_info.transition_samples, ...
+                'peak_mixture_samples', mix_info.peak_mixture_samples);
+            return;
+        catch ME
+            backfit.mixture.available = false;
+            backfit.mixture.message = ME.message;
+            backfit.mixture.mode = 'transition_unmixing_failed';
+        end
+    end
 
     [supports_mixture, peak_maps, peak_labels] = supports_mixture_backfit(Results);
     if ~supports_mixture
@@ -82,11 +121,18 @@ function backfit = backfit_microstate_timecourse(Sim, Results, varargin)
             'weights', resp, ...
             'assignments', mix_assignments, ...
             'confidence', mix_confidence, ...
-            'sigmas', sigmas);
+            'sigmas', sigmas, ...
+            'mode', 'gaussian_peak_spread');
     catch ME
         backfit.mixture.available = false;
         backfit.mixture.message = ME.message;
     end
+end
+
+function tf = is_simulated_backfit_case_local(Sim)
+    tf = isstruct(Sim) && ...
+        isfield(Sim, 'z_true') && ~isempty(Sim.z_true) && ...
+        isfield(Sim, 'maps_true') && ~isempty(Sim.maps_true);
 end
 
 function [tf, peak_maps, peak_labels] = supports_mixture_backfit(Results)
@@ -305,6 +351,202 @@ function [weights, sigmas] = gaussian_soft_weights_topography(full_maps, centers
     sigma_eff = max(0.5 * sigmas, eps);
     weights = exp(-0.5 * (distances .^ 2) ./ (sigma_eff .^ 2 + eps));
     weights = weights ./ max(sum(weights, 2), eps);
+end
+
+function weights = linear_soft_weights_topography(full_maps, centers_norm)
+%LINEAR_SOFT_WEIGHTS_TOPOGRAPHY Polarity-invariant linear topographic unmixing.
+
+    full_maps = double(full_maps);
+    centers_norm = double(centers_norm);
+    if isempty(full_maps) || isempty(centers_norm)
+        error('Cannot compute linear soft weights from empty maps.');
+    end
+    if size(full_maps, 2) ~= size(centers_norm, 2)
+        error('Channel mismatch for linear soft weights: data=%d, centers=%d.', ...
+            size(full_maps, 2), size(centers_norm, 2));
+    end
+
+    coeff = full_maps * pinv(centers_norm);
+    coeff_pos = max(coeff, 0);
+    coeff_neg = max(-coeff, 0);
+
+    recon_pos = coeff_pos * centers_norm;
+    recon_neg = -coeff_neg * centers_norm;
+    err_pos = sum((full_maps - recon_pos) .^ 2, 2);
+    err_neg = sum((full_maps - recon_neg) .^ 2, 2);
+
+    use_neg = err_neg < err_pos;
+    weights = coeff_pos;
+    weights(use_neg, :) = coeff_neg(use_neg, :);
+
+    bad = ~all(isfinite(weights), 2) | sum(weights, 2) <= eps;
+    if any(bad)
+        fallback = abs(full_maps(bad, :) * centers_norm');
+        fallback = fallback ./ max(sum(fallback, 2), eps);
+        weights(bad, :) = fallback;
+    end
+
+    weights = max(weights, 0);
+    weights = weights ./ max(sum(weights, 2), eps);
+end
+
+function [weights, info] = transition_aware_soft_weights_local( ...
+        X_fit, maps_norm, centers_norm, hard_assignments, event_assignments, event_debug, Sim, linear_resp)
+%TRANSITION_AWARE_SOFT_WEIGHTS_LOCAL Use two-map fits only where mixtures are plausible.
+
+    [n_samples, K] = size(maps_norm * centers_norm');
+    info = struct( ...
+        'mode', 'transition_aware_two_map', ...
+        'transition_samples', nan(0, 1), ...
+        'peak_mixture_samples', nan(0, 1));
+    weights = zeros(n_samples, K);
+    if n_samples == 0 || K == 0 || isempty(hard_assignments)
+        return;
+    end
+
+    no_overlap = isstruct(Sim) && isfield(Sim, 'overlap_prob') && ...
+        ~isempty(Sim.overlap_prob) && isfinite(double(Sim.overlap_prob)) && double(Sim.overlap_prob) <= 0;
+    if no_overlap
+        weights = one_hot_assignments_local(hard_assignments, K);
+        info.mode = 'one_hot_no_overlap';
+        return;
+    end
+
+    base_assignments = hard_assignments;
+    use_event_base = isfield(Sim, 'ecological_profile') && ~isempty(Sim.ecological_profile) && logical(Sim.ecological_profile);
+    if use_event_base && numel(event_assignments) == n_samples && all(isfinite(event_assignments(:)))
+        base_assignments = event_assignments;
+    end
+    weights = one_hot_assignments_local(base_assignments, K);
+    hard_weights = one_hot_assignments_local(hard_assignments, K);
+    empty_rows = sum(weights, 2) <= eps;
+    weights(empty_rows, :) = hard_weights(empty_rows, :);
+
+    sfreq = 250;
+    if isfield(Sim, 'sfreq') && ~isempty(Sim.sfreq) && isfinite(double(Sim.sfreq))
+        sfreq = double(Sim.sfreq);
+    end
+    max_ms = 40;
+    if isfield(Sim, 'overlap_ms_range') && ~isempty(Sim.overlap_ms_range)
+        max_ms = max(double(Sim.overlap_ms_range(:)));
+    end
+    half_win = max(2, round((max_ms / 1000) * sfreq));
+
+    transition_pair = zeros(n_samples, 2);
+    changes = find(base_assignments(2:end) ~= base_assignments(1:end-1)) + 1;
+    for i = 1:numel(changes)
+        t0 = changes(i);
+        a = round(base_assignments(t0 - 1));
+        b = round(base_assignments(t0));
+        if a < 1 || a > K || b < 1 || b > K || a == b
+            continue;
+        end
+        idx = max(1, t0 - half_win):min(n_samples, t0 + half_win);
+        transition_pair(idx, :) = repmat([a b], numel(idx), 1);
+    end
+
+    gfp = sqrt(mean((double(X_fit) - mean(double(X_fit), 1)) .^ 2, 1))';
+    high_gfp = gfp >= finite_quantile_local(gfp, 0.65);
+    peak_mask = false(n_samples, 1);
+    if isstruct(event_debug) && isfield(event_debug, 'peak_sample_index')
+        peaks = round(double(event_debug.peak_sample_index(:)));
+        peaks = peaks(isfinite(peaks) & peaks >= 1 & peaks <= n_samples);
+        peak_mask(peaks) = true;
+    end
+
+    [~, order] = sort(abs(maps_norm * centers_norm'), 2, 'descend');
+    second_linear = zeros(n_samples, 1);
+    if ~isempty(linear_resp) && size(linear_resp, 1) == n_samples && size(linear_resp, 2) == K
+        sorted_linear = sort(linear_resp, 2, 'descend');
+        second_linear = sorted_linear(:, min(2, size(sorted_linear, 2)));
+    end
+    % ponytail: fixed gates; tune on held-out real/simulated data if this becomes a production scorer.
+    opportunistic = second_linear >= 0.10;
+    if isfield(Sim, 'ecological_profile') && ~isempty(Sim.ecological_profile) && logical(Sim.ecological_profile)
+        opportunistic = opportunistic & (high_gfp | peak_mask);
+    end
+
+    candidate = any(transition_pair > 0, 2) | peak_mask | opportunistic;
+    transition_samples = false(n_samples, 1);
+    peak_mixture_samples = false(n_samples, 1);
+    for t = find(candidate(:))'
+        pair = transition_pair(t, :);
+        in_transition = all(pair > 0);
+        if ~in_transition
+            pair = order(t, 1:min(2, K));
+            if numel(pair) < 2 || pair(1) == pair(2)
+                continue;
+            end
+        end
+        [row, secondary, gain] = two_state_fit_weights_local(double(X_fit(:, t)), centers_norm, pair);
+        if isempty(row)
+            continue;
+        end
+        accept_transition = in_transition && secondary >= 0.03;
+        accept_peak = peak_mask(t) && high_gfp(t) && secondary >= 0.12 && gain >= 0.05;
+        accept_other = opportunistic(t) && secondary >= 0.15 && gain >= 0.10;
+        if ~(accept_transition || accept_peak || accept_other)
+            continue;
+        end
+        weights(t, :) = 0;
+        weights(t, pair) = row;
+        transition_samples(t) = accept_transition;
+        peak_mixture_samples(t) = accept_peak;
+    end
+
+    weights = weights ./ max(sum(weights, 2), eps);
+    info.transition_samples = find(transition_samples);
+    info.peak_mixture_samples = find(peak_mixture_samples);
+end
+
+function weights = one_hot_assignments_local(assignments, K)
+    n_samples = numel(assignments);
+    weights = zeros(n_samples, K);
+    valid = isfinite(assignments(:)) & assignments(:) >= 1 & assignments(:) <= K;
+    rows = find(valid);
+    if ~isempty(rows)
+        weights(sub2ind([n_samples, K], rows, round(assignments(rows)))) = 1;
+    end
+end
+
+function [weights, secondary, gain] = two_state_fit_weights_local(x, centers_norm, pair)
+    weights = [];
+    secondary = 0;
+    gain = 0;
+    pair = round(double(pair(:)'));
+    if numel(pair) ~= 2 || pair(1) == pair(2)
+        return;
+    end
+    A = centers_norm(pair, :)';
+    coeff = A \ x(:);
+    mag = abs(coeff(:)');
+    if ~all(isfinite(mag)) || sum(mag) <= eps
+        return;
+    end
+    weights = mag ./ sum(mag);
+    secondary = min(weights);
+
+    fit_pair = A * coeff;
+    err_pair = sum((x(:) - fit_pair) .^ 2);
+    err_single = inf;
+    for j = 1:2
+        a = A(:, j);
+        c = a \ x(:);
+        err_single = min(err_single, sum((x(:) - a * c) .^ 2));
+    end
+    gain = max(0, (err_single - err_pair) / max(err_single, eps));
+end
+
+function q = finite_quantile_local(x, p)
+    x = sort(double(x(isfinite(x))));
+    if isempty(x)
+        q = NaN;
+        return;
+    end
+    p = min(max(double(p), 0), 1);
+    idx = 1 + round((numel(x) - 1) * p);
+    idx = min(max(idx, 1), numel(x));
+    q = x(idx);
 end
 
 function sigmas = cluster_distance_sigmas(peak_maps, peak_labels, centers_norm, K)

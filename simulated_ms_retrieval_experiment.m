@@ -64,11 +64,12 @@ function T = simulated_ms_retrieval_experiment(varargin)
     addParameter(p, 'overlap_probs', double(sim_defaults.overlap_probs(:)'), @isnumeric); % run with and without overlap
     addParameter(p, 'overlap_ms_range', double(sim_defaults.overlap_ms_range(:)'), @isnumeric);
     addParameter(p, 'overlap_strength', double(sim_defaults.overlap_strength), @isnumeric);
-    addParameter(p, 'compute_backfit_diagnostics', logical(util.get_field(sim_defaults, 'compute_backfit_diagnostics', true)), @islogical);
-    addParameter(p, 'save_backfit_details', logical(util.get_field(sim_defaults, 'save_backfit_details', true)), @islogical);
+    addParameter(p, 'compute_backfit_diagnostics', logical(util.get_field(sim_defaults, 'compute_backfit_diagnostics', false)), @islogical);
+    addParameter(p, 'save_backfit_details', logical(util.get_field(sim_defaults, 'save_backfit_details', false)), @islogical);
     addParameter(p, 'backfit_downsample_factor', double(util.get_field(sim_defaults, 'backfit_downsample_factor', 5)), ...
         @(x) isnumeric(x) && isscalar(x) && x >= 1);
     addParameter(p, 'template_alignment_strong_threshold', double(util.get_field(sim_defaults, 'template_alignment_strong_threshold', 0.5)), @isnumeric);
+    addParameter(p, 'ecological_profile', logical(util.get_field(sim_defaults, 'ecological_profile', true)), @islogical);
     addParameter(p, 'randomize_true_templates', logical(util.get_field(sim_defaults, 'randomize_true_templates', true)), @islogical);
     addParameter(p, 'true_template_pool_K', double(util.get_field(sim_defaults, 'true_template_pool_K', 7)), @isnumeric);
     addParameter(p, 'clean_sanity_profile', logical(util.get_field(sim_defaults, 'clean_sanity_profile', true)), @islogical);
@@ -1315,7 +1316,8 @@ function sim_opts = build_simulation_options(CONFIG, overlap_prob, SNR_dB, rep, 
     sim_opts = struct( ...
         'prob', overlap_prob, ...
         'ms_range', CONFIG.overlap_ms_range, ...
-        'strength', CONFIG.overlap_strength);
+        'strength', CONFIG.overlap_strength, ...
+        'ecological_profile', CONFIG.ecological_profile);
 
     if CONFIG.randomize_true_templates
         pool_K = round(double(CONFIG.true_template_pool_K));

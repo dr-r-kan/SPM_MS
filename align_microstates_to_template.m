@@ -9,13 +9,14 @@ function alignment = align_microstates_to_template(estimated_maps, template_file
     addRequired(p, 'estimated_maps', @isnumeric);
     addRequired(p, 'template_file', @(x) ischar(x) || isstring(x));
     addParameter(p, 'estimated_channel_labels', {}, @(x) iscell(x) || isstring(x));
+    addParameter(p, 'estimated_chanlocs', [], @(x) isempty(x) || isstruct(x));
     addParameter(p, 'template_K', 7, @isnumeric);
     addParameter(p, 'strong_threshold', 0.5, @isnumeric);
     parse(p, estimated_maps, template_file, varargin{:});
 
     util = microstate_utilities();
     estimated_maps = util.normalize_maps(double(estimated_maps));
-    [template_maps, template_labels, template_channel_labels] = ...
+    [template_maps, template_labels, template_channel_labels, template_chanlocs] = ...
         load_metamaps_templates(template_file, 'K', p.Results.template_K);
 
     est_labels = cellstr(p.Results.estimated_channel_labels);
@@ -32,14 +33,14 @@ function alignment = align_microstates_to_template(estimated_maps, template_file
             template_common = template_maps(:, idx_template);
             channel_match_mode = 'labels';
         else
-            [estimated_common, template_common, channel_match_mode, idx_est, idx_template] = ...
-                use_first_common_channels(estimated_maps, template_maps);
-            common_labels = est_labels(idx_est);
+            [estimated_common, template_common, channel_match_mode, common_labels, idx_est, idx_template] = ...
+                coordinate_or_first_common(estimated_maps, template_maps, p.Results.estimated_chanlocs, ...
+                template_chanlocs, tmpl_labels, util);
         end
     else
-        [estimated_common, template_common, channel_match_mode, idx_est, idx_template] = ...
-            use_first_common_channels(estimated_maps, template_maps);
-        common_labels = arrayfun(@(i) sprintf('Ch%03d', i), idx_est, 'UniformOutput', false);
+        [estimated_common, template_common, channel_match_mode, common_labels, idx_est, idx_template] = ...
+            coordinate_or_first_common(estimated_maps, template_maps, p.Results.estimated_chanlocs, ...
+            template_chanlocs, tmpl_labels, util);
     end
 
     estimated_common = util.normalize_maps(estimated_common);
@@ -84,17 +85,85 @@ function alignment = align_microstates_to_template(estimated_maps, template_file
         'polarity', polarity, ...
         'aligned_maps', aligned_maps, ...
         'corr_matrix', corr_matrix, ...
+        'estimated_common_maps', estimated_common, ...
+        'template_common_maps', template_common, ...
         'template_labels', {template_labels}, ...
         'channel_match_mode', channel_match_mode, ...
         'matched_channel_labels', {common_labels}, ...
         'estimated_channel_indices', idx_est, ...
         'template_channel_indices', idx_template, ...
-        'n_common_channels', numel(idx_est), ...
+        'n_common_channels', size(estimated_common, 2), ...
         'mean_correlation', mean(template_corr(template_corr > 0)), ...
         'median_correlation', median(template_corr(template_corr > 0)), ...
         'min_correlation', min(template_corr(template_corr > 0)), ...
         'n_strong_matches', sum(strong), ...
         'strong_threshold', p.Results.strong_threshold);
+end
+
+function [estimated_common, template_common, mode, common_labels, idx_est, idx_template] = coordinate_or_first_common(estimated_maps, template_maps, estimated_chanlocs, template_chanlocs, template_labels, util)
+    [estimated_common, template_common, mode, common_labels, idx_est, idx_template] = ...
+        use_coordinate_interpolation(estimated_maps, template_maps, estimated_chanlocs, template_chanlocs, template_labels, util);
+    if ~isempty(estimated_common)
+        return;
+    end
+
+    [estimated_common, template_common, mode, idx_est, idx_template] = ...
+        use_first_common_channels(estimated_maps, template_maps);
+    common_labels = arrayfun(@(i) sprintf('Ch%03d', i), idx_est, 'UniformOutput', false);
+end
+
+function [estimated_common, template_common, mode, common_labels, idx_est, idx_template] = use_coordinate_interpolation(estimated_maps, template_maps, estimated_chanlocs, template_chanlocs, template_labels, util)
+    estimated_common = [];
+    template_common = [];
+    mode = '';
+    common_labels = {};
+    idx_est = [];
+    idx_template = [];
+    if isempty(estimated_chanlocs) || isempty(template_chanlocs)
+        return;
+    end
+
+    est_pos = util.positions_from_chanlocs(estimated_chanlocs, size(estimated_maps, 2));
+    tmpl_pos = util.positions_from_chanlocs(template_chanlocs, size(template_maps, 2));
+    est_ok = all(isfinite(est_pos), 2);
+    tmpl_ok = all(isfinite(tmpl_pos), 2);
+    if sum(est_ok) < 4 || sum(tmpl_ok) < 4
+        return;
+    end
+
+    est_pos = normalise_rows(est_pos(est_ok, :));
+    tmpl_pos = normalise_rows(tmpl_pos(tmpl_ok, :));
+    idx_est = find(est_ok);
+    idx_template = find(tmpl_ok);
+    estimated_common = idw_interpolate_maps(estimated_maps(:, idx_est), est_pos, tmpl_pos, 6);
+    template_common = template_maps(:, idx_template);
+    common_labels = template_labels(idx_template);
+    mode = 'coordinates_idw_to_template';
+end
+
+function pos = normalise_rows(pos)
+    norms = sqrt(sum(pos.^2, 2));
+    norms(norms < eps) = 1;
+    pos = pos ./ norms;
+end
+
+function maps_out = idw_interpolate_maps(maps_in, source_pos, target_pos, n_neighbours)
+    n_neighbours = min(max(1, n_neighbours), size(source_pos, 1));
+    maps_out = zeros(size(maps_in, 1), size(target_pos, 1));
+    for t = 1:size(target_pos, 1)
+        d = sqrt(sum((source_pos - target_pos(t, :)).^2, 2));
+        [ds, ord] = sort(d, 'ascend');
+        ord = ord(1:n_neighbours);
+        ds = ds(1:n_neighbours);
+        if ds(1) <= eps
+            w = zeros(numel(ord), 1);
+            w(1) = 1;
+        else
+            w = 1 ./ (ds.^2 + eps);
+            w = w ./ sum(w);
+        end
+        maps_out(:, t) = maps_in(:, ord) * w;
+    end
 end
 
 function [estimated_common, template_common, mode, idx_est, idx_template] = use_first_common_channels(estimated_maps, template_maps)
