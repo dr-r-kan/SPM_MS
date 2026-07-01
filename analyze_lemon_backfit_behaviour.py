@@ -15,8 +15,8 @@ It then:
 1. Builds participant-level backfit feature matrices for one or more backfit
    methods (`gaussian_mixture`, `hard`).
 2. Auto-discovers psychometric CSV files under the LEMON behavioural folder,
-   keeps only numeric variables from files that overlap the analysed EEG cohort,
-   and performs PCA on the merged psychometric matrix.
+   compiles score-level behavioural variables for overlapping participants,
+   and performs PCA on the merged score matrix.
 3. Relates the retained psychometric PCs to each backfit feature using Pearson
    correlation.
 4. Performs simple demographic effect tests when a demographic table overlaps
@@ -48,14 +48,14 @@ DEFAULT_STATE_METRICS = Path(
 DEFAULT_RECORD_SUMMARY = Path(
     "outputs/hierarchical_microstates/participant_condition_record_backfit_summary.csv"
 )
-DEFAULT_BEHAVIOUR_DIR = Path(
-    "/home/rohan/EEG_Data/LEMON/Behavioural_Data_MPILMBB_LEMON"
-)
-DEFAULT_NAME_MATCH = Path("/home/rohan/EEG_Data/LEMON/name_match.csv")
+DEFAULT_LEMON_ROOT = Path.home() / "EEG" / "LEMON"
+DEFAULT_BEHAVIOUR_DIR = DEFAULT_LEMON_ROOT / "Behavioural_Data_MPILMBB_LEMON"
+DEFAULT_NAME_MATCH = DEFAULT_LEMON_ROOT / "name_match.csv"
 DEFAULT_DEMOGRAPHICS = DEFAULT_BEHAVIOUR_DIR / (
     "META_File_IDs_Age_Gender_Education_Drug_Smoke_SKID_LEMON.csv"
 )
 DEFAULT_OUTPUT_DIR = Path("outputs/hierarchical_microstates/behavioural_backfit_analysis")
+DEFAULT_CONDITIONS = ("EC", "EO")
 
 PID_RE = re.compile(r"^sub-\d+$", re.IGNORECASE)
 AGE_BIN_RE = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
@@ -74,6 +74,202 @@ RECORD_FEATURE_COLUMNS = (
 DEFAULT_PSYCHOMETRIC_DIRS = (
     "Emotion_and_Personality_Test_Battery_LEMON",
     "Cognitive_Test_Battery_LEMON",
+)
+SCORE_SPECS: dict[str, list[dict[str, object]]] = {
+    "Emotion_and_Personality_Test_Battery_LEMON/NYC_Q_lemon.csv": [
+        {
+            "name": "nyc_q_content_mean",
+            "columns": [f"NYC-Q_lemon_{i}" for i in range(1, 24)],
+            "method": "mean",
+        },
+        {
+            "name": "nyc_q_form_mean",
+            "columns": [f"NYC-Q_lemon_{i}" for i in range(24, 32)],
+            "method": "mean",
+        },
+        {
+            "name": "nyc_q_fragmented_vague_form_mean",
+            "columns": ["NYC-Q_lemon_30", "NYC-Q_lemon_31"],
+            "method": "mean",
+        },
+        {
+            "name": "nyc_q_total_mean",
+            "columns": [f"NYC-Q_lemon_{i}" for i in range(1, 32)],
+            "method": "mean",
+        },
+    ],
+    "Emotion_and_Personality_Test_Battery_LEMON/YFAS.csv": [
+        {"name": "yfas_symptom_count", "columns": ["YFAS_symptom_count"]},
+        {"name": "yfas_diagnosis", "columns": ["YFAS_diagnosis"]},
+    ],
+    "Cognitive_Test_Battery_LEMON/CVLT/CVLT.csv": [
+        {"name": "cvlt_trial1_correct", "columns": ["CVLT_2"]},
+        {"name": "cvlt_trial5_correct", "columns": ["CVLT_3"]},
+        {"name": "cvlt_proactive_interference", "columns": ["CVLT_4"]},
+        {"name": "cvlt_retroactive_interference", "columns": ["CVLT_5"]},
+        {"name": "cvlt_total_trials_1_5_correct", "columns": ["CVLT_6"]},
+        {"name": "cvlt_total_trials_1_5_correct_adjusted", "columns": ["CVLT_7"]},
+        {"name": "cvlt_list_b_correct", "columns": ["CVLT_8"]},
+        {"name": "cvlt_short_delay_free_recall", "columns": ["CVLT_9"]},
+        {"name": "cvlt_short_delay_cued_recall", "columns": ["CVLT_10"]},
+        {"name": "cvlt_long_delay_free_recall", "columns": ["CVLT_11"]},
+        {"name": "cvlt_long_delay_cued_recall", "columns": ["CVLT_12"]},
+        {"name": "cvlt_delayed_recognition", "columns": ["CVLT_13"]},
+        {"name": "cvlt_repetitions_total", "columns": ["CVLT_14"]},
+        {"name": "cvlt_intrusions_total", "columns": ["CVLT_15"]},
+    ],
+    "Cognitive_Test_Battery_LEMON/LPS/LPS.csv": [
+        {"name": "lps_logical_reasoning_correct", "columns": ["LPS_1"]},
+    ],
+    "Cognitive_Test_Battery_LEMON/RWT/RWT.csv": [
+        {"name": "rwt_s_words_total_correct", "columns": ["RWT_8"]},
+        {"name": "rwt_s_words_percentile", "columns": ["RWT_9"]},
+        {"name": "rwt_s_words_repetitions_total", "columns": ["RWT_10"]},
+        {"name": "rwt_s_words_rule_breaks_total", "columns": ["RWT_11"]},
+        {"name": "rwt_animals_total_correct", "columns": ["RWT_20"]},
+        {"name": "rwt_animals_percentile", "columns": ["RWT_21"]},
+        {"name": "rwt_animals_repetitions_total", "columns": ["RWT_22"]},
+        {"name": "rwt_animals_rule_breaks_total", "columns": ["RWT_23"]},
+    ],
+    "Cognitive_Test_Battery_LEMON/TAP_Alertness/TAP-Alertness.csv": [
+        {"name": "tap_alertness_no_signal_mean_rt", "columns": ["TAP_A_5"]},
+        {"name": "tap_alertness_no_signal_median_rt", "columns": ["TAP_A_6"]},
+        {"name": "tap_alertness_no_signal_rt_sd", "columns": ["TAP_A_8"]},
+        {"name": "tap_alertness_signal_mean_rt", "columns": ["TAP_A_10"]},
+        {"name": "tap_alertness_signal_median_rt", "columns": ["TAP_A_11"]},
+        {"name": "tap_alertness_signal_rt_sd", "columns": ["TAP_A_13"]},
+        {"name": "tap_alertness_phasic_alertness", "columns": ["TAP_A_15"]},
+    ],
+    "Cognitive_Test_Battery_LEMON/TAP_Incompatibility/TAP-Incompatibility.csv": [
+        {"name": "tap_incompatibility_compatible_mean_rt", "columns": ["TAP_I_1"]},
+        {"name": "tap_incompatibility_compatible_median_rt", "columns": ["TAP_I_2"]},
+        {"name": "tap_incompatibility_compatible_errors", "columns": ["TAP_I_6"]},
+        {"name": "tap_incompatibility_incompatible_mean_rt", "columns": ["TAP_I_8"]},
+        {"name": "tap_incompatibility_incompatible_median_rt", "columns": ["TAP_I_9"]},
+        {"name": "tap_incompatibility_incompatible_errors", "columns": ["TAP_I_13"]},
+        {"name": "tap_incompatibility_total_mean_rt", "columns": ["TAP_I_15"]},
+        {"name": "tap_incompatibility_total_median_rt", "columns": ["TAP_I_16"]},
+        {"name": "tap_incompatibility_total_errors", "columns": ["TAP_I_20"]},
+        {"name": "tap_incompatibility_visual_field_f", "columns": ["TAP_I_22"]},
+        {"name": "tap_incompatibility_response_hand_f", "columns": ["TAP_I_24"]},
+        {"name": "tap_incompatibility_visual_field_by_hand_f", "columns": ["TAP_I_26"]},
+        {
+            "name": "tap_incompatibility_mean_rt_cost",
+            "columns": ["TAP_I_8", "TAP_I_1"],
+            "method": "diff",
+        },
+        {
+            "name": "tap_incompatibility_median_rt_cost",
+            "columns": ["TAP_I_9", "TAP_I_2"],
+            "method": "diff",
+        },
+    ],
+    "Cognitive_Test_Battery_LEMON/TAP_Working_Memory/TAP-Working Memory.csv": [
+        {"name": "tap_working_memory_mean_rt", "columns": ["TAP_WM_1"]},
+        {"name": "tap_working_memory_median_rt", "columns": ["TAP_WM_2"]},
+        {"name": "tap_working_memory_rt_sd", "columns": ["TAP_WM_4"]},
+        {"name": "tap_working_memory_correct_matches", "columns": ["TAP_WM_6"]},
+        {"name": "tap_working_memory_errors", "columns": ["TAP_WM_7"]},
+        {"name": "tap_working_memory_omissions", "columns": ["TAP_WM_9"]},
+    ],
+    "Cognitive_Test_Battery_LEMON/TMT/TMT.csv": [
+        {"name": "tmt_trail_a_time_s", "columns": ["TMT_1"]},
+        {"name": "tmt_trail_a_impairment_code", "columns": ["TMT_2"]},
+        {"name": "tmt_trail_a_errors", "columns": ["TMT_3"]},
+        {"name": "tmt_trail_b_time_s", "columns": ["TMT_5"]},
+        {"name": "tmt_trail_b_impairment_code", "columns": ["TMT_6"]},
+        {"name": "tmt_trail_b_errors", "columns": ["TMT_7"]},
+        {
+            "name": "tmt_trail_b_minus_a_time_s",
+            "columns": ["TMT_5", "TMT_1"],
+            "method": "diff",
+        },
+        {
+            "name": "tmt_trail_b_over_a_time_ratio",
+            "columns": ["TMT_5", "TMT_1"],
+            "method": "ratio",
+        },
+    ],
+    "Cognitive_Test_Battery_LEMON/WST/WST.csv": [
+        {"name": "wst_raw_correct", "columns": ["WST_1"]},
+        {"name": "wst_z_score", "columns": ["WST_2"]},
+        {"name": "wst_iq_score", "columns": ["WST_3"]},
+        {"name": "wst_standard_score", "columns": ["WST_4"]},
+    ],
+}
+FOCUSED_SCORE_RULES = (
+    (
+        "__tas_identification",
+        "interoception_proxy",
+        "difficulty_identifying_feelings",
+        "Alexithymia facet closest to interoceptive emotion awareness.",
+    ),
+    (
+        "__tas_describing",
+        "interoception_proxy",
+        "difficulty_describing_feelings",
+        "Alexithymia facet reflecting poor access to affective body-state labels.",
+    ),
+    (
+        "__tas_overallscore",
+        "interoception_proxy",
+        "alexithymia_total",
+        "Overall alexithymia, used as a proxy for reduced emotional interoceptive clarity.",
+    ),
+    (
+        "__fev_hunger",
+        "interoception_proxy",
+        "susceptibility_to_hunger",
+        "Eating-behaviour score most directly tied to hunger/body-signal sensitivity.",
+    ),
+    (
+        "__fev_stoer",
+        "interoception_proxy",
+        "eating_disinhibition",
+        "Eating dysregulation, retained as an interoception-adjacent appetite regulation score.",
+    ),
+    (
+        "__mars_disengagement",
+        "dissociation_proxy",
+        "affect_regulation_disengagement",
+        "Disengagement affect regulation is the closest available dissociation-adjacent coping style.",
+    ),
+    (
+        "__mars_avoidance",
+        "dissociation_proxy",
+        "affect_regulation_avoidance",
+        "Avoidance affect regulation is relevant to detachment/dissociative coping.",
+    ),
+    (
+        "__cope_behavioraldisengagement",
+        "dissociation_proxy",
+        "cope_behavioral_disengagement",
+        "Behavioural disengagement is a dissociation-adjacent withdrawal coping score.",
+    ),
+    (
+        "__cope_denial",
+        "dissociation_proxy",
+        "cope_denial",
+        "Denial is a dissociation-adjacent avoidance coping score.",
+    ),
+    (
+        "__cope_selfdistraction",
+        "dissociation_proxy",
+        "cope_self_distraction",
+        "Self-distraction captures disengagement from present affective state.",
+    ),
+    (
+        "__nyc_q_fragmented_vague_form_mean",
+        "dissociation_proxy",
+        "fragmented_vague_self_generated_thought",
+        "NYC-Q form composite from vague/non-specific and fragmented/disjointed thought items.",
+    ),
+    (
+        "__nyc_q_form_mean",
+        "dissociation_proxy",
+        "self_generated_thought_form",
+        "NYC-Q form section captures imagery/verbal/narrative structure of mind-wandering.",
+    ),
 )
 
 
@@ -132,7 +328,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--conditions",
         nargs="*",
-        default=["eyes_closed", "eyes_open"],
+        default=list(DEFAULT_CONDITIONS),
         help="Conditions to include when building participant-level backfit features.",
     )
     parser.add_argument(
@@ -155,7 +351,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-components",
         type=int,
-        default=10,
+        default=100,
         help="Upper bound on retained psychometric principal components.",
     )
     parser.add_argument(
@@ -175,10 +371,23 @@ def read_csv_rows(path: Path) -> tuple[list[str], list[list[str]]]:
     return rows[0], rows[1:]
 
 
+def is_repeated_header_row(row: dict[str, str], fieldnames: list[str]) -> bool:
+    matches = 0
+    checked = 0
+    for field in fieldnames:
+        if not field:
+            continue
+        checked += 1
+        if str(row.get(field, "")).strip().strip('"') == field:
+            matches += 1
+    return checked > 0 and matches / checked >= 0.8
+
+
 def read_csv_dicts(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
-        return list(reader)
+        fieldnames = [field for field in (reader.fieldnames or []) if field]
+        return [row for row in reader if not is_repeated_header_row(row, fieldnames)]
 
 
 def write_dict_rows(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
@@ -220,6 +429,21 @@ def sanitize_name(value: str) -> str:
     value = re.sub(r"[^a-z0-9]+", "_", value)
     value = re.sub(r"_+", "_", value).strip("_")
     return value or "unnamed"
+
+
+def normalize_condition(value: str | None) -> str:
+    text = "" if value is None else str(value).strip()
+    key = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    return {
+        "ec": "EC",
+        "eyes_closed": "EC",
+        "eye_closed": "EC",
+        "closed": "EC",
+        "eo": "EO",
+        "eyes_open": "EO",
+        "eye_open": "EO",
+        "open": "EO",
+    }.get(key, text)
 
 
 def parse_float(value: str | None) -> float:
@@ -398,7 +622,7 @@ def build_backfit_feature_matrix(
         if not parse_boolish(row.get("backfit_available")):
             continue
         participant = resolve_participant_id(row.get("participant"), participant_aliases)
-        condition = row.get("condition", "").strip()
+        condition = normalize_condition(row.get("condition"))
         label = row.get("template_label", "").strip()
         if not participant or not condition or not label or condition not in conditions:
             continue
@@ -417,7 +641,7 @@ def build_backfit_feature_matrix(
         if not parse_boolish(row.get("backfit_available")):
             continue
         participant = resolve_participant_id(row.get("participant"), participant_aliases)
-        condition = row.get("condition", "").strip()
+        condition = normalize_condition(row.get("condition"))
         if not participant or condition not in conditions:
             continue
         participants.add(participant)
@@ -429,23 +653,23 @@ def build_backfit_feature_matrix(
                 feature_names.add(name)
         record_counts += 1
 
-    if include_deltas and {"eyes_closed", "eyes_open"}.issubset(conditions):
+    if include_deltas and {"EC", "EO"}.issubset(conditions):
         participant_ids = list(participants)
         delta_targets = list(feature_names)
         for participant in participant_ids:
             row_dict = feature_values[participant]
             for feature_name in delta_targets:
-                if "__eyes_closed__" in feature_name:
-                    open_name = feature_name.replace("__eyes_closed__", "__eyes_open__")
+                if "__EC__" in feature_name:
+                    open_name = feature_name.replace("__EC__", "__EO__")
                     if open_name in row_dict and feature_name in row_dict:
                         closed_vals = row_dict[feature_name]
                         open_vals = row_dict[open_name]
                         if closed_vals and open_vals:
                             delta_name = (
                                 feature_name.replace(
-                                    "state__eyes_closed__", "delta__eyes_open_minus_closed__"
+                                    "state__EC__", "delta__EO_minus_EC__"
                                 ).replace(
-                                    "record__eyes_closed__", "delta_record__eyes_open_minus_closed__"
+                                    "record__EC__", "delta_record__EO_minus_EC__"
                                 )
                             )
                             delta_value = float(np.mean(open_vals) - np.mean(closed_vals))
@@ -481,6 +705,224 @@ def discover_psychometric_csvs(behaviour_dir: Path) -> list[Path]:
     return csvs
 
 
+def behaviour_rel_path(csv_path: Path, behaviour_dir: Path) -> str:
+    return csv_path.relative_to(behaviour_dir).as_posix()
+
+
+def score_specs_for(csv_path: Path, behaviour_dir: Path) -> list[dict[str, object]] | None:
+    return SCORE_SPECS.get(behaviour_rel_path(csv_path, behaviour_dir))
+
+
+def compute_score_value(row: list[str], col_indices: list[int], method: str) -> float:
+    values = [parse_float(row[idx] if idx < len(row) else "") for idx in col_indices]
+    if method == "copy":
+        return values[0] if values else np.nan
+    if method == "mean":
+        finite = [value for value in values if math.isfinite(value)]
+        return float(np.mean(finite)) if finite else np.nan
+    if method == "diff":
+        if len(values) < 2 or not all(math.isfinite(v) for v in values[:2]):
+            return np.nan
+        return values[0] - values[1]
+    if method == "ratio":
+        if len(values) < 2 or not all(math.isfinite(v) for v in values[:2]) or values[1] == 0:
+            return np.nan
+        return values[0] / values[1]
+    raise ValueError(f"Unknown score method: {method}")
+
+
+def add_score_values(
+    csv_path: Path,
+    behaviour_dir: Path,
+    header: list[str],
+    rows: list[list[str]],
+    pid_col: int,
+    overlap_ids: set[str],
+    participant_aliases: dict[str, str],
+    per_participant: dict[str, dict[str, float]],
+) -> tuple[int, list[dict[str, object]]]:
+    specs = score_specs_for(csv_path, behaviour_dir)
+    if specs is None:
+        return add_score_columns_from_numeric_csv(
+            csv_path,
+            behaviour_dir,
+            header,
+            rows,
+            pid_col,
+            overlap_ids,
+            participant_aliases,
+            per_participant,
+        )
+
+    prefix = sanitize_name(str(csv_path.relative_to(behaviour_dir).with_suffix("")))
+    header_lookup = {name: idx for idx, name in enumerate(header)}
+    inventory_rows: list[dict[str, object]] = []
+    used_scores = 0
+    for spec in specs:
+        columns = [str(column) for column in spec["columns"]]
+        missing_columns = [column for column in columns if column not in header_lookup]
+        feature_name = f"{prefix}__{sanitize_name(str(spec['name']))}"
+        method = str(spec.get("method", "copy"))
+        if missing_columns:
+            inventory_rows.append(
+                score_inventory_row(
+                    csv_path,
+                    behaviour_dir,
+                    [],
+                    columns,
+                    feature_name,
+                    method,
+                    len(overlap_ids),
+                    0,
+                    0,
+                    0,
+                    "skipped_missing_source_columns",
+                )
+            )
+            continue
+
+        col_indices = [header_lookup[column] for column in columns]
+        nonempty_count = 0
+        numeric_count = 0
+        overlap_nonmissing = 0
+        for row in rows:
+            participant = resolve_participant_id(
+                row[pid_col] if pid_col < len(row) else "", participant_aliases
+            )
+            source_values = [row[idx] if idx < len(row) else "" for idx in col_indices]
+            if any(str(value).strip().strip('"') for value in source_values):
+                nonempty_count += 1
+            if any(math.isfinite(parse_float(value)) for value in source_values):
+                numeric_count += 1
+            if participant not in overlap_ids:
+                continue
+            value = compute_score_value(row, col_indices, method)
+            if math.isfinite(value):
+                per_participant[participant][feature_name] = value
+                overlap_nonmissing += 1
+
+        status = "used" if overlap_nonmissing > 0 else "skipped_all_missing_after_overlap"
+        inventory_rows.append(
+            score_inventory_row(
+                csv_path,
+                behaviour_dir,
+                col_indices,
+                columns,
+                feature_name,
+                method,
+                len(overlap_ids),
+                nonempty_count,
+                numeric_count,
+                overlap_nonmissing,
+                status,
+            )
+        )
+        if overlap_nonmissing > 0:
+            used_scores += 1
+    return used_scores, inventory_rows
+
+
+def add_score_columns_from_numeric_csv(
+    csv_path: Path,
+    behaviour_dir: Path,
+    header: list[str],
+    rows: list[list[str]],
+    pid_col: int,
+    overlap_ids: set[str],
+    participant_aliases: dict[str, str],
+    per_participant: dict[str, dict[str, float]],
+) -> tuple[int, list[dict[str, object]]]:
+    prefix = sanitize_name(str(csv_path.relative_to(behaviour_dir).with_suffix("")))
+    inventory_rows: list[dict[str, object]] = []
+    used_scores = 0
+    max_cols = max((len(row) for row in rows), default=len(header))
+    for col_idx in range(max_cols):
+        if col_idx == pid_col:
+            continue
+        col_name = header[col_idx] if col_idx < len(header) else f"col_{col_idx}"
+        if not str(col_name).strip():
+            continue
+        col_values = [row[col_idx] if col_idx < len(row) else "" for row in rows]
+        is_numeric, nonempty_count, numeric_count = detect_numeric_column(col_values)
+        feature_name = f"{prefix}__{sanitize_name(col_name)}"
+        if not is_numeric:
+            inventory_rows.append(
+                score_inventory_row(
+                    csv_path,
+                    behaviour_dir,
+                    [col_idx],
+                    [col_name],
+                    feature_name,
+                    "copy",
+                    len(overlap_ids),
+                    nonempty_count,
+                    numeric_count,
+                    0,
+                    "skipped_non_numeric",
+                )
+            )
+            continue
+
+        overlap_nonmissing = 0
+        for row in rows:
+            if pid_col >= len(row):
+                continue
+            participant = resolve_participant_id(row[pid_col], participant_aliases)
+            if participant not in overlap_ids:
+                continue
+            value = parse_float(row[col_idx] if col_idx < len(row) else "")
+            if math.isfinite(value):
+                per_participant[participant][feature_name] = value
+                overlap_nonmissing += 1
+
+        status = "used" if overlap_nonmissing > 0 else "skipped_all_missing_after_overlap"
+        inventory_rows.append(
+            score_inventory_row(
+                csv_path,
+                behaviour_dir,
+                [col_idx],
+                [col_name],
+                feature_name,
+                "copy",
+                len(overlap_ids),
+                nonempty_count,
+                numeric_count,
+                overlap_nonmissing,
+                status,
+            )
+        )
+        if overlap_nonmissing > 0:
+            used_scores += 1
+    return used_scores, inventory_rows
+
+
+def score_inventory_row(
+    csv_path: Path,
+    behaviour_dir: Path,
+    column_indices: list[int],
+    source_columns: list[str],
+    feature_name: str,
+    method: str,
+    n_overlap: int,
+    n_nonempty: int,
+    n_numeric: int,
+    n_overlap_nonmissing: int,
+    status: str,
+) -> dict[str, object]:
+    return {
+        "file": behaviour_rel_path(csv_path, behaviour_dir),
+        "column_index": ";".join(str(idx) for idx in column_indices),
+        "source_column": ";".join(source_columns),
+        "feature_name": feature_name,
+        "score_method": method,
+        "n_overlap_with_backfit": n_overlap,
+        "n_nonempty_values": n_nonempty,
+        "n_numeric_values": n_numeric,
+        "n_overlap_nonmissing": n_overlap_nonmissing,
+        "status": status,
+    }
+
+
 def load_psychometric_matrix(
     behaviour_dir: Path,
     participant_pool: set[str],
@@ -512,66 +954,23 @@ def load_psychometric_matrix(
                     "participant_column_index": pid_col,
                     "n_participants_in_file": len(participant_ids),
                     "n_overlap_with_backfit": len(overlap_ids),
-                    "n_numeric_features_used": 0,
+                    "n_scores_used": 0,
                     "status": "skipped_low_overlap",
                 }
             )
             continue
 
-        prefix = sanitize_name(str(csv_path.relative_to(behaviour_dir).with_suffix("")))
-        max_cols = max((len(row) for row in rows), default=len(header))
-        used_columns = 0
-        for col_idx in range(max_cols):
-            if col_idx == pid_col:
-                continue
-            col_values = []
-            for row in rows:
-                col_values.append(row[col_idx] if col_idx < len(row) else "")
-            is_numeric, nonempty_count, numeric_count = detect_numeric_column(col_values)
-            col_name = header[col_idx] if col_idx < len(header) else f"col_{col_idx}"
-            feature_name = f"{prefix}__{sanitize_name(col_name or f'col_{col_idx}')}"
-            if not is_numeric:
-                inventory_rows.append(
-                    {
-                        "file": str(csv_path.relative_to(behaviour_dir)),
-                        "column_index": col_idx,
-                        "source_column": col_name,
-                        "feature_name": feature_name,
-                        "n_overlap_with_backfit": len(overlap_ids),
-                        "n_nonempty_values": nonempty_count,
-                        "n_numeric_values": numeric_count,
-                        "status": "skipped_non_numeric",
-                    }
-                )
-                continue
-
-            overlap_nonmissing = 0
-            for row in rows:
-                if pid_col >= len(row):
-                    continue
-                participant = resolve_participant_id(row[pid_col], participant_aliases)
-                if participant not in overlap_ids:
-                    continue
-                value = parse_float(row[col_idx] if col_idx < len(row) else "")
-                if math.isfinite(value):
-                    per_participant[participant][feature_name] = value
-                    overlap_nonmissing += 1
-
-            inventory_rows.append(
-                {
-                    "file": str(csv_path.relative_to(behaviour_dir)),
-                    "column_index": col_idx,
-                    "source_column": col_name,
-                    "feature_name": feature_name,
-                    "n_overlap_with_backfit": len(overlap_ids),
-                    "n_nonempty_values": nonempty_count,
-                    "n_numeric_values": numeric_count,
-                    "n_overlap_nonmissing": overlap_nonmissing,
-                    "status": "used" if overlap_nonmissing > 0 else "skipped_all_missing_after_overlap",
-                }
-            )
-            if overlap_nonmissing > 0:
-                used_columns += 1
+        used_scores, csv_inventory_rows = add_score_values(
+            csv_path,
+            behaviour_dir,
+            header,
+            rows,
+            pid_col,
+            overlap_ids,
+            participant_aliases,
+            per_participant,
+        )
+        inventory_rows.extend(csv_inventory_rows)
 
         file_rows.append(
             {
@@ -579,8 +978,8 @@ def load_psychometric_matrix(
                 "participant_column_index": pid_col,
                 "n_participants_in_file": len(participant_ids),
                 "n_overlap_with_backfit": len(overlap_ids),
-                "n_numeric_features_used": used_columns,
-                "status": "used" if used_columns > 0 else "skipped_no_numeric_features",
+                "n_scores_used": used_scores,
+                "status": "used" if used_scores > 0 else "skipped_no_scores",
             }
         )
 
@@ -655,8 +1054,9 @@ def run_psychometric_pca(
     stds[stds == 0] = 1.0
     x_z = (x_imputed - means) / stds
 
-    n_components = int(min(max_components, x_z.shape[0], x_z.shape[1]))
-    if n_components < 1:
+    u, singular_values, vt = np.linalg.svd(x_z, full_matrices=False)
+    component_limit = int(min(max_components, singular_values.size))
+    if component_limit < 1:
         return {
             "participants": participants,
             "feature_names": feature_names,
@@ -672,13 +1072,12 @@ def run_psychometric_pca(
             "loadings": np.empty((len(feature_names), 0)),
         }
 
-    u, singular_values, vt = np.linalg.svd(x_z, full_matrices=False)
-    component_weights_full = vt[:n_components, :].T
+    component_weights_full = vt[:component_limit, :].T
     scores_full = x_z @ component_weights_full
     if x_z.shape[0] > 1:
-        explained_variance_full = (singular_values[:n_components] ** 2) / (x_z.shape[0] - 1)
+        explained_variance_full = (singular_values ** 2) / (x_z.shape[0] - 1)
     else:
-        explained_variance_full = singular_values[:n_components] ** 2
+        explained_variance_full = singular_values ** 2
     total_variance = float(np.sum(explained_variance_full))
     if total_variance > 0:
         explained = explained_variance_full / total_variance
@@ -686,7 +1085,7 @@ def run_psychometric_pca(
         explained = np.zeros_like(explained_variance_full)
     cumulative = np.cumsum(explained)
     retained = int(np.searchsorted(cumulative, variance_threshold, side="left") + 1)
-    retained = max(1, min(retained, n_components))
+    retained = max(1, min(retained, component_limit))
 
     eigenvalues = explained_variance_full[:retained]
     component_weights = component_weights_full[:, :retained]
@@ -958,6 +1357,143 @@ def analyze_demographic_effects(
     return results
 
 
+def select_focused_scores(
+    feature_names: list[str],
+    matrix: np.ndarray,
+) -> tuple[list[str], np.ndarray, list[dict[str, object]]]:
+    indices: list[int] = []
+    rows: list[dict[str, object]] = []
+    for idx, feature_name in enumerate(feature_names):
+        for suffix, domain, construct, rationale in FOCUSED_SCORE_RULES:
+            if feature_name.endswith(suffix):
+                indices.append(idx)
+                rows.append(
+                    {
+                        "feature_name": feature_name,
+                        "domain": domain,
+                        "construct": construct,
+                        "rationale": rationale,
+                        "n_nonmissing": int(np.sum(np.isfinite(matrix[:, idx]))),
+                    }
+                )
+                break
+    if not indices:
+        return [], np.empty((matrix.shape[0], 0)), []
+    return [feature_names[idx] for idx in indices], matrix[:, indices], rows
+
+
+def residualize(values: np.ndarray, covariates: np.ndarray) -> np.ndarray:
+    design = np.column_stack([np.ones(values.size), covariates])
+    beta, *_ = np.linalg.lstsq(design, values, rcond=None)
+    return values - design @ beta
+
+
+def partial_spearman_age_gender(
+    x: np.ndarray,
+    y: np.ndarray,
+    participants: list[str],
+    demo_map: dict[str, dict[str, object]],
+) -> tuple[float, float, int]:
+    covariates: list[list[float]] = []
+    x_keep: list[float] = []
+    y_keep: list[float] = []
+    for participant, x_value, y_value in zip(participants, x, y):
+        if not math.isfinite(x_value) or not math.isfinite(y_value):
+            continue
+        demo = demo_map.get(participant, {})
+        age = demo.get("age_midpoint")
+        gender = demo.get("gender_code")
+        if not isinstance(age, float) or not isinstance(gender, float):
+            continue
+        if not math.isfinite(age) or not math.isfinite(gender):
+            continue
+        x_keep.append(float(x_value))
+        y_keep.append(float(y_value))
+        covariates.append([float(age), float(gender)])
+
+    n = len(x_keep)
+    if n < 10:
+        return np.nan, np.nan, n
+    x_rank = stats.rankdata(np.asarray(x_keep, dtype=float))
+    y_rank = stats.rankdata(np.asarray(y_keep, dtype=float))
+    cov = np.asarray(covariates, dtype=float)
+    cov = np.column_stack([stats.rankdata(cov[:, idx]) for idx in range(cov.shape[1])])
+    if np.std(x_rank) == 0 or np.std(y_rank) == 0 or np.linalg.matrix_rank(cov) == 0:
+        return np.nan, np.nan, n
+
+    x_resid = residualize(x_rank, cov)
+    y_resid = residualize(y_rank, cov)
+    if np.std(x_resid) == 0 or np.std(y_resid) == 0:
+        return np.nan, np.nan, n
+    r = float(np.corrcoef(x_resid, y_resid)[0, 1])
+    df = n - cov.shape[1] - 2
+    if df <= 0 or not math.isfinite(r) or abs(r) >= 1:
+        return r, np.nan, n
+    t_stat = r * math.sqrt(df / max(1.0 - r * r, np.finfo(float).eps))
+    p_value = float(2 * stats.t.sf(abs(t_stat), df))
+    return r, p_value, n
+
+
+def correlate_backfit_with_focused_scores(
+    participants: list[str],
+    backfit_feature_names: list[str],
+    backfit_matrix: np.ndarray,
+    score_names: list[str],
+    score_matrix: np.ndarray,
+    focused_score_rows: list[dict[str, object]],
+    demographic_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    score_meta = {row["feature_name"]: row for row in focused_score_rows}
+    demo_map = build_demographic_maps(demographic_rows)
+    rows: list[dict[str, object]] = []
+    for score_idx, score_name in enumerate(score_names):
+        y = score_matrix[:, score_idx]
+        meta = score_meta.get(score_name, {})
+        if np.sum(np.isfinite(y)) < 10 or np.nanstd(y) == 0:
+            continue
+        for feature_idx, feature_name in enumerate(backfit_feature_names):
+            x = backfit_matrix[:, feature_idx]
+            mask = np.isfinite(x) & np.isfinite(y)
+            if np.sum(mask) < 10 or np.std(x[mask]) == 0 or np.std(y[mask]) == 0:
+                continue
+            rho, p_value = stats.spearmanr(x[mask], y[mask])
+            partial_rho, partial_p, partial_n = partial_spearman_age_gender(
+                x, y, participants, demo_map
+            )
+            rows.append(
+                {
+                    "behaviour_domain": meta.get("domain", ""),
+                    "behaviour_construct": meta.get("construct", ""),
+                    "behaviour_score": score_name,
+                    "microstate_feature": feature_name,
+                    "n": int(np.sum(mask)),
+                    "spearman_rho": float(rho),
+                    "p_value": float(p_value),
+                    "partial_spearman_age_gender": partial_rho,
+                    "partial_p_value": partial_p,
+                    "partial_n": partial_n,
+                    "rationale": meta.get("rationale", ""),
+                }
+            )
+
+    q_values = fdr_bh([row["p_value"] for row in rows])
+    for row, q_value in zip(rows, q_values):
+        row["fdr_q_value"] = q_value
+    partial_q_values = fdr_bh([row["partial_p_value"] for row in rows])
+    for row, q_value in zip(rows, partial_q_values):
+        row["partial_fdr_q_value"] = q_value
+    rows.sort(
+        key=lambda row: (
+            row["partial_fdr_q_value"] if math.isfinite(row["partial_fdr_q_value"]) else math.inf,
+            row["fdr_q_value"] if math.isfinite(row["fdr_q_value"]) else math.inf,
+            row["p_value"],
+            row["behaviour_score"],
+            row["microstate_feature"],
+        )
+    )
+    return rows
+
+
 def top_rows_text(rows: list[dict[str, object]], limit: int, columns: list[str]) -> str:
     if not rows:
         return "None\n"
@@ -985,12 +1521,12 @@ def write_summary_report(
     lines.append(f"Name-match CSV: {config.name_match_csv.resolve()}")
     lines.append(f"Demographics CSV: {config.demographics_csv.resolve()}")
     lines.append("")
-    lines.append("Psychometric PCA")
+    lines.append("Behavioural score PCA")
     lines.append(
-        f"Participants in psychometric PCA: {len(pca_result['participants'])}"
+        f"Participants in behavioural score PCA: {len(pca_result['participants'])}"
     )
     lines.append(
-        f"Psychometric variables retained: {len(pca_result['feature_names'])}"
+        f"Behavioural scores retained: {len(pca_result['feature_names'])}"
     )
     lines.append(
         f"PCs retained: {pca_result['retained_components']}"
@@ -1009,7 +1545,7 @@ def write_summary_report(
         for row in used_files:
             lines.append(
                 f"  {row['file']}: overlap={row['n_overlap_with_backfit']}, "
-                f"numeric_features_used={row['n_numeric_features_used']}"
+                f"scores_used={row['n_scores_used']}"
             )
     else:
         lines.append("  None")
@@ -1032,7 +1568,8 @@ def write_summary_report(
         )
         lines.append(
             f"  psychometric_pc_tests={method_summary['pc_test_count']}, "
-            f"demographic_tests={method_summary['demographic_test_count']}"
+            f"demographic_tests={method_summary['demographic_test_count']}, "
+            f"focused_tests={method_summary.get('focused_test_count', 0)}"
         )
         lines.append("  top_pc_hits:")
         lines.append(
@@ -1054,6 +1591,24 @@ def write_summary_report(
                     "effect_size",
                     "p_value",
                     "fdr_q_value",
+                ],
+            ).rstrip("\n")
+        )
+        lines.append("  top_focused_interoception_dissociation_hits:")
+        lines.append(
+            top_rows_text(
+                method_summary.get("focused_rows", []),
+                5,
+                [
+                    "behaviour_domain",
+                    "behaviour_construct",
+                    "microstate_feature",
+                    "spearman_rho",
+                    "p_value",
+                    "fdr_q_value",
+                    "partial_spearman_age_gender",
+                    "partial_p_value",
+                    "partial_fdr_q_value",
                 ],
             ).rstrip("\n")
         )
@@ -1086,15 +1641,23 @@ def main() -> None:
     participant_aliases = load_name_match_map(name_match_csv)
     state_rows = read_csv_dicts(state_metrics_path)
     record_rows = read_csv_dicts(record_summary_path)
-    available_methods = sorted({row.get("backfit_method", "").strip() for row in state_rows if row.get("backfit_method", "").strip()})
+    available_methods = sorted(
+        {
+            row.get("backfit_method", "").strip()
+            for row in state_rows
+            if row.get("backfit_method", "").strip()
+            and parse_boolish(row.get("backfit_available"))
+        }
+    )
     methods = args.backfit_methods or available_methods
-    conditions = set(args.conditions)
+    conditions = {normalize_condition(condition) for condition in args.conditions}
     include_deltas = not args.disable_condition_deltas
 
     all_backfit_participants = {
-        resolve_participant_id(row.get("participant"), participant_aliases)
+        participant
         for row in state_rows
-        if resolve_participant_id(row.get("participant"), participant_aliases)
+        for participant in [resolve_participant_id(row.get("participant"), participant_aliases)]
+        if participant and PID_RE.match(participant)
     }
 
     psychometric_participants, psychometric_features, psychometric_matrix, psychometric_inventory_rows, psychometric_file_rows = load_psychometric_matrix(
@@ -1125,7 +1688,7 @@ def main() -> None:
             "participant_column_index",
             "n_participants_in_file",
             "n_overlap_with_backfit",
-            "n_numeric_features_used",
+            "n_scores_used",
             "status",
         ],
     )
@@ -1137,6 +1700,7 @@ def main() -> None:
             "column_index",
             "source_column",
             "feature_name",
+            "score_method",
             "n_overlap_with_backfit",
             "n_nonempty_values",
             "n_numeric_values",
@@ -1194,6 +1758,23 @@ def main() -> None:
             for suffix in ("loading", "weight")
         ]
         write_dict_rows(output_dir / "psychometric_pc_loadings.csv", loading_rows, loading_fields)
+
+    focused_score_names, focused_score_matrix, focused_score_rows = select_focused_scores(
+        pca_result["feature_names"],
+        pca_result["raw_matrix"],
+    )
+    if focused_score_rows:
+        write_dict_rows(
+            output_dir / "focused_behaviour_score_inventory.csv",
+            focused_score_rows,
+            ["feature_name", "domain", "construct", "n_nonmissing", "rationale"],
+        )
+        write_matrix_csv(
+            output_dir / "focused_behaviour_score_matrix.csv",
+            pca_result["participants"],
+            focused_score_names,
+            focused_score_matrix,
+        )
 
     method_summaries: list[dict[str, object]] = []
     for method in methods:
@@ -1273,6 +1854,45 @@ def main() -> None:
                         ],
                     )
 
+        focused_rows: list[dict[str, object]] = []
+        if participants and feature_names and focused_score_names:
+            common_focused, backfit_focused, score_focused = intersect_rows(
+                participants,
+                backfit_matrix,
+                pca_result["participants"],
+                focused_score_matrix,
+            )
+            if common_focused:
+                focused_rows = correlate_backfit_with_focused_scores(
+                    common_focused,
+                    feature_names,
+                    backfit_focused,
+                    focused_score_names,
+                    score_focused,
+                    focused_score_rows,
+                    demographic_rows,
+                )
+                if focused_rows:
+                    write_dict_rows(
+                        method_dir / "focused_interoception_dissociation_microstate_stats.csv",
+                        focused_rows,
+                        [
+                            "behaviour_domain",
+                            "behaviour_construct",
+                            "behaviour_score",
+                            "microstate_feature",
+                            "n",
+                            "spearman_rho",
+                            "p_value",
+                            "fdr_q_value",
+                            "partial_spearman_age_gender",
+                            "partial_p_value",
+                            "partial_fdr_q_value",
+                            "partial_n",
+                            "rationale",
+                        ],
+                    )
+
         method_summaries.append(
             {
                 **summary,
@@ -1280,6 +1900,8 @@ def main() -> None:
                 "pc_test_count": len(pc_rows),
                 "demographic_rows": demographic_rows_out,
                 "demographic_test_count": len(demographic_rows_out),
+                "focused_rows": focused_rows,
+                "focused_test_count": len(focused_rows),
             }
         )
 

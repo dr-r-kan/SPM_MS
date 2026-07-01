@@ -11,6 +11,7 @@ function utils = microstate_utilities()
     end
 
     utils.preprocess_maps = @preprocess_maps_internal;
+    utils.apply_spatial_filter = @apply_spatial_filter_public_internal;
     utils.normalize_maps = @normalize_maps_internal;
     utils.bandpass_filter = @bandpass_fft_zero_phase_internal;
     utils.extract_gfp_peaks = @gfp_peak_maps_internal;
@@ -113,6 +114,7 @@ function cfg = default_config_internal()
         'min_peak_count_after_template_rejection', 50, ...
         'max_maps_per_file', 1500, ...
         'max_global_maps', 30000, ...
+        'max_child_maps', 30000, ...
         'require_spm_initialisation', true);
     cfg.simulation = struct( ...
         'out_dir', fullfile('outputs', 'simulations'), ...
@@ -598,6 +600,11 @@ function [Xf, info] = apply_spatial_filter_internal(X, Sim, cfg)
     end
 end
 
+function [Xf, info] = apply_spatial_filter_public_internal(X, Sim)
+    cfg = preprocess_config_internal(Sim);
+    [Xf, info] = apply_spatial_filter_internal(X, Sim, cfg);
+end
+
 function W = nearest_neighbour_laplacian_internal(pos, n_neighbours, strength)
     if nargin < 3 || isempty(strength)
         strength = 1;
@@ -931,10 +938,10 @@ function chanlocs_out = set_mne_topoplot_location_fields_internal(chanlocs_in)
             double_or_nan_internal(get_field_or_empty_local(chanlocs_out(i), 'Y')), ...
             double_or_nan_internal(get_field_or_empty_local(chanlocs_out(i), 'Z'))];
         if all(isfinite(xyz)) && norm(xyz) > eps
-            xyz = xyz ./ norm(xyz);
-            [~, elev] = cart2sph(xyz(1), xyz(2), xyz(3));
-            chanlocs_out(i).theta = wrap_display_angle_internal(atan2d(xyz(2), xyz(1)));
-            chanlocs_out(i).radius = 0.5 - rad2deg(elev) / 180;
+            [az, elev] = cart2sph(xyz(1), xyz(2), xyz(3));
+            [~, theta, radius] = sph2topo([i rad2deg(elev) rad2deg(az)], 1, 2);
+            chanlocs_out(i).theta = theta;
+            chanlocs_out(i).radius = radius;
         end
     end
 end
@@ -1164,6 +1171,12 @@ function display_name = format_criterion_name_internal(criterion_code)
             display_name = 'Silhouette';
         case 'free_energy'
             display_name = 'Free Energy';
+        case {'log_likelihood', 'll'}
+            display_name = 'LL';
+        case 'bic'
+            display_name = 'BIC';
+        case 'icl'
+            display_name = 'ICL';
         case 'elbow'
             display_name = 'Elbow';
         case 'free_energy_elbow'

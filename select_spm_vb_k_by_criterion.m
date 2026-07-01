@@ -3,6 +3,9 @@ function [K_selected, best_score, score_by_k, details] = select_spm_vb_k_by_crit
 %
 % Supports both the legacy criteria and the covariance-aware additions:
 %   - gev / gfp
+%   - log_likelihood / ll
+%   - bic
+%   - icl
 %   - calinski_harabasz_score
 %   - covariance
 %   - covariance_elbow
@@ -31,6 +34,9 @@ function [K_selected, best_score, score_by_k, details] = select_spm_vb_k_by_crit
 
     K_valid = K_all(valid_mask);
     fe_valid = metrics.free_energy(valid_mask);
+    ll_valid = metrics.log_likelihood(valid_mask);
+    bic_valid = metrics.bic(valid_mask);
+    icl_valid = metrics.icl(valid_mask);
     sil_valid = metrics.silhouette(valid_mask);
     gev_valid = metrics.gev(valid_mask);
     ch_valid = metrics.calinski_harabasz(valid_mask);
@@ -68,6 +74,36 @@ function [K_selected, best_score, score_by_k, details] = select_spm_vb_k_by_crit
             [best_score, best_local] = max(fe_valid);
             K_selected = K_valid(best_local);
             score_by_k(valid_mask) = fe_valid;
+
+        case {'log_likelihood', 'll'}
+            if ~any(isfinite(ll_valid))
+                return;
+            end
+            local_scores = ll_valid;
+            local_scores(~isfinite(local_scores)) = -Inf;
+            [best_score, best_local] = max(local_scores);
+            K_selected = K_valid(best_local);
+            score_by_k(valid_mask) = ll_valid;
+
+        case 'bic'
+            if ~any(isfinite(bic_valid))
+                return;
+            end
+            local_scores = bic_valid;
+            local_scores(~isfinite(local_scores)) = -Inf;
+            [best_score, best_local] = max(local_scores);
+            K_selected = K_valid(best_local);
+            score_by_k(valid_mask) = bic_valid;
+
+        case 'icl'
+            if ~any(isfinite(icl_valid))
+                return;
+            end
+            local_scores = icl_valid;
+            local_scores(~isfinite(local_scores)) = -Inf;
+            [best_score, best_local] = max(local_scores);
+            K_selected = K_valid(best_local);
+            score_by_k(valid_mask) = icl_valid;
 
         case {'free_energy_elbow', 'elbow'}
             [K_selected, local_scores, elbow_info] = elbow_select_local(fe_valid, K_valid, 'increasing');
@@ -141,6 +177,12 @@ function metrics = extract_selection_metrics_local(Results)
     if isempty(metrics.free_energy)
         metrics.free_energy = coerce_numeric_vector_local(field_or_local(Results, 'free_energy', []));
     end
+    metrics.log_likelihood = coerce_numeric_vector_local(field_or_local(Results, 'log_likelihood_vals', []));
+    metrics.bic = coerce_numeric_vector_local(field_or_local(Results, 'bic_vals', []));
+    if isempty(metrics.bic)
+        metrics.bic = metrics.free_energy;
+    end
+    metrics.icl = coerce_numeric_vector_local(field_or_local(Results, 'icl_vals', []));
     metrics.silhouette = coerce_numeric_vector_local(field_or_local(Results, 'silhouette_vals', []));
     metrics.gev = coerce_numeric_vector_local(field_or_local(Results, 'gev_vals', []));
     metrics.calinski_harabasz = coerce_numeric_vector_local(field_or_local(Results, 'calinski_harabasz_vals', []));
@@ -162,6 +204,9 @@ function metrics = extract_selection_metrics_local(Results)
 
     nK = numel(metrics.K_candidates);
     metrics.free_energy = resize_vector_local(metrics.free_energy, nK, -Inf);
+    metrics.log_likelihood = resize_vector_local(metrics.log_likelihood, nK, NaN);
+    metrics.bic = resize_vector_local(metrics.bic, nK, NaN);
+    metrics.icl = resize_vector_local(metrics.icl, nK, NaN);
     metrics.silhouette = resize_vector_local(metrics.silhouette, nK, NaN);
     metrics.gev = resize_vector_local(metrics.gev, nK, NaN);
     metrics.calinski_harabasz = resize_vector_local(metrics.calinski_harabasz, nK, NaN);

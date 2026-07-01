@@ -4,7 +4,8 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
 % INPUTS:
 %   Sim          - Simulation structure
 %   K_candidates - Vector of K values to test
-%   criterion    - 'silhouette', 'free_energy', 'free_energy_elbow',
+%   criterion    - 'silhouette', 'free_energy', 'log_likelihood', 'bic',
+%                  'icl', 'free_energy_elbow',
 %                  'elbow_sil_combined', 'gev'/'gfp',
 %                  'calinski_harabasz_score', 'covariance',
 %                  'covariance_elbow', or 'free_energy_covariance'
@@ -49,15 +50,24 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     % then recover topographies from labels in the original normalized maps.
     [linear_features, pca_info] = pca_features_for_spm(maps_norm);
     [features, polarity_feature_info] = polarity_invariant_projective_features(linear_features);
+    [matrix_features, matrix_feature_info] = polarity_invariant_matrix_features(maps_norm);
     fprintf(['2. Using polarity-invariant PCA features: %d PCA dims -> %d projective dims ', ...
         '(%.3f%% variance, rank %d of %d channels)\n'], ...
         size(linear_features, 2), size(features, 2), ...
         pca_info.variance_explained_pct, pca_info.rank_est, C_dims);
+    fprintf('   Matrix-space evidence features: %d dims (intrinsic dim %d)\n', ...
+        size(matrix_features, 2), matrix_feature_info.intrinsic_dim);
 
     % Fit VB GMM
     fprintf('3. Fitting VB GMM models using SPM...\n');
     nK = numel(K_candidates);
     free_energy = zeros(nK, 1);
+    spm_pca_free_energy = zeros(nK, 1);
+    log_likelihood_vals = nan(nK, 1);
+    bic_vals = nan(nK, 1);
+    icl_vals = nan(nK, 1);
+    assignment_entropy_vals = nan(nK, 1);
+    n_parameters_vals = nan(nK, 1);
     silhouette_score = zeros(nK, 1);
     within_ss = zeros(nK, 1);
     gev_vals = zeros(nK, 1);
@@ -69,6 +79,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     K_effective = K_candidates(:);
     polarity_duplicate_info = cell(nK, 1);
     feature_backfit_models = cell(nK, 1);
+    matrix_evidence_models = cell(nK, 1);
 
     for iK = 1:nK
         K = K_candidates(iK);
@@ -82,12 +93,13 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
             if ~is_valid_spm_mix_result(result)
                 fprintf('Invalid\n');
                 free_energy(iK) = -Inf;
+                spm_pca_free_energy(iK) = -Inf;
                 silhouette_score(iK) = -1;
                 within_ss(iK) = Inf;
                 gev_vals(iK) = 0;
                 calinski_harabasz_vals(iK) = NaN;
             else
-                free_energy(iK) = result.fm;
+                spm_pca_free_energy(iK) = result.fm;
                 vbmix{iK} = result;
                 spm_mix_model_summaries(iK) = summarise_spm_mix_result(result, K, size(features, 2), result.fm);
                 
@@ -102,6 +114,14 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
                 K_effective(iK) = K_eff;
                 polarity_duplicate_info{iK} = detect_polarity_duplicate_centers(temp_centers, 0.85);
                 feature_backfit_models{iK} = build_feature_backfit_model(features, labels, K_eff);
+                evidence = compute_matrix_space_evidence(matrix_features, labels, K_eff, matrix_feature_info.intrinsic_dim);
+                free_energy(iK) = evidence.free_energy;
+                log_likelihood_vals(iK) = evidence.log_likelihood;
+                bic_vals(iK) = evidence.bic;
+                icl_vals(iK) = evidence.icl;
+                assignment_entropy_vals(iK) = evidence.assignment_entropy;
+                n_parameters_vals(iK) = evidence.n_parameters;
+                matrix_evidence_models{iK} = evidence.model;
                 sim = abs(maps_original * temp_centers');
                 [max_sim, ~] = max(sim, [], 2);
                 gfp_squared = sum(maps_original.^2, 2);
@@ -120,14 +140,15 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
                 dup_count = size(polarity_duplicate_info{iK}.pairs, 1);
                 if dup_count > 0
                     fprintf('F=%.1f, Sil=%.3f, WSS=%.1f, polarity-duplicate pairs=%d\n', ...
-                        result.fm, sil, wss, dup_count);
+                        free_energy(iK), sil, wss, dup_count);
                 else
-                    fprintf('F=%.1f, Sil=%.3f, WSS=%.1f\n', result.fm, sil, wss);
+                    fprintf('F=%.1f, Sil=%.3f, WSS=%.1f\n', free_energy(iK), sil, wss);
                 end
             end
         catch ME
             fprintf('ERROR: %s\n', ME.message);
             free_energy(iK) = -Inf;
+            spm_pca_free_energy(iK) = -Inf;
             silhouette_score(iK) = -1;
             within_ss(iK) = Inf;
             gev_vals(iK) = 0;
@@ -138,7 +159,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     end
 
     % Model selection
-    valid_idx = ~isinf(free_energy) & free_energy ~= 0;
+    valid_idx = isfinite(free_energy) & free_energy ~= 0;
     
     if ~any(valid_idx)
         warning('All fits failed!');
@@ -159,6 +180,10 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     selection_payload = struct( ...
         'K_candidates', K_candidates(:), ...
         'free_energy_vals', free_energy(:), ...
+        'spm_pca_free_energy_vals', spm_pca_free_energy(:), ...
+        'log_likelihood_vals', log_likelihood_vals(:), ...
+        'bic_vals', bic_vals(:), ...
+        'icl_vals', icl_vals(:), ...
         'silhouette_vals', silhouette_score(:), ...
         'calinski_harabasz_vals', calinski_harabasz_vals(:), ...
         'covariance_trace_mean_vals', cov_trace_mean_vals(:), ...
@@ -190,6 +215,12 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
             fprintf('  Calinski-Harabasz: selected K=%d (score=%.4f)\n', K_model_selected, best_score);
         case 'free_energy'
             fprintf('  Free Energy: selected K=%d (FE=%.1f)\n', K_model_selected, best_score);
+        case {'log_likelihood', 'll'}
+            fprintf('  Matrix log likelihood: selected K=%d (LL=%.1f)\n', K_model_selected, best_score);
+        case 'bic'
+            fprintf('  Matrix BIC evidence: selected K=%d (BIC=%.1f)\n', K_model_selected, best_score);
+        case 'icl'
+            fprintf('  Matrix ICL evidence: selected K=%d (ICL=%.1f)\n', K_model_selected, best_score);
         case {'free_energy_elbow', 'elbow'}
             fprintf('  Free-energy elbow: selected K=%d (score=%.4f)\n', K_model_selected, best_score);
         case 'elbow_sil_combined'
@@ -290,6 +321,13 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     'labels', labels, ...
     'labels_by_K', {labels_all}, ...
     'free_energy', free_energy, ...
+    'matrix_free_energy_vals', free_energy, ...
+    'spm_pca_free_energy_vals', spm_pca_free_energy, ...
+    'log_likelihood_vals', log_likelihood_vals, ...
+    'bic_vals', bic_vals, ...
+    'icl_vals', icl_vals, ...
+    'assignment_entropy_vals', assignment_entropy_vals, ...
+    'n_parameters_vals', n_parameters_vals, ...
     'silhouette_vals', silhouette_score, ...  
     'free_energy_vals', free_energy, ...      
     'within_ss', within_ss, ...            
@@ -309,6 +347,8 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     'selected_spm_priors', spm_mix_model_summaries(best_idx).priors, ...
     'feature_backfit_models', {feature_backfit_models}, ...
     'selected_feature_backfit_model', feature_backfit_models{best_idx}, ...
+    'matrix_evidence_models', {matrix_evidence_models}, ...
+    'selected_matrix_evidence_model', matrix_evidence_models{best_idx}, ...
     'best_criterion_value', best_score, ...
     'maps_nc', maps_norm, ...
     'idx_peaks', idx_peaks, ...
@@ -316,6 +356,7 @@ function Results = fit_microstate_spm_vb(Sim, K_candidates, criterion)
     'preprocessing_info', preprocessing_info, ...
     'pca_info', pca_info, ...
     'polarity_feature_info', polarity_feature_info, ...
+    'matrix_feature_info', matrix_feature_info, ...
     'polarity_duplicate_info', {polarity_duplicate_info}, ...
     'recovery_metrics', recovery_metrics, ...
     'mean_recovery', recovery_metrics.mean_recovery_matched, ...
@@ -655,6 +696,28 @@ function [features_projective, info] = polarity_invariant_projective_features(fe
         'scale', sd);
 end
 
+function [features_matrix, info] = polarity_invariant_matrix_features(maps_norm)
+%POLARITY_INVARIANT_MATRIX_FEATURES Full sensor-space xx' embedding.
+
+    [features_matrix, info] = polarity_invariant_projective_features(maps_norm);
+    rank_est = estimate_matrix_rank(maps_norm);
+    info.mode = 'sensor_outer_product';
+    info.channel_dims = size(maps_norm, 2);
+    % ponytail: matrix features live in a high-dimensional embedding; BIC uses
+    % the intrinsic scalp-map dimension so K is not penalised for redundant xx' entries.
+    info.intrinsic_dim = max(1, rank_est - 1);
+end
+
+function rank_est = estimate_matrix_rank(X)
+    s = svd(double(X), 'econ');
+    if isempty(s)
+        rank_est = 1;
+        return;
+    end
+    tol = max(size(X)) * eps(max(s));
+    rank_est = max(1, sum(s > tol));
+end
+
 function model = build_feature_backfit_model(features, labels, K)
 %BUILD_FEATURE_BACKFIT_MODEL Regularized Gaussian model aligned to final labels.
 
@@ -700,6 +763,84 @@ function model = build_feature_backfit_model(features, labels, K)
         'feature_dim', D, ...
         'n_components', K, ...
         'ridge', ridge);
+end
+
+function evidence = compute_matrix_space_evidence(features, labels, K, intrinsic_dim)
+%COMPUTE_MATRIX_SPACE_EVIDENCE LL/BIC/ICL for the final solution.
+
+    if nargin < 4 || isempty(intrinsic_dim) || ~isfinite(intrinsic_dim)
+        intrinsic_dim = size(features, 2);
+    end
+    model = build_diagonal_feature_model(features, labels, K);
+    [log_joint, log_likelihood_by_row] = matrix_model_log_joint(features, model);
+    log_likelihood = sum(log_likelihood_by_row);
+    resp = exp(log_joint - log_likelihood_by_row);
+    resp(~isfinite(resp)) = 0;
+    assignment_entropy = -sum(resp(:) .* log(resp(:) + eps));
+    n_parameters = (K - 1) + 2 * K * max(1, intrinsic_dim);
+    % Matrix-space free energy is the BIC-form log-evidence approximation.
+    bic = log_likelihood - 0.5 * n_parameters * log(size(features, 1));
+    icl = bic - assignment_entropy;
+    evidence = struct( ...
+        'free_energy', bic, ...
+        'log_likelihood', log_likelihood, ...
+        'bic', bic, ...
+        'icl', icl, ...
+        'assignment_entropy', assignment_entropy, ...
+        'n_parameters', n_parameters, ...
+        'model', model);
+end
+
+function model = build_diagonal_feature_model(features, labels, K)
+    [~, D] = size(features);
+    labels = labels(:);
+    means = zeros(K, D);
+    variances = zeros(K, D);
+    priors = zeros(K, 1);
+    global_var = var(features, 0, 1);
+    global_var(~isfinite(global_var) | global_var < 1e-8) = 1e-8;
+    ridge = max(1e-8, median(global_var) * 1e-4);
+
+    for k = 1:K
+        idx = labels == k;
+        priors(k) = mean(idx);
+        if ~any(idx)
+            means(k, :) = mean(features, 1);
+            variances(k, :) = global_var + ridge;
+            continue;
+        end
+        Xk = features(idx, :);
+        means(k, :) = mean(Xk, 1);
+        if size(Xk, 1) >= 2
+            vk = var(Xk, 0, 1);
+        else
+            vk = global_var;
+        end
+        vk(~isfinite(vk) | vk < 1e-8) = 1e-8;
+        variances(k, :) = vk + ridge;
+    end
+
+    priors = priors / max(sum(priors), eps);
+    model = struct('means', means, 'variances', variances, 'priors', priors, ...
+        'feature_dim', D, 'n_components', K, 'ridge', ridge);
+end
+
+function [log_joint, log_likelihood_by_row] = matrix_model_log_joint(features, model)
+    [N, D] = size(features);
+    K = model.n_components;
+    log_joint = -inf(N, K);
+    for k = 1:K
+        v = model.variances(k, :);
+        xc = features - model.means(k, :);
+        log_pdf = -0.5 * (D * log(2 * pi) + sum(log(v)) + sum((xc .^ 2) ./ v, 2));
+        log_joint(:, k) = log(model.priors(k) + eps) + log_pdf;
+    end
+    log_likelihood_by_row = logsumexp_rows(log_joint);
+end
+
+function y = logsumexp_rows(X)
+    m = max(X, [], 2);
+    y = m + log(sum(exp(X - m), 2) + eps);
 end
 
 function info = detect_polarity_duplicate_centers(centers, threshold)
@@ -1103,7 +1244,14 @@ function Results = create_empty_results(Sim, K_candidates, n_maps, C_dims, crite
         'labels', ones(n_maps, 1), ...
         'labels_by_K', {cell(numel(K_candidates), 1)}, ...
         'free_energy', -Inf(numel(K_candidates), 1), ...
+        'matrix_free_energy_vals', -Inf(numel(K_candidates), 1), ...
+        'spm_pca_free_energy_vals', -Inf(numel(K_candidates), 1), ...
         'free_energy_vals', -Inf(numel(K_candidates), 1), ...
+        'log_likelihood_vals', nan(numel(K_candidates), 1), ...
+        'bic_vals', nan(numel(K_candidates), 1), ...
+        'icl_vals', nan(numel(K_candidates), 1), ...
+        'assignment_entropy_vals', nan(numel(K_candidates), 1), ...
+        'n_parameters_vals', nan(numel(K_candidates), 1), ...
         'silhouette_vals', -ones(numel(K_candidates), 1), ...
         'within_ss', Inf(numel(K_candidates), 1), ...
         'gev_vals', zeros(numel(K_candidates), 1), ...
@@ -1122,8 +1270,11 @@ function Results = create_empty_results(Sim, K_candidates, n_maps, C_dims, crite
         'selected_spm_priors', nan(0, 1), ...
         'feature_backfit_models', {cell(numel(K_candidates), 1)}, ...
         'selected_feature_backfit_model', struct(), ...
+        'matrix_evidence_models', {cell(numel(K_candidates), 1)}, ...
+        'selected_matrix_evidence_model', struct(), ...
         'pca_info', struct(), ...
         'polarity_feature_info', struct(), ...
+        'matrix_feature_info', struct(), ...
         'polarity_duplicate_info', {cell(numel(K_candidates), 1)}, ...
         'recovery_metrics', struct('n_matched', 0, 'mean_recovery_matched', NaN, ...
             'mean_recovery_padded', NaN, 'f1_score', NaN, 'sensitivity', NaN, ...

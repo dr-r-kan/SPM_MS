@@ -45,7 +45,7 @@ OUTCOMES = [
     "sensitivity",
     "precision",
     "mean_recovery_matched",
-    "K_abs_error",
+    "K_sq_error",
 ]
 OUTCOME_LABELS = {
     "K_correct": "K_true selection accuracy",
@@ -54,6 +54,7 @@ OUTCOME_LABELS = {
     "precision": "Precision",
     "mean_recovery_matched": "Mean matched correlation",
     "K_abs_error": "Absolute K error",
+    "K_sq_error": "Squared K error",
     "runtime_s": "Runtime (s)",
 }
 OUTCOMES_FULL = OUTCOMES[:4] + ["runtime_s"] + OUTCOMES[4:]
@@ -212,6 +213,7 @@ def prepare_results_table(table: pd.DataFrame) -> pd.DataFrame:
         table["K_error"] = np.nan
         table["K_gap"] = np.nan
     table["K_abs_error"] = table["K_error"].abs()
+    table["K_sq_error"] = table["K_error"].pow(2)
 
     if "mean_recovery_matched" not in table:
         recovery_cols = [c for c in table.columns if c.startswith("recovery_")]

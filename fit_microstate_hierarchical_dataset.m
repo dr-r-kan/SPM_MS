@@ -22,11 +22,16 @@ function [HResults, results_mat] = fit_microstate_hierarchical_dataset(input_pat
     path_defaults = repo_cfg.paths;
     pre_defaults = repo_cfg.preprocessing;
     hier_defaults = repo_cfg.hierarchical;
+    max_child_maps_default = double(hier_defaults.max_global_maps);
+    if isfield(hier_defaults, 'max_child_maps')
+        max_child_maps_default = double(hier_defaults.max_child_maps);
+    end
 
     p = inputParser;
     addRequired(p, 'input_path', @(x) ischar(x) || isstring(x));
     addParameter(p, 'output_dir', path_defaults.hierarchical_output_dir, @(x) ischar(x) || isstring(x));
     addParameter(p, 'template_file', path_defaults.template_file, @(x) ischar(x) || isstring(x));
+    addParameter(p, 'template_label_override', {}, @(x) iscell(x) || isstring(x));
     addParameter(p, 'K_candidates', double(hier_defaults.K_candidates(:)'), @isnumeric);
     addParameter(p, 'criterion', char(hier_defaults.criterion), @(x) ischar(x) || isstring(x));
     addParameter(p, 'apply_average_reference', logical(pre_defaults.apply_average_reference), @islogical);
@@ -47,6 +52,7 @@ function [HResults, results_mat] = fit_microstate_hierarchical_dataset(input_pat
     addParameter(p, 'gfp_outlier_mad_multiplier', double(pre_defaults.gfp_outlier_mad_multiplier), @isnumeric);
     addParameter(p, 'max_maps_per_file', [], @(x) isempty(x) || isnumeric(x));
     addParameter(p, 'max_global_maps', double(hier_defaults.max_global_maps), @(x) isempty(x) || isnumeric(x));
+    addParameter(p, 'max_child_maps', max_child_maps_default, @(x) isempty(x) || isnumeric(x));
     addParameter(p, 'spm_prior_pseudocount', double(hier_defaults.spm_prior_pseudocount), @isnumeric);
     addParameter(p, 'global_only', false, @islogical);
     addParameter(p, 'run_backfit', true, @islogical);
@@ -69,6 +75,7 @@ function [HResults, results_mat] = fit_microstate_hierarchical_dataset(input_pat
     cfg.input_path = char(cfg.input_path);
     cfg.output_dir = util.resolve_path(cfg.output_dir, util.project_root());
     cfg.template_file = util.resolve_path(cfg.template_file, util.project_root());
+    cfg.template_label_override = cellstr(string(cfg.template_label_override));
     cfg.criterion = lower(char(cfg.criterion));
     cfg.spatial_filter = char(cfg.spatial_filter);
     cfg.exclude_channels = cellstr(string(cfg.exclude_channels));
@@ -1201,15 +1208,16 @@ function [nodes, summary] = fit_group_nodes(pooled_maps, pooled_gfp, pooled_rows
     for i = 1:numel(levels)
         level = levels(i);
         mask = pooled_rows.group == level;
+        fit_idx = capped_mask_indices(mask, cfg.max_child_maps);
         out_dir = fullfile(out_root, clean_key(level));
         ensure_dir(out_dir);
-        Fit = fit_spm_vb_peak_maps(pooled_maps(mask, :), pooled_gfp(mask), cfg.K_candidates, cfg, ['group_' char(level)], global_fit.centers);
+        Fit = fit_spm_vb_peak_maps(pooled_maps(fit_idx, :), pooled_gfp(fit_idx), cfg.K_candidates, cfg, ['group_' char(level)], global_fit.centers);
         Fit = attach_template_alignment_if_available(Fit, cfg, common_labels, common_chanlocs);
-        rows = pooled_rows(mask, :);
-        rows.cluster_label = assign_by_abs_correlation(pooled_maps(mask, :), Fit.centers);
+        rows = pooled_rows(fit_idx, :);
+        rows.cluster_label = assign_by_abs_correlation(pooled_maps(fit_idx, :), Fit.centers);
         save_fit_bundle(out_dir, 'group', Fit, rows, common_labels, common_chanlocs, cfg);
-        nodes(end+1) = build_node('group', "", level, "", level, Fit, sum(mask), out_dir); %#ok<AGROW>
-        summary = [summary; make_summary_row('group', level, level, "", "", Fit, numel(unique(rows.file_index)), sum(mask), out_dir)]; %#ok<AGROW>
+        nodes(end+1) = build_node('group', "", level, "", level, Fit, numel(fit_idx), out_dir); %#ok<AGROW>
+        summary = [summary; make_summary_row('group', level, level, "", "", Fit, numel(unique(rows.file_index)), numel(fit_idx), out_dir)]; %#ok<AGROW>
         print_alignment_line(['Group ' char(level)], Fit);
     end
 end
@@ -1221,15 +1229,16 @@ function [nodes, summary] = fit_condition_nodes(pooled_maps, pooled_gfp, pooled_
     for i = 1:numel(levels)
         level = levels(i);
         mask = pooled_rows.condition == level;
+        fit_idx = capped_mask_indices(mask, cfg.max_child_maps);
         out_dir = fullfile(out_root, clean_key(level));
         ensure_dir(out_dir);
-        Fit = fit_spm_vb_peak_maps(pooled_maps(mask, :), pooled_gfp(mask), cfg.K_candidates, cfg, ['condition_' char(level)], global_fit.centers);
+        Fit = fit_spm_vb_peak_maps(pooled_maps(fit_idx, :), pooled_gfp(fit_idx), cfg.K_candidates, cfg, ['condition_' char(level)], global_fit.centers);
         Fit = attach_template_alignment_if_available(Fit, cfg, common_labels, common_chanlocs);
-        rows = pooled_rows(mask, :);
-        rows.cluster_label = assign_by_abs_correlation(pooled_maps(mask, :), Fit.centers);
+        rows = pooled_rows(fit_idx, :);
+        rows.cluster_label = assign_by_abs_correlation(pooled_maps(fit_idx, :), Fit.centers);
         save_fit_bundle(out_dir, 'condition', Fit, rows, common_labels, common_chanlocs, cfg);
-        nodes(end+1) = build_node('condition', "", "", level, level, Fit, sum(mask), out_dir); %#ok<AGROW>
-        summary = [summary; make_summary_row('condition', level, "", level, "", Fit, numel(unique(rows.file_index)), sum(mask), out_dir)]; %#ok<AGROW>
+        nodes(end+1) = build_node('condition', "", "", level, level, Fit, numel(fit_idx), out_dir); %#ok<AGROW>
+        summary = [summary; make_summary_row('condition', level, "", level, "", Fit, numel(unique(rows.file_index)), numel(fit_idx), out_dir)]; %#ok<AGROW>
         print_alignment_line(['Condition ' char(level)], Fit);
     end
 end
@@ -1241,19 +1250,20 @@ function [nodes, summary] = fit_participant_nodes(pooled_maps, pooled_gfp, poole
     for i = 1:numel(levels)
         participant = levels(i);
         mask = pooled_rows.participant == participant;
+        fit_idx = capped_mask_indices(mask, cfg.max_child_maps);
         row_mask = manifest.participant == participant;
         group_value = manifest.group(find(row_mask, 1, 'first'));
         cond_values = unique(pooled_rows.condition(mask), 'stable');
         prior_maps = parent_prior_maps(global_fit, group_nodes, condition_nodes, group_value, cond_values);
         out_dir = fullfile(out_root, clean_key(participant));
         ensure_dir(out_dir);
-        Fit = fit_spm_vb_peak_maps(pooled_maps(mask, :), pooled_gfp(mask), cfg.K_candidates, cfg, ['participant_' char(participant)], prior_maps);
+        Fit = fit_spm_vb_peak_maps(pooled_maps(fit_idx, :), pooled_gfp(fit_idx), cfg.K_candidates, cfg, ['participant_' char(participant)], prior_maps);
         Fit = attach_template_alignment_if_available(Fit, cfg, common_labels, common_chanlocs);
-        rows = pooled_rows(mask, :);
-        rows.cluster_label = assign_by_abs_correlation(pooled_maps(mask, :), Fit.centers);
+        rows = pooled_rows(fit_idx, :);
+        rows.cluster_label = assign_by_abs_correlation(pooled_maps(fit_idx, :), Fit.centers);
         save_fit_bundle(out_dir, 'participant', Fit, rows, common_labels, common_chanlocs, cfg);
-        nodes(end+1) = build_node('participant', participant, group_value, "", participant, Fit, sum(mask), out_dir); %#ok<AGROW>
-        summary = [summary; make_summary_row('participant', participant, group_value, "", participant, Fit, numel(unique(rows.file_index)), sum(mask), out_dir)]; %#ok<AGROW>
+        nodes(end+1) = build_node('participant', participant, group_value, "", participant, Fit, numel(fit_idx), out_dir); %#ok<AGROW>
+        summary = [summary; make_summary_row('participant', participant, group_value, "", participant, Fit, numel(unique(rows.file_index)), numel(fit_idx), out_dir)]; %#ok<AGROW>
         print_alignment_line(['Participant ' char(participant)], Fit);
     end
 end
@@ -1271,6 +1281,7 @@ function [nodes, summary] = fit_participant_condition_nodes(pooled_maps, pooled_
         if ~any(mask)
             continue;
         end
+        fit_idx = capped_mask_indices(mask, cfg.max_child_maps);
 
         row_mask = manifest.participant == participant & manifest.condition == condition;
         if ~any(row_mask)
@@ -1298,15 +1309,15 @@ function [nodes, summary] = fit_participant_condition_nodes(pooled_maps, pooled_
         out_dir = fullfile(out_root, clean_key(participant), clean_key(condition));
         ensure_dir(out_dir);
         fit_name = ['participant_condition_' char(participant) '_' char(condition)];
-        Fit = fit_spm_vb_peak_maps(pooled_maps(mask, :), pooled_gfp(mask), cfg.K_candidates, cfg, fit_name, prior_maps);
+        Fit = fit_spm_vb_peak_maps(pooled_maps(fit_idx, :), pooled_gfp(fit_idx), cfg.K_candidates, cfg, fit_name, prior_maps);
         Fit = attach_template_alignment_if_available(Fit, cfg, common_labels, common_chanlocs);
-        rows = pooled_rows(mask, :);
-        rows.cluster_label = assign_by_abs_correlation(pooled_maps(mask, :), Fit.centers);
+        rows = pooled_rows(fit_idx, :);
+        rows.cluster_label = assign_by_abs_correlation(pooled_maps(fit_idx, :), Fit.centers);
         save_fit_bundle(out_dir, 'participant_condition', Fit, rows, common_labels, common_chanlocs, cfg);
 
         node_name = participant + "_" + condition;
-        nodes(end+1) = build_node('participant_condition', participant, group_value, condition, node_name, Fit, sum(mask), out_dir); %#ok<AGROW>
-        summary = [summary; make_summary_row('participant_condition', node_name, group_value, condition, participant, Fit, numel(unique(rows.file_index)), sum(mask), out_dir)]; %#ok<AGROW>
+        nodes(end+1) = build_node('participant_condition', participant, group_value, condition, node_name, Fit, numel(fit_idx), out_dir); %#ok<AGROW>
+        summary = [summary; make_summary_row('participant_condition', node_name, group_value, condition, participant, Fit, numel(unique(rows.file_index)), numel(fit_idx), out_dir)]; %#ok<AGROW>
         print_alignment_line(['Participant-condition ' char(participant) ' ' char(condition)], Fit);
     end
 end
@@ -1445,6 +1456,9 @@ function [Sim_backfit, gfp, X_metric] = prepare_backfit_record(file_path, common
     Sim_backfit.preprocessing = struct( ...
         'apply_average_reference', cfg.apply_average_reference, ...
         'filter_band', cfg.filter_band, ...
+        'spatial_filter', cfg.spatial_filter, ...
+        'spatial_filter_neighbours', cfg.spatial_filter_neighbours, ...
+        'spatial_filter_strength', cfg.spatial_filter_strength, ...
         'gfp_peak_min_distance', cfg.gfp_peak_min_distance, ...
         'gfp_peak_threshold_schedule', cfg.gfp_peak_threshold_schedule);
     X_metric = preprocess_backfit_metric_matrix(Sim_backfit, util);
@@ -1456,6 +1470,7 @@ function X = preprocess_backfit_metric_matrix(Sim_backfit, util)
     if isfield(Sim_backfit.preprocessing, 'apply_average_reference') && Sim_backfit.preprocessing.apply_average_reference
         X = X - mean(X, 1, 'omitnan');
     end
+    [X, ~] = util.apply_spatial_filter(X, Sim_backfit);
     if isfield(Sim_backfit.preprocessing, 'filter_band') && ~isempty(Sim_backfit.preprocessing.filter_band)
         X = util.bandpass_filter(X, Sim_backfit.sfreq, Sim_backfit.preprocessing.filter_band);
     end
@@ -2388,6 +2403,8 @@ function Fit = attach_template_alignment_if_available(Fit, cfg, common_labels, c
         alignment = align_microstates_to_template(Fit.centers, cfg.template_file, ...
             'estimated_channel_labels', common_labels, ...
             'estimated_chanlocs', common_chanlocs, ...
+            'template_K', Fit.K_estimated, ...
+            'label_override', cfg.template_label_override, ...
             'strong_threshold', 0.5);
         Fit.template_alignment = alignment;
         Fit.centers = alignment.aligned_maps;
@@ -2420,9 +2437,9 @@ function plot_centers(Fit, chanlocs, out_file)
             centers_plot = centers;
         end
         K = size(centers, 1);
-        fig = figure('Visible', 'off', 'Color', 'white');
-        n_cols = min(K, 4);
-        n_rows = ceil(K / n_cols);
+        fig = figure('Visible', 'off', 'Color', 'white', 'Position', [100 100 max(900, 230*K) 300]);
+        n_cols = K;
+        n_rows = 1;
         for k = 1:K
             subplot(n_rows, n_cols, k);
             if ~isempty(plot_chanlocs) && exist('topoplot', 'file') == 2
@@ -2434,9 +2451,10 @@ function plot_centers(Fit, chanlocs, out_file)
             if isfield(Fit, 'template_alignment') && isfield(Fit.template_alignment, 'labels') && numel(Fit.template_alignment.labels) >= k
                 label = sprintf('%s r=%.2f', Fit.template_alignment.labels{k}, Fit.template_alignment.correlations(k));
             end
-            title(label, 'Interpreter', 'none');
+            title(label, 'Interpreter', 'none', 'Color', [0 0 0], 'FontWeight', 'bold');
         end
-        sgtitle(Fit.name, 'Interpreter', 'none');
+        st = sgtitle(Fit.name, 'Interpreter', 'none');
+        set(st, 'Color', [0 0 0], 'FontWeight', 'bold');
         saveas(fig, out_file);
         close(fig);
     catch ME
@@ -2467,10 +2485,13 @@ end
 function chanlocs = set_mne_topoplot_location_fields(chanlocs, idx)
     xyz = [field_double(chanlocs(idx), 'X'), field_double(chanlocs(idx), 'Y'), field_double(chanlocs(idx), 'Z')];
     if all(isfinite(xyz)) && norm(xyz) > eps
-        xyz = xyz ./ norm(xyz);
-        [~, el] = cart2sph(xyz(1), xyz(2), xyz(3));
-        chanlocs(idx).theta = atan2d(xyz(2), xyz(1));
-        chanlocs(idx).radius = 0.5 - rad2deg(el) / 180;
+        [az, el, sph_r] = cart2sph(xyz(1), xyz(2), xyz(3));
+        [~, theta, radius] = sph2topo([idx rad2deg(el) rad2deg(az)], 1, 2);
+        chanlocs(idx).theta = theta;
+        chanlocs(idx).radius = radius;
+        chanlocs(idx).sph_theta = rad2deg(az);
+        chanlocs(idx).sph_phi = rad2deg(el);
+        chanlocs(idx).sph_radius = sph_r;
     end
 end
 
@@ -2562,6 +2583,12 @@ function idx = deterministic_subsample(N, maxN)
     if numel(idx) > maxN
         idx = idx(1:maxN);
     end
+end
+
+function idx = capped_mask_indices(mask, maxN)
+    idx = find(mask);
+    keep = deterministic_subsample(numel(idx), maxN);
+    idx = idx(keep);
 end
 
 function ensure_dir(pth)

@@ -11,6 +11,7 @@ function alignment = align_microstates_to_template(estimated_maps, template_file
     addParameter(p, 'estimated_channel_labels', {}, @(x) iscell(x) || isstring(x));
     addParameter(p, 'estimated_chanlocs', [], @(x) isempty(x) || isstruct(x));
     addParameter(p, 'template_K', 7, @isnumeric);
+    addParameter(p, 'label_override', {}, @(x) iscell(x) || isstring(x));
     addParameter(p, 'strong_threshold', 0.5, @isnumeric);
     parse(p, estimated_maps, template_file, varargin{:});
 
@@ -23,12 +24,13 @@ function alignment = align_microstates_to_template(estimated_maps, template_file
     tmpl_labels = cellstr(template_channel_labels);
     n_est_channels = size(estimated_maps, 2);
     n_template_channels = size(template_maps, 2);
+    min_label_matches = max(16, ceil(0.5 * min(n_est_channels, n_template_channels)));
 
     if ~isempty(est_labels) && numel(est_labels) >= n_est_channels && ~isempty(tmpl_labels)
         [common_labels, idx_est, idx_template] = intersect( ...
             lower(strtrim(est_labels(1:n_est_channels))), ...
             lower(strtrim(tmpl_labels(1:n_template_channels))), 'stable');
-        if numel(common_labels) >= 4
+        if numel(common_labels) >= min_label_matches
             estimated_common = estimated_maps(:, idx_est);
             template_common = template_maps(:, idx_template);
             channel_match_mode = 'labels';
@@ -50,7 +52,12 @@ function alignment = align_microstates_to_template(estimated_maps, template_file
 
     n_est = size(estimated_common, 1);
     n_template = size(template_common, 1);
-    template_idx = optimal_template_assignment(corr_matrix);
+    label_override = cellstr(string(p.Results.label_override(:)));
+    if isempty(label_override)
+        template_idx = optimal_template_assignment(corr_matrix);
+    else
+        template_idx = assignment_from_label_override(label_override, template_labels, n_est);
+    end
     template_corr = zeros(n_est, 1);
     polarity = ones(n_est, 1);
     for e = 1:n_est
@@ -88,8 +95,10 @@ function alignment = align_microstates_to_template(estimated_maps, template_file
         'estimated_common_maps', estimated_common, ...
         'template_common_maps', template_common, ...
         'template_labels', {template_labels}, ...
+        'label_override', {label_override}, ...
         'channel_match_mode', channel_match_mode, ...
         'matched_channel_labels', {common_labels}, ...
+        'min_label_matches', min_label_matches, ...
         'estimated_channel_indices', idx_est, ...
         'template_channel_indices', idx_template, ...
         'n_common_channels', size(estimated_common, 2), ...
@@ -98,6 +107,24 @@ function alignment = align_microstates_to_template(estimated_maps, template_file
         'min_correlation', min(template_corr(template_corr > 0)), ...
         'n_strong_matches', sum(strong), ...
         'strong_threshold', p.Results.strong_threshold);
+end
+
+function template_idx = assignment_from_label_override(labels, template_labels, n_est)
+    if numel(labels) ~= n_est
+        error('label_override has %d labels, but the fitted solution has %d states.', numel(labels), n_est);
+    end
+    if numel(unique(lower(strtrim(string(labels(:)))))) ~= n_est
+        error('label_override labels must be unique.');
+    end
+    template_idx = nan(n_est, 1);
+    keys = lower(strtrim(string(template_labels(:))));
+    for e = 1:n_est
+        hit = find(keys == lower(strtrim(string(labels{e}))), 1, 'first');
+        if isempty(hit)
+            error('label_override label "%s" was not found in the selected template set.', labels{e});
+        end
+        template_idx(e) = hit;
+    end
 end
 
 function [estimated_common, template_common, mode, common_labels, idx_est, idx_template] = coordinate_or_first_common(estimated_maps, template_maps, estimated_chanlocs, template_chanlocs, template_labels, util)

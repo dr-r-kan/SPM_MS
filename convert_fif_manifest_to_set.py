@@ -27,6 +27,7 @@ def main():
     p.add_argument("--file-column", default="")
     p.add_argument("--input-dir", default="", help="Directory containing files when manifest paths are stale")
     p.add_argument("--montage", default="", help="MNE builtin montage name or montage file to apply before export")
+    p.add_argument("--format", choices=("set", "mat"), default="set", help="Output file format")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 
@@ -53,16 +54,23 @@ def main():
     for row in rows:
         src = resolve_input_path(row[file_col], input_dir)
         stem = src.stem
-        out_set = out_dir / f"{stem}.set"
+        out_path = out_dir / f"{stem}.{args.format}"
+        if out_path.exists() and not args.overwrite:
+            row[file_col] = str(out_path)
+            print(f"{src.name} -> {out_path.name} (exists)")
+            continue
         raw = mne.io.read_raw_fif(src, preload=True, verbose="ERROR")
         raw.pick("eeg")
         if args.montage:
             raw.set_montage(load_montage(args.montage), on_missing="warn")
 
-        raw.export(out_set, fmt="eeglab", overwrite=args.overwrite, verbose="ERROR")
-        finite = write_chanloc_sidecars(raw, out_dir / stem, reference_positions)
-        row[file_col] = str(out_set)
-        print(f"{src.name} -> {out_set.name} ({len(raw.ch_names)} EEG channels, {finite} finite positions)")
+        if args.format == "set":
+            raw.export(out_path, fmt="eeglab", overwrite=args.overwrite, verbose="ERROR")
+            finite = write_chanloc_sidecars(raw, out_dir / stem, reference_positions)
+        else:
+            finite = write_mat_eeg(raw, out_path, reference_positions)
+        row[file_col] = str(out_path)
+        print(f"{src.name} -> {out_path.name} ({len(raw.ch_names)} EEG channels, {finite} finite positions)")
 
     with out_manifest.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -128,16 +136,23 @@ def channel_positions(raw, reference_positions=None):
     for i, (name, ch) in enumerate(zip(raw.ch_names, raw.info["chs"])):
         key = normalise_channel_label(name)
         candidates = (
-            montage_pos.get(name),
-            montage_pos_by_key.get(key),
-            ch.get("loc", np.full(12, np.nan))[:3],
-            reference_positions.get(key),
+            (montage_pos.get(name), True),
+            (montage_pos_by_key.get(key), True),
+            (ch.get("loc", np.full(12, np.nan))[:3], True),
+            (reference_positions.get(key), False),
         )
-        for pos in candidates:
+        for pos, from_mne in candidates:
             if usable_position(pos):
-                xyz[i] = np.asarray(pos, dtype=float)[:3]
+                pos = np.asarray(pos, dtype=float)[:3]
+                xyz[i] = mne_xyz_to_eeglab(pos) if from_mne else pos
                 break
     return xyz
+
+
+def mne_xyz_to_eeglab(pos):
+    """Convert MNE/FIF RAS coords to EEGLAB/topoplot coords."""
+    x, y, z = np.asarray(pos, dtype=float)[:3]
+    return np.array([y, -x, z], dtype=float)
 
 
 def usable_position(pos):
@@ -157,12 +172,37 @@ def normalise_channel_label(label):
     return s
 
 
-def write_chanloc_sidecars(raw, stem, reference_positions=None):
-    labels = raw.ch_names
-    xyz = channel_positions(raw, reference_positions)
+def matlab_chanlocs(labels, xyz):
     chanlocs = np.empty((1, len(labels)), dtype=[("labels", "O"), ("X", "O"), ("Y", "O"), ("Z", "O")])
     for i, label in enumerate(labels):
         chanlocs[0, i] = (label, float(xyz[i, 0]), float(xyz[i, 1]), float(xyz[i, 2]))
+    return chanlocs
+
+
+def write_mat_eeg(raw, out_path, reference_positions=None):
+    labels = raw.ch_names
+    xyz = channel_positions(raw, reference_positions)
+    chanlocs = matlab_chanlocs(labels, xyz)
+    data = raw.get_data().astype(np.float32, copy=False)
+    sio.savemat(
+        out_path,
+        {
+            "EEG": {"data": data, "srate": float(raw.info["sfreq"]), "chanlocs": chanlocs},
+            "data": data,
+            "sfreq": float(raw.info["sfreq"]),
+            "srate": float(raw.info["sfreq"]),
+            "labels": np.array(labels, dtype=object),
+            "pos": xyz,
+            "chanlocs": chanlocs,
+        },
+    )
+    return int(np.sum(np.all(np.isfinite(xyz), axis=1)))
+
+
+def write_chanloc_sidecars(raw, stem, reference_positions=None):
+    labels = raw.ch_names
+    xyz = channel_positions(raw, reference_positions)
+    chanlocs = matlab_chanlocs(labels, xyz)
 
     sio.savemat(str(stem) + "_chanlocs.mat", {"chanlocs": chanlocs, "labels": np.array(labels, dtype=object), "pos": xyz})
     with open(str(stem) + "_electrodes.tsv", "w", newline="") as f:

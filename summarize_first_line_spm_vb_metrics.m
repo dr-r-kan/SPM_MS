@@ -8,7 +8,7 @@ function output_csv = summarize_first_line_spm_vb_metrics(results_source, vararg
     p = inputParser;
     addRequired(p, 'results_source');
     addParameter(p, 'method', 'spm_vb', @(x) ischar(x) || isstring(x));
-    addParameter(p, 'criteria', {'silhouette', 'free_energy', 'free_energy_elbow', 'covariance', 'calinski_harabasz_score'}, ...
+    addParameter(p, 'criteria', {'silhouette', 'free_energy', 'log_likelihood', 'bic', 'icl', 'free_energy_elbow', 'covariance', 'calinski_harabasz_score'}, ...
         @(x) iscell(x) || isstring(x));
     addParameter(p, 'output_csv', '', @(x) ischar(x) || isstring(x));
     addParameter(p, 'verbose', true, @islogical);
